@@ -1,7 +1,7 @@
 import * as TregAgentSetup from '../agent-setup/data'
 
 export default {
-// first-run welcome: the agent picker (step 1) and the per-agent setup line (step 2)
+// Getting started: the agent picker and the per-agent setup line
     welcomeAgents(){ return TregAgentSetup.agents; },
 welcomeMoreAgents(){ return TregAgentSetup.moreAgents; },
 welcomeAgent(){ return this.welcomeAgents.concat(this.welcomeMoreAgents).find(a=>a.id===this.welcome.agent) || this.welcomeAgents[0]; },
@@ -12,5 +12,5 @@ welcomeSetupCmd(){ return this.buildAgentPrompt('agent', true); },
 welcomeSetupMasked(){ const t=this.myToken?(this.startTokenShow?this.myToken:(this.myToken.slice(0,14)+'••••••••••••••••')):'<YOUR_TOKEN>';
       return this.welcomeSetupCmd+'\n\nwith team '+(this.activeSlugNow||'<team-slug>')+' token: '+t; },
 tryExamples(){ return TregAgentSetup.examples; },
-tryOauth(){ return TregAgentSetup.oauthGroups; }
+tryOauth(){ return TregAgentSetup.listedOauthGroups(this.providers); }
 }

@@ -18,7 +18,7 @@ from sqlmodel import select
 
 from ... import oauth, oauth_providers
 from ... import sandbox as demo_sandbox
-from ...config import get_settings, platform_setting_name
+from ...config import get_settings
 from ...domain.capacity import marks as capacity_marks
 from ...domain.capacity.routes_view import view as overflow_routes_view
 from ...domain.capacity.view import view as capacity_view
@@ -33,6 +33,8 @@ from ...infra.db import session_maker
 from ...domain.governance.access import pinned_tag_predicates
 from ...models import AsyncResourceRecord, AsyncTaskRecord, CapabilityPin, Org, Secret, Tool
 from ..connect import _host_of, _provider_bindings
+from . import keyslots
+from .idempotency import _IDEM_SCOPE_SEP, IDEMPOTENCY_HEADER, _idempotency_key
 from .types import ResolutionFailed, ResolvedTarget
 
 
@@ -79,9 +81,9 @@ async def _resolve_call(rest: str, caller: Caller, db: AsyncSession) -> Resolved
     if norm.startswith("http://") or norm.startswith("https://"):
         try:
             host = urlsplit(norm).netloc.lower()
-        except ValueError:  # malformed passthrough URL (e.g. unbalanced IPv6 brackets) → 400, not 500
+        except ValueError as exc:  # malformed passthrough URL (e.g. unbalanced IPv6 brackets) → 400, not 500
             raise ResolutionFailed(
-                "invalid_target", status_code=400, detail="malformed upstream URL")
+                "invalid_target", status_code=400, detail="malformed upstream URL") from exc
         on_host = (await db.execute(
             select(Tool).where(Tool.host == host, Tool.org_id == org_id)
         )).scalars().all()
@@ -215,24 +217,6 @@ async def resolve_call_target(
         return await resolver(rest, caller, db)
 
 
-# ---- direct marketplace calls: `treg call <catalog-endpoint-id>`, no tool registration ----------
-# See docs/context/interface/cli-audit-2026-07-28.md (design section). The registry stays "our
-# stuff"; the catalog is "everything callable". Credential ladder: (1) an org tool bound to the
-# provider — resolved via the URL-passthrough shape, so ACLs and ambiguity handling are identical —
-# then (2) an org credential matching the provider, injected via a VIRTUAL tool that is never
-# persisted (no registry pollution), then (4) TREG'S OWN key for the provider, metered against the
-# org's prepaid balance — the keyless first call — and only then (3) an actionable error naming the
-# connect/secret fix.
-#
-# Tier 4 is the only rung that spends OUR money, so it is fenced on every side: the endpoint must be
-# `platform_eligible` (priced, price-provenanced, live-verified, not the caller's own account's
-# business — see catalog_store.platform_eligible), the provider must be allow-listed AND keyed
-# (config.platform_key_for — the kill switch), the org must not be a demo, the estimated cost is
-# RESERVED from the balance before the request leaves, and a per-org daily ceiling caps the damage a
-# runaway agent can do. The key itself only ever exists as a `platform_setting` NAME in a virtual
-# tool's bindings; `relay` reads the value from settings at call time, so no platform credential is
-# stored, listable, or reachable from a local run.
-
 def _catalog_endpoint_for(rest: str) -> dict | None:
     """The catalog endpoint `rest` names, or None. Only a dotted, slash-free rest can be an
     endpoint id, so tool names and URL/named shapes never reach the catalog lookup."""
@@ -257,9 +241,8 @@ def _enforce_catalog_status(ep: dict) -> None:
     if successor := str(ep.get("superseded_by") or "").strip():
         detail += f" Use {successor} instead."
     elif alternatives := _capability_alternatives(ep):
-        # 41 of the 50 TikHub retirements have no same-provider successor, so `superseded_by` has
-        # nothing to say for them. A cross-provider sibling is the only help left — and it is the
-        # difference between a tombstone and a migration path.
+        # Most retirements have no same-provider successor, so `superseded_by` has nothing to say
+        # for them. A cross-provider sibling is the only help left.
         detail += " " + " ".join(alternatives)
     else:
         detail += " No replacement is currently catalogued."
@@ -324,6 +307,9 @@ class MarketplaceCall:
     max_cost_micro: int | None = None  # remaining caller ceiling, inherited by overflow
     params_hash: str = ""
     call_id: str | None = None      # the ledger hold, once reserved (metered calls only)
+    payer_org_id: int | None = None  # captured from the trusted caller when reserving
+    reserved_micro: int | None = None  # the held amount; None for legacy in-memory callers
+    reserved_at: float | None = None  # monotonic time no later than the hold's creation
     # The call rides a REGISTRY OAUTH CONNECT of a provider that bills treg's app per use (X's
     # pay-per-use: the app owner pays whoever's token made the call). Orthogonal to `tier` — the
     # credential is genuinely the org's own (tier 1/2), but the upstream bill is ours, so the call
@@ -332,7 +318,7 @@ class MarketplaceCall:
     unit_micro: int = 0             # RAW per-resource price for a per_result settle-by-count
     reported_charge_unit_micro: int = 0  # RAW value of one response-reported provider credit
     # treg's own account is marked exhausted AND an overflow route is enabled: skip the direct
-    # attempt (no hold, no vendor 402) and go straight to the child cycle (plan §4 ladder).
+    # attempt (no hold, no vendor 402) and go straight to the child cycle.
     skip_direct: bool = False
     settlement_basis: dict = field(default_factory=dict)
     request_data: dict = field(default_factory=dict)
@@ -349,6 +335,9 @@ class MarketplaceCall:
     # Admitted through an active capacity lock as its probe (domain.capacity.marks): a 2xx clears
     # exactly that lock.
     probe_lock_id: str | None = None
+    # Which of treg's accounts for the provider serves this platform call (`keyslots`); None until
+    # the call path picks one when resolution left the choice open.
+    key_slot: str | None = None
     # A routed child: settle into this list instead of the ledger (CallContext.deferred_settles).
     deferred: list | None = None
 
@@ -387,7 +376,8 @@ _PLATFORM_PAGE_DEFAULT = 20
 _PLATFORM_PAGE_MAX = 100
 _LIMIT_PARAMS = ("limit", "count", "depth", "page_size", "per_page", "num", "max_results", "size",
                  "pageSize", "perPage", "numResults", "maxResults",
-                 "contactsLimit")  # camelCase: companyenrich, exa, lusha; contactsLimit: lusha buying-group
+                 "contactsLimit",  # camelCase: companyenrich, exa, lusha; contactsLimit: lusha buying-group
+                 "pastNMonths")  # spyfu domain stats: one row per month
 
 
 # Units that name an INPUT entity rather than a returned row: the caller pays per thing they asked
@@ -465,9 +455,7 @@ def _body_limit(body: bytes) -> int | None:
         val = doc.get(name)  # one row per item: moz targets, dataforseo keywords, companyenrich domains, brightdata urls, lusha contacts/companies
         if isinstance(val, list) and val:
             return len(val)
-    # icypeas / lusha: {"pagination": {"size": 10}}; influencersclub: {"paging": {"limit": 10}} —
-    # the miss on `paging` left discovery reserving the 20-row default whatever the caller asked
-    # (found live 2026-08-30, the same calls whose settle over-billed).
+    # icypeas / lusha: {"pagination": {"size": 10}}; influencersclub: {"paging": {"limit": 10}}.
     for envelope in ("pagination", "paging"):
         nested = doc.get(envelope)
         if isinstance(nested, dict):
@@ -507,6 +495,94 @@ def _body_text_utf8_bytes(body: bytes) -> int:
     return 1
 
 
+def team_label(org_id: int) -> str:
+    """The calling team's label on a shared provider account: stable, one per team, the same for
+    every provider. A row's `team_label` fields must carry it on treg's key (see
+    `_enforce_team_label`), so what the provider keeps under a label is one team's alone."""
+    return "team-" + hashlib.sha256(f"treg-team:{org_id}".encode()).hexdigest()[:16]
+
+
+def _request_value(path: str, body: bytes, headers, query) -> list[str]:
+    """Every value the request supplies at a dotted catalog path (`body.x`, `headers.x`,
+    `queryParams.x`, `pathParams.x`). Path params arrive as query params before substitution."""
+    where, name = path.split(".", 1)
+    if where == "headers":
+        return _request_header_values(headers, name.lower())
+    if where in ("queryParams", "pathParams"):
+        return [str(v) for k, v in query.multi_items() if k == name] if query is not None else []
+    value: object = _json_object(body) if body else {}
+    for part in name.split("."):  # body paths may be nested: `notify.email`
+        value = value.get(part) if isinstance(value, dict) else None
+    return [] if value is None else [value if isinstance(value, str) else json.dumps(value)]
+
+
+def _enforce_team_label(ep: dict, org_id: int, body: bytes, headers=None, query=None) -> None:
+    """On treg's shared key, every `team_label` field must name the caller's own team, exactly
+    once. The caller sends it, so the relay stays faithful; a missing or other team's label is a
+    400 that names the expected value."""
+    expected = team_label(org_id)
+    for path in ep.get("team_label") or ():
+        if _request_value(path, body, headers, query) != [expected]:
+            raise ResolutionFailed(
+                "catalog_parameter_invalid", status_code=400, detail={
+                    "error": "catalog_parameter_invalid", "endpoint_id": ep["id"],
+                    "parameter": path, "expected": expected,
+                    "message": f"{ep['id']} on treg's key requires {path} = {expected}, "
+                               "your team's label: send it exactly",
+                },
+            )
+
+
+def _enforce_caller_email(ep: dict, email: str, body: bytes, headers=None, query=None) -> None:
+    """On treg's shared key, a `caller_email` field the caller sends may only be its own verified
+    email, so a shared provider account never sends mail to someone else. Absent is fine; the
+    caller sends it, so the relay stays faithful."""
+    own = (email or "").strip().lower()
+    for path in ep.get("caller_email") or ():
+        values = _request_value(path, body, headers, query)
+        if values and [str(v).strip().lower() for v in values] != [own]:
+            raise ResolutionFailed(
+                "catalog_parameter_invalid", status_code=400, detail={
+                    "error": "catalog_parameter_invalid", "endpoint_id": ep["id"],
+                    "parameter": path, "expected": email,
+                    "message": f"{ep['id']} on treg's key sends {path} only to your own email, "
+                               f"{email}; leave it out to get no email",
+                },
+            )
+
+
+def _request_quantity(cost: dict, body: bytes, query) -> int | None:
+    """The quantity a `cost.quantity` row prices by: a positive integer the caller chose, at most
+    the declared maximum. None when absent or not a whole number in range."""
+    rule = cost.get("quantity") if isinstance(cost.get("quantity"), dict) else None
+    if not rule:
+        return None
+    values = _request_value(str(rule.get("field")), body, None, query)
+    top = int(rule.get("max") or 0)
+    # Longer than the maximum's digits is out of range, and checked before int(): Python refuses
+    # to convert a very long digit string, which would answer 500 instead of this 400.
+    if (len(values) != 1 or not str(values[0]).strip().isdigit()
+            or len(str(values[0]).strip()) > len(str(top))):
+        return None
+    n = int(str(values[0]).strip())
+    return n if 1 <= n <= top else None
+
+
+def _enforce_request_quantity(ep: dict, cost: dict, body: bytes, query) -> None:
+    """A row priced by a quantity the caller chooses refuses a missing or out-of-range one before
+    anything is held, so the hold and the charge are exactly what the caller asked for."""
+    rule = cost.get("quantity") if isinstance(cost.get("quantity"), dict) else None
+    if rule and _request_quantity(cost, body, query) is None:
+        raise ResolutionFailed(
+            "catalog_parameter_invalid", status_code=400, detail={
+                "error": "catalog_parameter_invalid", "endpoint_id": ep["id"],
+                "parameter": rule.get("field"),
+                "message": f"{ep['id']} needs {rule.get('field')}: a whole number from 1 to "
+                           f"{rule.get('max')}",
+            },
+        )
+
+
 def _platform_estimate_micro(cost: dict, query, body: bytes = b"") -> int:
     """What one call is expected to cost the platform, in RAW micro-USD (no margin — ledger.reserve
     applies that). Rounds UP: a fraction of a micro-dollar is not representable and must not round to
@@ -515,14 +591,16 @@ def _platform_estimate_micro(cost: dict, query, body: bytes = b"") -> int:
     if usd is None:
         return 0
     n = 1
-    if cost.get("unit") == "character":
+    if isinstance(cost.get("quantity"), dict):
+        # A quantity the caller chose (a budget): validated before reserve, so the hold is exact.
+        n = _request_quantity(cost, body, query) or 1
+    elif cost.get("unit") == "character":
         n = _body_text_characters(body)
     elif cost.get("unit") == "utf8_byte":
         n = _body_text_utf8_bytes(body)
     elif cost.get("type") in ("per_result", "quota_rows") and cost.get("unit") in _ENTITY_UNITS:
         # Priced per INPUT entity, not per returned row: the page-size default below has no
-        # meaning here and billed one-target calls 20x (seranking summary, serpstat overview —
-        # 2026-09-05). The request names how many entities it asks about.
+        # meaning here. The request names how many entities it asks about.
         n = 1 if cost.get("unit") == "call" else _entity_count(query, body)
     elif cost.get("type") in ("per_result", "quota_rows"):
         asked = None
@@ -541,10 +619,9 @@ def _platform_estimate_micro(cost: dict, query, body: bytes = b"") -> int:
     return whole + 1 if raw_micro > whole else whole
 
 
-# ---- oauth-billed metering: providers whose upstream bill lands on treg's app -------------------
-# X moved to pay-per-use (Feb 2026): the APP OWNER is billed per resource read / per post written,
+# X bills pay-per-use: the APP OWNER is billed per resource read / per post written,
 # whoever's user token made the call. A registry connect rides treg's app, so those calls spend
-# treg's prepaid credits and must be metered against the org's balance — the same reserve→settle
+# treg's prepaid credits and must be metered against the org's balance - the same reserve->settle
 # path as tier 4. A BYO connect (/oauth/start with the caller's own client_id) stores
 # `secret.provider == ""` and is therefore never flagged: its upstream bill is already the org's.
 
@@ -842,8 +919,7 @@ def _marketplace_pricing(
                 if cost.get("type") in ("per_result", "quota_rows") and cost.get("usd") else 0)
     if endpoint_id in ("icypeas.bulk.search", "icypeas.people.email.find") and credit_rate:
         # The answer is an id ({file} / {item: {_id}}) with no rows, so this reserve IS the bill: one
-        # row per bulk `data` entry at its task's rate, one for a single search. Without it the
-        # 20-row default billed a 3-row job, and a single email lookup, $0.38.
+        # row per bulk `data` entry at its task's rate, one for a single search.
         # ponytail: a search row is billed as if found; per-found billing needs a settle on job end.
         doc = _json_object(body)
         rows = doc.get("data") if isinstance(doc.get("data"), list) else []
@@ -885,8 +961,6 @@ def _marketplace_pricing(
     if provider == "hunter" and endpoint_id == "hunter.companies.emails":
         # Hunter charges 1 search credit per 10 emails RETURNED, rounded UP — not linear per-email.
         # The settle logic uses ceil(emails/10); the estimate must match to avoid billing mismatch.
-        # With limit=1 returning 1 email: linear estimate would be $0.00245, but settle is 1 credit
-        # = $0.0245 — a 10x overbill. Use the same rounding here.
         raw = query.get("limit")
         asked = int(str(raw)) if raw is not None and str(raw).isdigit() else 10  # Hunter's default
         asked = max(1, min(asked, 100))  # Hunter's max
@@ -894,6 +968,12 @@ def _marketplace_pricing(
         if rate:
             credits = -(-asked // 10)  # ceil division: whole credits, minimum 1
             return _usd_to_micro(credits * rate), _usd_to_micro(rate)
+        return estimate, unit
+    if endpoint_id == "fiber-ai.people.search.natural_language" and credit_rate:
+        # Fiber charges 2 NL-interpretation credits on the first page only.
+        token = _json_object(body).get("pageToken")
+        if not (isinstance(token, str) and token.strip()):
+            estimate += _usd_to_micro(2 * credit_rate)
         return estimate, unit
     if provider != "aviato" and not cost.get("modifiers"):
         return estimate, unit
@@ -986,11 +1066,9 @@ def _oauth_billed_estimate(provider, ep: dict | None, method: str, query, body: 
     default); the provider-level rates cover the extended/passthrough long tail. `unit_micro` is
     the per-resource price a `per_result` settle counts the response against."""
     cv = catalog_store.load().cost_view(ep.get("cost"), provider.service) if ep and ep.get("cost") else None
-    # A ZERO price must fall through to the provider rate, not bill zero — on an oauth-billed
+    # A ZERO price must fall through to the provider rate, not bill zero - on an oauth-billed
     # provider the upstream charges us whatever the catalog says, so `free` there is a catalog bug
-    # (a stale ingest), never a fact. Spelled out because it used to ride on `0.0` being falsy:
-    # the same expression read as "no price recorded" and "the price is nothing", and the catalog
-    # could publish free while the balance was debited the fallback.
+    # (a stale ingest), never a fact.
     if cv and cv.get("type") != "free" and cv.get("usd"):
         ctype = str(cv.get("type") or "per_call")
         est = _platform_estimate_micro(cv, query, body)
@@ -1047,42 +1125,6 @@ def _params_hash(endpoint_id: str, query_items: list[tuple[str, str]], body: byt
         h.update(b"\x1f" + f"{k}={v}".encode("utf-8", "replace"))
     h.update(b"\x1e" + (hashlib.sha256(body).digest() if body else b""))
     return h.hexdigest()
-
-
-def _platform_bindings(provider) -> list[dict]:
-    """Tier 4's injection: the SAME header/param shape a pasted key of this provider gets
-    (`_provider_bindings`), except the value is named rather than carried — `relay` reads
-    `platform_setting` from settings at call time. That is the whole security model: treg's key is
-    never written to a Secret row (unreadable by the tenant, unexportable by a local run, and
-    `api.py`'s cross-org secret check would reject it anyway).
-
-    `token_encode` is carried for HTTP Basic providers so the injector can ensure Base64 encoding,
-    matching `_provider_bindings` for tiers 1/2. Platform settings should already be encoded, but
-    carrying the attribute costs nothing and keeps the contract explicit."""
-    setting = platform_setting_name(provider.service)
-    encode_attr = {"token_encode": provider.token_encode} if provider.token_encode else {}
-    if provider.token_location in {"query", "json"}:
-        bindings = [{"platform_setting": setting, "injector": "env", "location": provider.token_location,
-                     "name": provider.token_param, "format": provider.token_format, **encode_attr}]
-    else:
-        bindings = [{"platform_setting": setting, "injector": "env", "location": "header",
-                     "name": provider.token_header, "format": provider.token_format, **encode_attr}]
-    # Keep tier 4 protocol-identical to BYOK. Required provider headers are constants, but they
-    # still use the same platform setting reference so the normal binding validator and injector
-    # own the whole shape. Crustdata's x-api-version pin is the first provider that needs this.
-    source = {k: v for k, v in bindings[0].items()
-              if k in ("platform_setting", "injector", "secret_field")}
-    bindings.extend({**source, "location": "header", "name": name, "format": value}
-                    for name, value in provider.required_headers)
-    # A per-user credential PAIR (Tomba's key+secret headers) needs treg's own second half on
-    # tier 4. platform_extra_setting is tier-4-only by design: extra_credential_setting would also
-    # ride user connects, pairing a user's key with treg's secret — a pair the provider rejects.
-    if provider.needs_extra_credential and provider.platform_extra_setting:
-        bindings.append({"platform_setting": provider.platform_extra_setting, "injector": "env",
-                         "location": provider.extra_credential_location,
-                         "name": provider.extra_credential_name,
-                         "format": "{secret}"})
-    return bindings
 
 
 def _platform_offer(ep: dict, provider, org: Org) -> dict | None:
@@ -1149,7 +1191,7 @@ def _capability_alternatives(ep: dict, *, limit: int = 3) -> list[str]:
     settings = get_settings()
     ranked = []
     for alt in cat.for_capability(capability):
-        if alt["id"] == ep["id"]:
+        if alt["id"] == ep["id"] or catalog_store.paused(alt):
             continue
         cost = cat.cost_view(alt.get("cost"), alt["provider"])
         usd = cost.get("usd") if cost else None
@@ -1240,6 +1282,28 @@ class _DuplicateJsonKey(ValueError):
 
 def _strict_json_object(body: bytes, ep_id: str) -> dict:
     """Parse a platform request without accepting ambiguous duplicate JSON keys."""
+    document = _strict_json(body, ep_id)
+    if not isinstance(document, dict):
+        raise ResolutionFailed(
+            "catalog_parameter_invalid", status_code=400,
+            detail=f"{ep_id} requires a JSON object request body",
+        )
+    return document
+
+
+def _strict_json_task_objects(body: bytes, ep_id: str) -> list[dict]:
+    """A JSON object, or the array of task objects some providers take (DataForSEO), as a list."""
+    document = _strict_json(body, ep_id)
+    tasks = document if isinstance(document, list) else [document]
+    if not tasks or not all(isinstance(task, dict) for task in tasks):
+        raise ResolutionFailed(
+            "catalog_parameter_invalid", status_code=400,
+            detail=f"{ep_id} requires a JSON object or an array of JSON objects as the request body",
+        )
+    return tasks
+
+
+def _strict_json(body: bytes, ep_id: str) -> object:
     def object_pairs(pairs):
         result = {}
         for name, value in pairs:
@@ -1260,11 +1324,6 @@ def _strict_json_object(body: bytes, ep_id: str) -> dict:
             "catalog_parameter_invalid", status_code=400,
             detail=f"{ep_id} requires a JSON request body",
         ) from None
-    if not isinstance(document, dict):
-        raise ResolutionFailed(
-            "catalog_parameter_invalid", status_code=400,
-            detail=f"{ep_id} requires a JSON object request body",
-        )
     return document
 
 
@@ -1454,7 +1513,7 @@ def _multipart_fields(body: bytes, content_type: str, ep_id: str) -> dict[str, o
             else:
                 fields[name] = value
         return fields
-    except Exception as exc:  # noqa: BLE001 - malformed multipart is one caller error
+    except Exception as exc:
         raise ResolutionFailed(
             "catalog_parameter_invalid", status_code=400,
             detail=f"{ep_id} requires a valid multipart/form-data request body",
@@ -1486,6 +1545,9 @@ def _apify_max_timeout() -> int:
     # Catalog rows pin timeout 90, so call_timeout_s must stay >= 120 or those rows refuse every call.
     return max(1, min(_APIFY_PLATFORM_MAX_TIMEOUT, get_settings().call_timeout_s - 30))
 _APIFY_PLATFORM_QUERY = frozenset({"maxTotalChargeUsd", "maxItems", "memory", "timeout"})
+_APOLLO_WEBHOOK_PARAMS = frozenset({
+    "reveal_phone_number", "webhook_url", "poll_only", "run_waterfall_email", "run_waterfall_phone",
+})
 _ASCII_INT = re.compile(r"[0-9]+")
 _ASCII_DECIMAL = re.compile(r"[0-9]+(?:\.[0-9]+)?")
 
@@ -1567,6 +1629,49 @@ def _enforce_platform_request(ep: dict, body: bytes, headers=None, query=None) -
     has a singleton enum is the row identity, not caller choice: accepting another value lets a cheap
     row reserve for an expensive model. Full schema validation remains out of the faithful BYOK path.
     """
+    if ep.get("provider") == "oceanio":
+        endpoint_id = ep["id"]
+        if endpoint_id in {
+            "oceanio.companies.lookalike", "oceanio.companies.search", "oceanio.people.search",
+        }:
+            document = _request_body_document(ep, body, headers)
+            size = document.get("size")
+            if type(size) is not int or not 1 <= size <= 100:
+                raise ResolutionFailed(
+                    "catalog_parameter_invalid", status_code=400, detail={
+                        "error": "catalog_parameter_invalid", "endpoint_id": endpoint_id,
+                        "parameter": "body.size",
+                        "message": "Ocean.io shared-key search requires an explicit size from 1 to 100; "
+                                   "connect your own key for larger searches",
+                    },
+                )
+        elif endpoint_id == "oceanio.people.enrich":
+            document = _request_body_document(ep, body, headers)
+            for name in ("revealEmails", "revealPhones"):
+                if name in document:
+                    raise ResolutionFailed(
+                        "catalog_parameter_invalid", status_code=400, detail={
+                            "error": "catalog_parameter_invalid", "endpoint_id": endpoint_id,
+                            "parameter": f"body.{name}",
+                            "message": "Ocean.io contact reveals are not available on the shared key; "
+                                       "connect your own key for reveals",
+                        },
+                    )
+
+    if ep.get("id") == "apollo.people.enrich" and query is not None:
+        # These answer later at the caller's webhook, outside the response settlement reads, and
+        # the phone and waterfall reveals draw credits the 1-credit hold never covered.
+        for name, _ in query.multi_items():
+            if name in _APOLLO_WEBHOOK_PARAMS:
+                raise ResolutionFailed(
+                    "catalog_parameter_invalid", status_code=400, detail={
+                        "error": "catalog_parameter_invalid", "endpoint_id": ep["id"],
+                        "parameter": f"queryParams.{name}",
+                        "message": "Apollo phone, waterfall and webhook options are not available on "
+                                   "the shared key; connect your own key for them",
+                    },
+                )
+
     if ep.get("provider") == "octen" and ep.get("id") in _OCTEN_ENDPOINTS:
         from . import octen
         invalid = octen.invalid_platform_parameter(ep["id"], body)
@@ -1736,19 +1841,22 @@ def _managed_values(ep: dict, rule: dict, query: QueryValues, body: bytes, heade
 
 async def _enforce_platform_managed_ownership(
     ep: dict, query: QueryValues, body: bytes, headers, caller: Caller, db: AsyncSession,
-) -> tuple[str, ...]:
+) -> tuple[tuple[str, ...], tuple[str | None, ...]]:
+    """(public ids looked up on any account, key slots of the org's own resources acted on)."""
     rule = ep.get("managed_resource") or {}
     operation = rule.get("operation")
     if not rule or operation == "create":
-        return ()
+        return (), ()
     values = _managed_values(ep, rule, query, body, headers)
     public_ids: list[str] = []
+    owners: list[str | None] = []
     for upstream_id in values:
         row = await provider_resources.owned(
             db, caller.org_id, ep["provider"], str(rule.get("kind") or ""), upstream_id,
             include_deleted=operation == "delete",
         )
         if row is not None:
+            owners.append(row.key_slot)
             continue
         # A resource assigned to another org (or tombstoned by this one) is private even when the
         # provider also has a public catalog. Deny it locally; never ask the shared account about a
@@ -1768,7 +1876,7 @@ async def _enforce_platform_managed_ownership(
             detail={"error": "provider_resource_not_owned",
                     "message": "resource is not owned by this organization"},
         )
-    return tuple(public_ids)
+    return tuple(public_ids), tuple(owners)
 
 
 def _async_resource_refs(ep: dict) -> list[tuple[str, dict]]:
@@ -1790,13 +1898,18 @@ def _async_resource_refs(ep: dict) -> list[tuple[str, dict]]:
 def _one_resource_value(ep: dict, query: QueryValues, refs: list[tuple[str, dict]],
                         body: bytes = b"") -> str:
     supplied: list[str] = []
-    document = _strict_json_object(body, ep["id"]) if body else {}
+    # Every task object must name the resource: a DataForSEO on-page reader takes `[{"id": ...}]`,
+    # and a second element naming another team's crawl must not ride along on an owned first one.
+    tasks = _strict_json_task_objects(body, ep["id"]) if body else [{}]
     for _, param in refs:
         name = str(param.get("name") or "")
         if param.get("in") == "body":
-            value = document.get(name)
-            if isinstance(value, (str, int, float)) and not isinstance(value, bool):
-                supplied.append(str(value))
+            for document in tasks:
+                value = document.get(name)
+                if isinstance(value, (str, int, float)) and not isinstance(value, bool):
+                    supplied.append(str(value))
+                elif len(tasks) > 1:
+                    supplied.append("")  # an element without the id makes the request ambiguous
         else:
             supplied.extend(value for key, value in query.items if key == name)
     values = set(supplied)
@@ -1818,30 +1931,32 @@ def _descriptor_ref(descriptor: dict, kind: str) -> tuple[str, dict]:
 
 async def _enforce_platform_async_ownership(
     ep: dict, query: QueryValues, body: bytes, caller: Caller, db: AsyncSession,
-) -> str | None:
-    """Authorize shared-key task/result utilities through the caller org's durable submission."""
+) -> tuple[str | None, tuple[str | None, ...]]:
+    """Authorize shared-key task/result utilities through the caller org's durable submission.
+    Returns (the owning submission when this is its poll, the key slot of the row that authorized
+    the call; empty when nothing had to)."""
     ownership = ep.get("resource_ownership") or {}
     required = ownership.get("requires") or {}
-    resource_owned = False
+    resource_slot: tuple[str | None, ...] = ()  # (the owning row's key slot,) when it exists
     if required:
         value = _one_resource_value(
             ep, query,
             [("resource", {"name": required.get("param"), "in": required.get("in")})],
             body,
         )
-        resource_owned = (await db.execute(select(AsyncResourceRecord.id).where(
+        resource_slot = tuple((await db.execute(select(AsyncResourceRecord.key_slot).where(
             AsyncResourceRecord.org_id == caller.org_id,
             *pinned_tag_predicates(AsyncResourceRecord.tags, caller.membership.pinned_tags),
             AsyncResourceRecord.provider == ep["provider"],
             AsyncResourceRecord.resource_kind == required.get("kind"),
             AsyncResourceRecord.resource_id == value,
-        ))).scalar_one_or_none() is not None
+        ))).first() or ())
 
     refs = _async_resource_refs(ep)
     if not refs:
-        if required and not resource_owned:
+        if required and not resource_slot:
             raise _async_resource_denied(caller)
-        return None
+        return None, resource_slot
     value = _one_resource_value(ep, query, refs, body)
     candidates = (await db.execute(select(AsyncTaskRecord).where(
         AsyncTaskRecord.org_id == caller.org_id,
@@ -1855,7 +1970,7 @@ async def _enforce_platform_async_ownership(
             if endpoint_id != ep["id"] or frozen_param != current_param:
                 continue
             if kind == "poll" and row.task_id == value:
-                return row.call_id
+                return row.call_id, (row.key_slot, *resource_slot)
             if kind == "fetch":
                 result = (row.descriptor or {}).get("result") or {}
                 same_as_task = (
@@ -1864,9 +1979,9 @@ async def _enforce_platform_async_ownership(
                     == (row.descriptor or {}).get("id_from")
                 )
                 if row.result_id == value or same_as_task:
-                    return None
-    if resource_owned:
-        return None
+                    return None, (row.key_slot, *resource_slot)
+    if resource_slot:
+        return None, resource_slot
     raise _async_resource_denied(caller)
 
 
@@ -2056,6 +2171,14 @@ async def _resolve_marketplace_call(
         raise ResolutionFailed(
             "method_mismatch", status_code=400,
             detail=f"{ep['id']} is {ep['method']} — add --method {ep['method']}")
+    # A form-only upstream answers a JSON body with an opaque 415; refuse it here with the fix
+    # instead. Nothing is rewritten, and a row whose upstream also takes JSON declares `json`.
+    if (has_body and (ep.get("input") or {}).get("bodyType") == "form"
+            and "json" in _request_headers(request_headers).get("content-type", "").lower()):
+        raise ResolutionFailed(
+            "catalog_parameter_invalid", status_code=400,
+            detail=f"{ep['id']} takes an application/x-www-form-urlencoded body, not JSON: send "
+                   "the same fields as key=value&key=value with that Content-Type")
 
     try:
         methods = connection_authorization.select_endpoint_methods(
@@ -2128,9 +2251,12 @@ async def _resolve_marketplace_call(
         # re-price a task already in flight.
         usage_unit_micro = _usd_to_micro(cat.unit_rates.get(service, {}).get(usage_unit))
     reported_charge_unit_micro = 0
-    if (raw_cost.get("reported_charge") or {}).get("unit") == "credit":
+    if raw_cost.get("currency") == "credit" or \
+            (raw_cost.get("reported_charge") or {}).get("unit") == "credit":
         # Freeze one provider credit's replacement cost so a later fx edit cannot re-price a call
         # already in flight. USD reported charges use their fixed micro-USD conversion directly.
+        # Body-reported credit counts (datagma, sumble, scrubby) settle against this, never against
+        # `unit_micro`, which is a whole call on a per_success row.
         reported_charge_unit_micro = _usd_to_micro(cat.credit_rates.get(service))
     basis = settlement_basis.derive_basis(
         raw_cost, request=request_data, input_schema=ep.get("input") or {},
@@ -2168,8 +2294,7 @@ async def _resolve_marketplace_call(
         params_hash=phash, cost_type=str((ep.get("cost") or {}).get("type") or ""),
         estimate_micro=info_est,
         # The per-ROW price, carried on every tier (settle only reads it on metered calls):
-        # a `per_result` settle that can't count rows can only ever bill the estimate,
-        # which is how 6,000 delivered Bright Data records once billed as one (2026-08-24).
+        # a `per_result` settle that can't count rows can only ever bill the estimate.
         unit_micro=info_unit, reported_charge_unit_micro=reported_charge_unit_micro,
         settlement_basis=basis, request_data=request_data,
         async_descriptor=ep.get("async"), resource_ownership=ep.get("resource_ownership"),
@@ -2180,13 +2305,14 @@ async def _resolve_marketplace_call(
         return MarketplaceCall(tool=chosen_tool, tier="tool", **common)
 
     if not methods:
-        try:  # tier 1 - the org registered this provider: their tool, their bindings, their ACLs
-            target = await resolve_call(upstream, caller, db)
-            return MarketplaceCall(
-                tool=target.tool, tier="tool", **{**common, "upstream": target.upstream})
-        except ResolutionFailed as exc:
-            if exc.status_code != 404:  # 403 (ACL) / 409 (ambiguous) are real answers, not fall-through
-                raise
+        for candidate in provider.tool_lookup_urls(upstream):
+            try:  # tier 1 - the org registered this provider: their tool, their bindings, their ACLs
+                target = await resolve_call(candidate, caller, db)
+                return MarketplaceCall(
+                    tool=target.tool, tier="tool", **{**common, "upstream": target.upstream})
+            except ResolutionFailed as exc:
+                if exc.status_code != 404:  # 403 (ACL) / 409 (ambiguous) are real answers, not fall-through
+                    raise
 
     secret = chosen_secret or await _marketplace_secret(service, caller.org_id, db)  # tier 2
     if secret is not None:
@@ -2219,8 +2345,13 @@ async def _resolve_marketplace_call(
     # silently switched onto our key (their quota, their rate limits, their data agreements).
     cost = _platform_offer(ep, provider, caller.org)
     async_owner_call_id = None
+    async_owners: tuple[str | None, ...] = ()
+    resource_owners: tuple[str | None, ...] = ()
     if cost is not None:
         _enforce_platform_request(ep, body, request_headers, query)
+        _enforce_team_label(ep, caller.org_id, body, request_headers, query)
+        _enforce_caller_email(ep, caller.email, body, request_headers, query)
+        _enforce_request_quantity(ep, cost, body, query)
         if service == "sumble":
             from . import sumble
             sumble.enforce(ep, _strict_json_object(body, ep["id"]) if has_body else {}, query)
@@ -2248,40 +2379,63 @@ async def _resolve_marketplace_call(
                         "parameter": name, "expected": expected,
                         "message": f"{ep['id']} requires {name}={expected!r}; use the matching catalog tool.",
                     })
-        async_owner_call_id = await _enforce_platform_async_ownership(ep, query, body, caller, db)
-        public_resource_ids = await _enforce_platform_managed_ownership(
+        async_owner_call_id, async_owners = await _enforce_platform_async_ownership(
+            ep, query, body, caller, db)
+        public_resource_ids, resource_owners = await _enforce_platform_managed_ownership(
             ep, query, body, request_headers, caller, db)
     skip_direct = False
     probe_lock_id = None
-    if cost is not None and capacity_view.is_exhausted(service, ep["id"]):
+    key_slot = None
+    if cost is not None:
+        # None: any of treg's accounts may serve it; the call path picks one before the relay.
+        key_slot = keyslots.pinned(
+            service, owners=async_owners + resource_owners,
+            idempotency_key=_key_affinity(caller, request_headers))
+    metered = cost is not None and capacity_marks.spends_balance(str(cost.get("type") or "per_call"))
+    if cost is not None and (keyslots.exhausted(service, ep["id"], key_slot, metered=metered)
+                             if key_slot is not None
+                             else keyslots.all_exhausted(service, ep["id"], metered=metered)):
         # treg's own account for this call is known to be out (the call-path lock, or the sweep).
-        # A lock admits one probe a minute so a recovered account is noticed. Otherwise never
+        # Either admits one probe a minute so a recovered account is noticed. Otherwise never
         # relay a call we know will 402: with an enabled overflow route the ladder skips straight
-        # to the child cycle (plan §4); else refuse BEFORE reserve with a typed 503 naming when
-        # and what else (§4.2).
-        lock = capacity_view.active_lock(service, ep["id"])
+        # to the child cycle; else refuse BEFORE reserve with a typed 503 naming when and what
+        # else. With every account out, the probe goes to the primary.
+        key_slot = key_slot or keyslots.PRIMARY_SLOT
+        cap_slot = keyslots.capacity_slot(key_slot)
+        lock = capacity_view.active_lock(service, ep["id"], cap_slot, metered=metered)
+        state = capacity_view.get(service) if lock is None and cap_slot is None and metered else None
         if lock is not None and capacity_marks.probe_due(lock.key):
             probe_lock_id = lock.lock_id
+        elif state is not None and capacity_marks.sweep_probe_due(service, state.observed_at):
+            probe_lock_id = capacity_marks.sweep_probe_id(state.observed_at)
         elif (get_settings().overflow_mode == "on" and not caller.org.platform_overflow_disabled
                 and overflow_routes_view.for_endpoint(ep["id"])):
             skip_direct = True
         else:
             raise _provider_capacity_unavailable(
-                ep, service, capacity_view.exhausted_until(service, ep["id"]),
-                probing=lock is not None)
+                ep, service, capacity_view.exhausted_until(service, ep["id"], cap_slot, metered=metered),
+                probing=True)
     if cost is not None:
         virtual = Tool(
             org_id=caller.org_id, name=ep["id"], owner=caller.email,
             base_url=provider.base_url, host=_host_of(provider.base_url),
-            bindings=_platform_bindings(provider),
+            bindings=oauth_providers.platform_bindings(provider, key_slot),
         )
         return MarketplaceCall(tool=virtual, tier="platform", skip_direct=skip_direct,
                                async_owner_call_id=async_owner_call_id,
                                public_resource_ids=public_resource_ids,
-                               probe_lock_id=probe_lock_id, **{
+                               probe_lock_id=probe_lock_id,
+                               key_slot=key_slot, **{
             **common, "cost_type": str(cost.get("type") or "per_call"),
             "estimate_micro": info_est, "unit_micro": info_unit})
     raise _marketplace_no_credential(service, ep["id"], provider, ep)
+
+
+def _key_affinity(caller: Caller, headers) -> str:
+    """The caller's Idempotency-Key, scoped to the org: what pins a retry to one of treg's
+    accounts (`keyslots`). Empty without the header."""
+    key = _idempotency_key(headers.get(IDEMPOTENCY_HEADER) if headers is not None else None)
+    return f"{caller.org_id}{_IDEM_SCOPE_SEP}{key}" if key else ""
 
 
 def _provider_capacity_unavailable(ep: dict, service: str, resets, *,
@@ -2289,8 +2443,8 @@ def _provider_capacity_unavailable(ep: dict, service: str, resets, *,
     """The typed floor (plan §4.5): no charge, `resets_at` when known, and the same-capability
     alternatives — treg names them and leaves the choice to the caller (charter: no failover)."""
     # Say what treg is doing about it before what the caller could do: an agent quotes the first
-    # imperative line back to its user, and "use your own key" read as "your plan lost access"
-    # (2026-09-17). Nothing about the caller's plan or balance changed.
+    # imperative line back to its user, and "use your own key" reads as "your plan lost access".
+    # Nothing about the caller's plan or balance changed.
     lines = [f"treg's own {service} account is out of capacity right now — {ep['id']} can't be "
              f"served on treg's key" + (f" until about {resets:%Y-%m-%d %H:%M} UTC" if resets else "")
              + "; nothing about your plan or balance changed and nothing was charged"]
@@ -2308,6 +2462,13 @@ def _provider_capacity_unavailable(ep: dict, service: str, resets, *,
     })
 
 
+def provider_paused(service: str, endpoint_id: str | None = None) -> ResolutionFailed:
+    """This deployment paused `service` (TREG_PAUSED_PROVIDERS): refused before any hold, charge
+    or upstream request, on the catalog road and on a connection's own tool alike."""
+    return ResolutionFailed("provider_paused", status_code=503,
+                            detail=oauth_providers.paused_detail(service, endpoint_id))
+
+
 async def resolve_marketplace_target(
     ep: dict,
     *,
@@ -2320,9 +2481,11 @@ async def resolve_marketplace_target(
     request_headers=None,
     authorization_method: str = "",
 ) -> MarketplaceCall:
-    # The exhausted view is refreshed here — before the resolution session opens, so at most one
+    if oauth_providers.is_paused(ep.get("provider")):
+        raise provider_paused(ep["provider"], ep["id"])
+    # The exhausted view is refreshed here - before the resolution session opens, so at most one
     # connection is held at a time, and before any hold exists. Cached 60 s; a stale or empty view
-    # never refuses (plan §4.1: blocking fires on confirmed signals only).
+    # never refuses: blocking fires on confirmed signals only.
     await capacity_view.load()
     if get_settings().overflow_mode != "off":
         await overflow_routes_view.load()  # same discipline: before the session, cached 60 s

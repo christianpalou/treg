@@ -1,15 +1,31 @@
 
 export default {
-async loadUsage(){ if(!this.canAdmin || !this.activeOrgId) return; this.usage=null; const live=this.ticket('usage');
-      try{ const usage=await this.api('/orgs/'+this.activeOrgId+'/usage?days='+this.usageDays); if(live()) this.usage=usage; }
-      catch(e){ if(live()) this.err='Failed to load usage: '+(e.detail||e.status); }
-      await this.loadTagUsage(); },
+// Every section loads on its own and shows itself when ready: the page never waits for the slowest
+// one (the counts read the audit table), and a failed section does not take the others with it.
+async loadUsage(){ if(!this.canAdmin || !this.activeOrgId) return;
+      this.usageToolPage=0; this.usageDayPage=0;
+      await Promise.all([this.loadUsageCounts(), this.loadUsageSpend(), this.loadTagUsage()]); },
+async loadUsageCounts(){ if(!this.canAdmin || !this.activeOrgId) return; this.usage=null; this.usageErr=''; const live=this.ticket('usage');
+      try{ const usage=await this.reportApi('/orgs/'+this.activeOrgId+'/usage?days='+this.usageDays); if(live()) this.usage=usage; }
+      catch(e){ if(live()) this.usageErr='Could not load usage counts: '+(e.detail||e.status); } },
+// The spend chart reads only the daily spend rollup. It keeps its last answer on screen (dimmed)
+// while a filter change loads the next. Days are UTC.
+spendQuery(){ const r=this.spendRange, f=this.spendFilter, today=new Date().toISOString().slice(0,10);
+      const from=r.preset==='custom' ? r.from : new Date(Date.parse(today+'T00:00:00Z')-(r.preset-1)*864e5).toISOString().slice(0,10);
+      return 'from='+from+'&to='+(r.preset==='custom' ? r.to : today)+'&group='+f.group+'&stack='+f.stack+
+        (f.key?'&key='+f.key:'')+(f.provider?'&provider='+encodeURIComponent(f.provider):''); },
+async loadUsageSpend(){ if(!this.canAdmin || !this.activeOrgId) return; const live=this.ticket('usageSpend');
+      if(!this.spendFilter.provider) this.spendFilter.stack='key';
+      this.usageSpendBusy=true; this.usageSpendErr=''; this.spendRankPage=0;
+      try{ const spend=await this.api('/orgs/'+this.activeOrgId+'/usage/spend?'+this.spendQuery()); if(live()) this.usageSpend=spend; }
+      catch(e){ if(live()) this.usageSpendErr='Could not load spend: '+(e.detail||e.status); }
+      finally{ if(live()) this.usageSpendBusy=false; } },
+setSpendRange(value){ this.spendRange=value; this.loadUsageSpend(); },
 async loadTagUsage(){ if(!this.canAdmin || !this.activeOrgId) return;
-      this.tagUsage={}; const live=this.ticket('tagUsage'), org=this.activeOrgId;
+      this.tagUsage={}; this.tagUsageErr={}; const live=this.ticket('tagUsage'), org=this.activeOrgId;
       try{
         // What the team has actually SENT. Reporting works on any key, unlike enforcement, which
-        // needs a declared one — so this is deliberately NOT the budgetable list, which hid
-        // `feature=` and friends from the dashboard even though the API served them fine.
+        // needs a declared one - so this is deliberately NOT the budgetable list.
         const k=await this.api('/orgs/'+org+'/tag-keys');
         if(!live()) return;
         const primary=k.primary;
@@ -17,15 +33,14 @@ async loadTagUsage(){ if(!this.canAdmin || !this.activeOrgId) return;
         // Primary first — it is the one a reselling team bills on; the rest alphabetically.
         keys.sort((a,b)=> a===primary ? -1 : b===primary ? 1 : a.localeCompare(b));
         this.tagKeys=keys;
-        // One request per key. Bounded by the 5-key cap on the header, and they run together.
-        const got=await Promise.all(keys.map(key=>
-          this.api('/orgs/'+org+'/usage/by-tag?key='+encodeURIComponent(key)+
-                   '&days='+this.usageDays).catch(()=>null)));
-        if(!live()) return;
-        const out={};
-        keys.forEach((key,i)=>{ if(got[i]) out[key]=got[i]; });
-        this.tagUsage=out;
-      }catch(e){ if(live()){ this.tagUsage={}; this.tagKeys=[]; } } },
+        // One request per key, bounded by the 5-key cap on the header. They run one at a time:
+        // the server runs only a couple of reports at once, and a refused one is retried.
+        for(const key of keys){
+          try{ const u=await this.reportApi('/orgs/'+org+'/usage/by-tag?key='+encodeURIComponent(key)+'&days='+this.usageDays);
+            if(!live()) return; this.tagUsage={...this.tagUsage, [key]:u}; }
+          catch(e){ if(!live()) return; this.tagUsageErr={...this.tagUsageErr, [key]:'Could not load spend by '+key+': '+(e.detail||e.status)}; }
+        }
+      }catch(e){ if(live()){ this.tagUsage={}; this.tagUsageErr={}; this.tagKeys=[]; } } },
 // micro-USD -> a money string, EXACT. Cents round a $0.0006 charge to $0.00 and a $9.999 balance
     // to "$10.00"; a fixed 4 decimals rounds $0.00015 to $0.0001 (float: 0.00015 is stored just
     // under). So: whole-cent amounts render as normal cents, everything else renders all 6 micro

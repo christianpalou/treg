@@ -9,9 +9,12 @@ from __future__ import annotations
 
 import atexit
 import glob
+import hashlib
+import hmac
 import os
 import socket
 import tempfile
+from pathlib import Path
 
 # Tests and their CLI subprocesses must never emit production analytics.
 os.environ["TREG_TELEMETRY"] = "0"
@@ -64,6 +67,27 @@ if _test_db_url and _worker and _test_db_url.startswith("postgresql"):
 os.environ["TREG_DATABASE_URL"] = _test_db_url or _default
 # Replica tests opt in explicitly; never inherit a real replica from the shell or .env.
 os.environ["TREG_READ_DATABASE_URL"] = ""
+os.environ["TREG_WORKOS_API_KEY"] = ""
+os.environ["TREG_WORKOS_CLIENT_ID"] = ""
+os.environ["TREG_WORKOS_WEBHOOK_SECRET"] = ""
+os.environ["TREG_PUBLIC_URL"] = "https://treg.to"
+os.environ["TREG_OVERFLOW_MODE"] = "off"
+os.environ["TREG_OVERFLOW_KEY_ORTHOGONAL"] = ""
+os.environ["TREG_OVERFLOW_KEY_MONID"] = ""
+# A merged local .env can carry newly added funded platform keys that the fixed list below has not
+# learned yet. Blank their names without reading values into logs or exposing them to tests.
+_local_env = Path(__file__).resolve().parents[1] / ".env"
+_platform_names = {name for name in os.environ if name.startswith("TREG_PLATFORM_KEY_")}
+if _local_env.exists():
+    _platform_names.update(line.split("=", 1)[0].strip() for line in _local_env.read_text().splitlines()
+                           if line.startswith("TREG_PLATFORM_KEY_") and "=" in line)
+for _platform_name in _platform_names:
+    os.environ[_platform_name] = ""
+# Never let a developer's Redis URL or rollout settings turn tests into shared-store traffic.
+os.environ["TREG_KV_URL"] = ""
+os.environ["TREG_MONEY_ADMISSION_ENABLED"] = "false"
+os.environ["TREG_MONEY_ADMISSION_ORG_IDS"] = "[]"
+os.environ["TREG_ORG_FLOW_CONTROL_ENABLED"] = "false"
 os.environ["TREG_EMAIL_DEV_MODE"] = "true"  # tests need the returned OTP code (prod default is now False)
 os.environ["TREG_RESEND_API_KEY"] = ""  # never fire a real Resend send from the test suite (send_otp/send_invite skip when empty)
 os.environ["TREG_RUN_ALLOWED_BINS"] = "sh,echo,true,false,cat,sleep,treg-nonexistent-bin-xyz"  # allow the test CLIs for --server run tests
@@ -91,7 +115,7 @@ for _k in (
     "PLATFORM_KEY_QUICKENRICH", "PLATFORM_KEY_PROSPEO", "PLATFORM_KEY_AIARK", "PLATFORM_KEY_WIZA",
     "PLATFORM_KEY_SCRUBBY", "PLATFORM_KEY_ZEROBOUNCE", "PLATFORM_KEY_SUMBLE", "PLATFORM_KEY_MOLTSETS",
     "PLATFORM_KEY_OPENMART", "PLATFORM_KEY_LIMADATA", "PLATFORM_KEY_HARVESTAPI", "PLATFORM_KEY_FETCHINIO",
-    "PLATFORM_KEY_DROPLEADS",
+    "PLATFORM_KEY_DROPLEADS", "PLATFORM_KEY_BLITZAPI",
     "PLATFORM_KEY_FINANCIALDATASETS",
     "PLATFORM_KEY_ADYNTEL", "PLATFORM_EMAIL_ADYNTEL",
     "PLATFORM_KEY_KEENABLE", "PLATFORM_KEY_OLOSTEP",
@@ -183,9 +207,25 @@ def make_upstream(hook_hits: list | None = None) -> FastAPI:
             return JSONResponse({"error": {"message": "invalid token"}}, status_code=401)
         return {"user_id": "17841400000000000", "username": "direct_ig"}
 
+    def _meta_proof_missing(request: Request) -> JSONResponse | None:
+        # treg's Meta app requires App Secret Proof: a token it issued (META-TOKEN, PAGE-TOKEN-*) is
+        # refused unless paired with HMAC-SHA256(app secret, token), as Graph does in production.
+        token = request.headers.get("authorization", "").removeprefix("Bearer ")
+        if token != "META-TOKEN" and not token.startswith("PAGE-TOKEN"):
+            return None
+        app_secret = os.environ.get("TREG_META_CLIENT_SECRET", "").encode()
+        want = hmac.new(app_secret, token.encode(), hashlib.sha256).hexdigest()
+        if request.query_params.get("appsecret_proof") == want:
+            return None
+        return JSONResponse({"error": {
+            "message": "API calls from the server require an appsecret_proof argument",
+            "type": "GraphMethodException", "code": 100}}, status_code=400)
+
     @up.get("/me/accounts")
     @up.get("/v25.0/me/accounts")
-    async def meta_pages(request: Request) -> dict:
+    async def meta_pages(request: Request):
+        if refused := _meta_proof_missing(request):
+            return refused
         # Meta's primary Page listing: what the user manages through a PERSONAL Page role. One row
         # carries both the facebook shape (id/name) and the instagram shape (nested professional
         # account), so both Meta providers can discover against the same stand-in.
@@ -200,6 +240,8 @@ def make_upstream(hook_hits: list | None = None) -> FastAPI:
     @up.get("/me/businesses")
     @up.get("/v25.0/me/businesses")
     async def meta_businesses(request: Request):
+        if refused := _meta_proof_missing(request):
+            return refused
         # Meta's Business walk (needs business_management): each business row nests owned_pages /
         # client_pages whose entries are shaped like /me/accounts rows. PAGE-DIRECT reappears here
         # (a personal-role Page is usually also Business-owned) to exercise dedup, and the
@@ -234,6 +276,8 @@ def make_upstream(hook_hits: list | None = None) -> FastAPI:
 
     @up.get("/v25.0/{page_id}/conversations")
     async def instagram_conversations(page_id: str, request: Request):
+        if refused := _meta_proof_missing(request):
+            return refused
         if request.headers.get("authorization") == "Bearer IG-LONG-TOKEN":
             return {
                 "auth": request.headers["authorization"],
@@ -251,8 +295,28 @@ def make_upstream(hook_hits: list | None = None) -> FastAPI:
             return {"data": []}
         return {"data": [{"id": "IG-CONVERSATION-1", "page_id": page_id}]}
 
+    @up.get("/v25.0/{page_id}/posts")
+    async def facebook_page_posts(page_id: str, request: Request):
+        if refused := _meta_proof_missing(request):
+            return refused
+        # Meta's new Pages experience answers a user token on a Page edge with code 190 /
+        # subcode 2069032. Only the token of the Page in the path is accepted.
+        expected_token = {
+            "PAGE-DIRECT": "PAGE-TOKEN-DIRECT",
+            "PAGE-CLIENT": "PAGE-TOKEN-CLIENT",
+        }.get(page_id)
+        if request.headers.get("authorization") != f"Bearer {expected_token}":
+            return JSONResponse(
+                {"error": {"message": "A Page access token is required for this call",
+                           "code": 190, "error_subcode": 2069032}},
+                status_code=400,
+            )
+        return {"data": [{"id": f"{page_id}_POST-1", "message": "hello"}]}
+
     @up.post("/v25.0/{page_id}/subscribed_apps")
     async def instagram_subscribe(page_id: str, request: Request):
+        if refused := _meta_proof_missing(request):
+            return refused
         expected_token = {
             "PAGE-DIRECT": "PAGE-TOKEN-DIRECT",
             "PAGE-CLIENT": "PAGE-TOKEN-CLIENT",
@@ -370,7 +434,7 @@ async def verified_identity(client, email):
         with patch.object(email_sender, "send_otp", receive):
             started = await client.post("/auth/email/start", json={"email": email})
         assert started.status_code == 200, started.text
-        code = started.json().get("dev_code") or delivered[email]
+        code = started.json().get("dev_code") or delivered[started.json()["email"]]
         proof = await client.post("/auth/email/verify", json={"email": email, "code": code})
         assert proof.status_code == 200, proof.text
         return proof.json()["token"]
@@ -465,6 +529,14 @@ async def clients():
         await app.state.http.aclose()
 
 
+@pytest.fixture(autouse=True, scope="session")
+def _provider_labels():
+    """The provider display names search matches ("people data labs"), wired as `create_app` wires
+    them, for the tests that search without building an app."""
+    from treg import bootstrap
+    bootstrap.configure_provider_labels()
+
+
 @pytest.fixture(autouse=True)
 def _reset_call_path_caches():
     """The call path keeps in-process copies of ratestore state (the capacity view: 'provider X is
@@ -491,6 +563,8 @@ def _reset_call_path_caches():
         try:
             from treg.infra.upstream.limiter import limiter
             limiter.reset()
+            from treg.application.call import keyslots
+            keyslots._rotation.clear()
         except ImportError:
             pass
         # The shared store's in-process fallback (the review-invitation budget): org ids restart

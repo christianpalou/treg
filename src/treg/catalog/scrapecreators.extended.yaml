@@ -15,7 +15,7 @@
 # 2026-07-28: platform slugs added to capabilities.yaml and endpoints re-filed off `web`:
 # apple-music, bluesky, github, kick, pinterest, rumble, snapchat, soundcloud, spotify,
 # truthsocial, twitch, plus komi/linkbio/linkme/linktree/pillar under `linkinbio`.
-# Only detect-age-gender (image detection, no platform) remains on `web`.
+# Creator photo age and gender estimation files under the creators platform.
 
 provider: scrapecreators
 source:
@@ -54,6 +54,7 @@ endpoints:
     queryParams:
       page: '1'
   verified: '2026-07-28'
+  added: '2026-07-28'
   example_response: examples/scrapecreators.x.v1-account-get-api-usage.json
   observed_time: 1.15
 - id: scrapecreators.x.v1-account-get-daily-usage-count
@@ -68,6 +69,7 @@ endpoints:
   test_request:
     queryParams: {}
   verified: '2026-07-28'
+  added: '2026-07-28'
   example_response: examples/scrapecreators.x.v1-account-get-daily-usage-count.json
   observed_time: 1.09
 - id: scrapecreators.x.v1-account-get-most-used-routes
@@ -95,6 +97,7 @@ endpoints:
     queryParams:
       start_time: '2025-04-01T00:00:00.000Z'
   verified: '2026-07-28'
+  added: '2026-07-28'
   example_response: examples/scrapecreators.x.v1-account-get-most-used-routes.json
   observed_time: 1.19
 - id: scrapecreators.x.v1-amazon-shop
@@ -126,9 +129,11 @@ endpoints:
     queryParams:
       url: https://www.amazon.com/shop/sydneydelrey
   verified: '2026-07-28'
+  added: '2026-07-28'
   example_response: examples/scrapecreators.x.v1-amazon-shop.json
   observed_time: 8.1
 - id: scrapecreators.x.v1-apple-music-album
+  added: '2026-07-28'
   tier: extended
   platform: apple-music
   method: GET
@@ -163,6 +168,7 @@ endpoints:
       id: '1468058165'
   skipped: not called — $1.0000 would exceed this run's $45.00 budget
 - id: scrapecreators.x.v1-apple-music-artist
+  added: '2026-07-28'
   tier: extended
   platform: apple-music
   method: GET
@@ -197,6 +203,7 @@ endpoints:
       id: '159260351'
   skipped: not called — $1.0000 would exceed this run's $45.00 budget
 - id: scrapecreators.x.v1-apple-music-search
+  added: '2026-07-28'
   tier: extended
   platform: apple-music
   method: GET
@@ -231,6 +238,7 @@ endpoints:
       query: taylor swift
   skipped: not called — $1.0000 would exceed this run's $45.00 budget
 - id: scrapecreators.x.v1-apple-music-track
+  added: '2026-07-28'
   tier: extended
   platform: apple-music
   method: GET
@@ -265,6 +273,7 @@ endpoints:
       id: '1833328840'
   skipped: not called — $1.0000 would exceed this run's $45.00 budget
 - id: scrapecreators.x.v1-bluesky-post
+  added: '2026-07-28'
   tier: extended
   platform: bluesky
   method: GET
@@ -295,6 +304,7 @@ endpoints:
   skipped: not called — $1.0000 would exceed this run's $45.00 budget
   capability: bluesky.post.detail
 - id: scrapecreators.x.v1-bluesky-profile
+  added: '2026-07-28'
   tier: extended
   platform: bluesky
   method: GET
@@ -325,6 +335,7 @@ endpoints:
   skipped: not called — $1.0000 would exceed this run's $45.00 budget
   capability: bluesky.user.profile
 - id: scrapecreators.x.v1-bluesky-user-posts
+  added: '2026-07-28'
   tier: extended
   platform: bluesky
   method: GET
@@ -360,12 +371,14 @@ endpoints:
   skipped: not called — $1.0000 would exceed this run's $45.00 budget
   capability: bluesky.user.posts
 - id: scrapecreators.x.v1-detect-age-gender
+  added: '2026-07-28'
   kind: utility
   tier: extended
-  platform: web
+  capability: creators.photo.demographics
+  platform: creators
   method: GET
   path: /v1/detect-age-gender
-  name: "Estimate age and gender from a profile photo URL"
+  name: "Estimate age and gender"
   summary: Uses AI to analyze a creator's profile photo and estimate their age and gender.
   cost:
     type: per_call
@@ -390,6 +403,7 @@ endpoints:
       url: https://twitter.com/levelsio
   skipped: not called — $1.0000 would exceed this run's $45.00 budget
 - id: scrapecreators.x.v1-facebook-adlibrary-ad
+  added: '2026-07-28'
   tier: extended
   platform: meta-ads
   method: GET
@@ -434,6 +448,7 @@ endpoints:
       id: '702369045530963'
   unverified: 'http 404: Shoot it looks like the ad doesn''t exist :('
 - id: scrapecreators.x.v1-facebook-adlibrary-ad-transcript
+  added: '2026-07-28'
   tier: extended
   platform: meta-ads
   method: GET
@@ -473,6 +488,7 @@ endpoints:
       id: '1020359190509080'
   unverified: 'http 404: Shoot it looks like the ad doesn''t exist :('
 - id: scrapecreators.x.v1-facebook-adlibrary-company-ads
+  added: '2026-07-28'
   tier: extended
   platform: meta-ads
   capability: meta-ads.library.advertiser
@@ -551,8 +567,10 @@ endpoints:
   test_request:
     queryParams:
       pageId: '367152833370567'
-  skipped: not called — $1.0000 would exceed this run's $45.00 budget
+  verified: '2026-10-20'
+  example_response: examples/scrapecreators.x.v1-facebook-adlibrary-company-ads.json
 - id: scrapecreators.x.v1-facebook-adlibrary-search-ads
+  added: '2026-07-28'
   tier: extended
   platform: meta-ads
   capability: meta-ads.library.search
@@ -635,6 +653,7 @@ endpoints:
       query: running
   skipped: not called — $1.0000 would exceed this run's $45.00 budget
 - id: scrapecreators.x.v1-facebook-adlibrary-search-companies
+  added: '2026-07-28'
   tier: extended
   platform: meta-ads
   method: GET
@@ -697,6 +716,7 @@ endpoints:
     queryParams:
       id: '2255360061870188'
   verified: '2026-07-28'
+  added: '2026-07-28'
   example_response: examples/scrapecreators.x.v1-facebook-event-details.json
   observed_time: 0.89
   capability: facebook.event.detail
@@ -738,6 +758,7 @@ endpoints:
     queryParams:
       url: https://www.facebook.com/events/explore/saint-petersburg-florida/111326725552547
   verified: '2026-07-28'
+  added: '2026-07-28'
   example_response: examples/scrapecreators.x.v1-facebook-events.json
   observed_time: 3.19
   capability: facebook.events.city
@@ -775,6 +796,7 @@ endpoints:
     queryParams:
       query: Event name or description
   verified: '2026-07-28'
+  added: '2026-07-28'
   example_response: examples/scrapecreators.x.v1-facebook-events-search.json
   observed_time: 1.99
   capability: facebook.search.events
@@ -812,6 +834,7 @@ endpoints:
     queryParams:
       url: https://www.facebook.com/groups/366190054572553/about
   verified: '2026-07-28'
+  added: '2026-07-28'
   example_response: examples/scrapecreators.x.v1-facebook-group.json
   observed_time: 1.71
   capability: facebook.group.info
@@ -859,6 +882,7 @@ endpoints:
     queryParams:
       url: https://www.facebook.com/groups/1270525996445602/
   verified: '2026-07-28'
+  added: '2026-07-28'
   example_response: examples/scrapecreators.x.v1-facebook-group-posts.json
   observed_time: 3.0
   capability: facebook.group.posts
@@ -896,6 +920,7 @@ endpoints:
     queryParams:
       id: '1656586118821988'
   verified: '2026-07-28'
+  added: '2026-07-28'
   example_response: examples/scrapecreators.x.v1-facebook-marketplace-item.json
   observed_time: 2.77
   capability: facebook.marketplace.item.detail
@@ -928,6 +953,7 @@ endpoints:
     queryParams:
       query: Austin
   verified: '2026-07-28'
+  added: '2026-07-28'
   example_response: examples/scrapecreators.x.v1-facebook-marketplace-location-search.json
   observed_time: 1.3
   capability: facebook.marketplace.location.search
@@ -1022,6 +1048,7 @@ endpoints:
       lat: '30.2677'
       lng: '-97.7475'
   verified: '2026-07-28'
+  added: '2026-07-28'
   example_response: examples/scrapecreators.x.v1-facebook-marketplace-search.json
   observed_time: 2.33
   capability: facebook.marketplace.search
@@ -1059,10 +1086,12 @@ endpoints:
     queryParams:
       url: https://www.facebook.com/reel/1535656380759655
   verified: '2026-07-28'
+  added: '2026-07-28'
   example_response: examples/scrapecreators.x.v1-facebook-post.json
   observed_time: 3.59
   capability: facebook.post.detail
 - id: scrapecreators.x.v1-facebook-post-comment-replies
+  added: '2026-07-28'
   tier: extended
   platform: facebook
   method: GET
@@ -1143,9 +1172,11 @@ endpoints:
     queryParams:
       url: https://www.facebook.com/reel/753347914167361
   verified: '2026-07-28'
+  added: '2026-07-28'
   example_response: examples/scrapecreators.x.v1-facebook-post-comments.json
   observed_time: 5.21
 - id: scrapecreators.x.v1-facebook-post-transcript
+  added: '2026-07-28'
   tier: extended
   platform: facebook
   method: GET
@@ -1223,6 +1254,7 @@ endpoints:
     queryParams:
       url: https://www.facebook.com/mantraindianfolsom
   verified: '2026-07-28'
+  added: '2026-07-28'
   example_response: examples/scrapecreators.x.v1-facebook-profile.json
   observed_time: 4.21
   capability: facebook.user.profile
@@ -1260,6 +1292,7 @@ endpoints:
     queryParams:
       url: https://www.facebook.com/brickyardoldtown
   verified: '2026-07-28'
+  added: '2026-07-28'
   example_response: examples/scrapecreators.x.v1-facebook-profile-events.json
   observed_time: 3.32
   capability: facebook.page.events
@@ -1302,6 +1335,7 @@ endpoints:
     queryParams:
       url: https://www.facebook.com/Spurs
   verified: '2026-07-28'
+  added: '2026-07-28'
   example_response: examples/scrapecreators.x.v1-facebook-profile-photos.json
   observed_time: 1.63
   capability: facebook.page.photos
@@ -1345,6 +1379,7 @@ endpoints:
     queryParams:
       url: https://www.facebook.com/pacemorby
   verified: '2026-07-28'
+  added: '2026-07-28'
   example_response: examples/scrapecreators.x.v1-facebook-profile-posts.json
   observed_time: 5.37
 - id: scrapecreators.x.v1-facebook-profile-reels
@@ -1386,10 +1421,12 @@ endpoints:
     queryParams:
       url: https://www.facebook.com/pacemorby
   verified: '2026-07-28'
+  added: '2026-07-28'
   example_response: examples/scrapecreators.x.v1-facebook-profile-reels.json
   observed_time: 3.41
   capability: facebook.page.reels
 - id: scrapecreators.x.v1-github-repository
+  added: '2026-07-28'
   tier: extended
   platform: github
   method: GET
@@ -1420,6 +1457,7 @@ endpoints:
   skipped: not called — $1.0000 would exceed this run's $45.00 budget
   capability: github.repo.profile
 - id: scrapecreators.x.v1-github-trending-developers
+  added: '2026-07-28'
   tier: extended
   platform: github
   method: GET
@@ -1455,6 +1493,7 @@ endpoints:
   skipped: not called — $1.0000 would exceed this run's $45.00 budget
   capability: github.trending.developers
 - id: scrapecreators.x.v1-github-trending-repositories
+  added: '2026-07-28'
   tier: extended
   platform: github
   method: GET
@@ -1495,6 +1534,7 @@ endpoints:
   skipped: not called — $1.0000 would exceed this run's $45.00 budget
   capability: github.trending.repositories
 - id: scrapecreators.x.v1-github-user
+  added: '2026-07-28'
   tier: extended
   platform: github
   method: GET
@@ -1530,6 +1570,7 @@ endpoints:
   skipped: not called — $1.0000 would exceed this run's $45.00 budget
   capability: github.user.profile
 - id: scrapecreators.x.v1-github-user-activity
+  added: '2026-07-28'
   tier: extended
   platform: github
   method: GET
@@ -1575,6 +1616,7 @@ endpoints:
   skipped: not called — $1.0000 would exceed this run's $45.00 budget
   capability: github.user.activity
 - id: scrapecreators.x.v1-github-user-contributions
+  added: '2026-07-28'
   tier: extended
   platform: github
   method: GET
@@ -1615,6 +1657,7 @@ endpoints:
   skipped: not called — $1.0000 would exceed this run's $45.00 budget
   capability: github.user.contributions
 - id: scrapecreators.x.v1-github-user-followers
+  added: '2026-07-28'
   tier: extended
   platform: github
   method: GET
@@ -1655,6 +1698,7 @@ endpoints:
   skipped: not called — $1.0000 would exceed this run's $45.00 budget
   capability: github.user.followers
 - id: scrapecreators.x.v1-github-user-following
+  added: '2026-07-28'
   tier: extended
   platform: github
   method: GET
@@ -1695,6 +1739,7 @@ endpoints:
   skipped: not called — $1.0000 would exceed this run's $45.00 budget
   capability: github.user.following
 - id: scrapecreators.x.v1-github-user-pull-requests
+  added: '2026-07-28'
   tier: extended
   platform: github
   method: GET
@@ -1740,6 +1785,7 @@ endpoints:
   skipped: not called — $1.0000 would exceed this run's $45.00 budget
   capability: github.user.pull_requests
 - id: scrapecreators.x.v1-github-user-repositories
+  added: '2026-07-28'
   tier: extended
   platform: github
   method: GET
@@ -1828,6 +1874,7 @@ endpoints:
     queryParams:
       url: https://adstransparency.google.com/advertiser/AR01614014350098432001/creative/CR10449491775734153217
   verified: '2026-07-28'
+  added: '2026-07-28'
   example_response: examples/scrapecreators.x.v1-google-ad.json
   observed_time: 3.01
 - id: scrapecreators.x.v1-google-adlibrary-advertisers-search
@@ -1864,6 +1911,7 @@ endpoints:
     queryParams:
       query: lululemon
   verified: '2026-07-28'
+  added: '2026-07-28'
   example_response: examples/scrapecreators.x.v1-google-adlibrary-advertisers-search.json
   observed_time: 1.11
 - id: scrapecreators.x.v1-google-company-ads
@@ -1940,6 +1988,7 @@ endpoints:
     queryParams:
       domain: lululemon.com
   verified: '2026-07-28'
+  added: '2026-07-28'
   example_response: examples/scrapecreators.x.v1-google-company-ads.json
   observed_time: 1.64
 - id: scrapecreators.x.v1-google-search
@@ -1987,6 +2036,7 @@ endpoints:
     queryParams:
       query: austen allred
   verified: '2026-07-28'
+  added: '2026-07-28'
   example_response: examples/scrapecreators.x.v1-google-search.json
   observed_time: 1.77
 - id: scrapecreators.x.v1-instagram-audio-reels
@@ -2024,6 +2074,7 @@ endpoints:
     queryParams:
       audio_id: '1392969992841787'
   verified: '2026-07-28'
+  added: '2026-07-28'
   example_response: examples/scrapecreators.x.v1-instagram-audio-reels.json
   observed_time: 2.27
 - id: scrapecreators.x.v1-instagram-basic-profile
@@ -2061,9 +2112,11 @@ endpoints:
     queryParams:
       userId: '314216'
   verified: '2026-07-28'
+  added: '2026-07-28'
   example_response: examples/scrapecreators.x.v1-instagram-basic-profile.json
   observed_time: 0.65
 - id: scrapecreators.x.v1-instagram-post
+  added: '2026-07-28'
   tier: extended
   platform: instagram
   capability: instagram.post.detail
@@ -2132,6 +2185,7 @@ endpoints:
   test_request:
     queryParams: {}
   verified: '2026-07-28'
+  added: '2026-07-28'
   example_response: examples/scrapecreators.x.v1-instagram-reels-trending.json
   observed_time: 3.68
 - id: scrapecreators.x.v1-instagram-search-hashtag
@@ -2179,6 +2233,7 @@ endpoints:
     queryParams:
       hashtag: makeup
   verified: '2026-07-28'
+  added: '2026-07-28'
   example_response: examples/scrapecreators.x.v1-instagram-search-hashtag.json
   observed_time: 11.28
 - id: scrapecreators.x.v1-instagram-search-profiles
@@ -2216,6 +2271,7 @@ endpoints:
     queryParams:
       query: fitness coach
   verified: '2026-07-28'
+  added: '2026-07-28'
   example_response: examples/scrapecreators.x.v1-instagram-search-profiles.json
   observed_time: 9.03
 - id: scrapecreators.x.v1-instagram-user-embed
@@ -2247,6 +2303,7 @@ endpoints:
     queryParams:
       handle: jane
   verified: '2026-07-28'
+  added: '2026-07-28'
   example_response: examples/scrapecreators.x.v1-instagram-user-embed.json
   observed_time: 3.92
 - id: scrapecreators.x.v1-instagram-user-highlight-detail
@@ -2279,6 +2336,7 @@ endpoints:
     queryParams:
       id: '18067016518767507'
   verified: '2026-07-28'
+  added: '2026-07-28'
   example_response: examples/scrapecreators.x.v1-instagram-user-highlight-detail.json
   observed_time: 3.98
 - id: scrapecreators.x.v1-instagram-user-highlights
@@ -2316,6 +2374,7 @@ endpoints:
     queryParams:
       user_id: '2700692569'
   verified: '2026-07-28'
+  added: '2026-07-28'
   example_response: examples/scrapecreators.x.v1-instagram-user-highlights.json
   observed_time: 2.2
 - id: scrapecreators.x.v1-instagram-user-reels
@@ -2363,9 +2422,11 @@ endpoints:
     queryParams:
       user_id: '2700692569'
   verified: '2026-07-28'
+  added: '2026-07-28'
   example_response: examples/scrapecreators.x.v1-instagram-user-reels.json
   observed_time: 1.03
 - id: scrapecreators.x.v1-kick-clip
+  added: '2026-07-28'
   tier: extended
   platform: kick
   method: GET
@@ -2395,6 +2456,7 @@ endpoints:
       url: https://kick.com/xqc/clips/clip_01JGJHB6CEVFCQRYTVPM8DW892
   skipped: not called — $1.0000 would exceed this run's $45.00 budget
 - id: scrapecreators.x.v1-komi
+  added: '2026-07-28'
   tier: extended
   platform: linkinbio
   method: GET
@@ -2458,6 +2520,7 @@ endpoints:
     queryParams:
       url: https://www.kwai.com/@KwaiBrasilOficial/photo/5193363430624671876
   verified: '2026-07-28'
+  added: '2026-07-28'
   example_response: examples/scrapecreators.x.v1-kwai-post.json
   observed_time: 4.58
 - id: scrapecreators.x.v1-kwai-profile
@@ -2495,6 +2558,7 @@ endpoints:
     queryParams:
       handle: KwaiBrasilOficial
   verified: '2026-07-28'
+  added: '2026-07-28'
   example_response: examples/scrapecreators.x.v1-kwai-profile.json
   observed_time: 5.84
 - id: scrapecreators.x.v1-kwai-user-posts
@@ -2541,9 +2605,11 @@ endpoints:
     queryParams:
       handle: KwaiBrasilOficial
   verified: '2026-07-28'
+  added: '2026-07-28'
   example_response: examples/scrapecreators.x.v1-kwai-user-posts.json
   observed_time: 4.88
 - id: scrapecreators.x.v1-linkbio
+  added: '2026-07-28'
   tier: extended
   platform: linkinbio
   method: GET
@@ -2607,6 +2673,7 @@ endpoints:
     queryParams:
       url: https://www.linkedin.com/ad-library/detail/666281156
   verified: '2026-07-28'
+  added: '2026-07-28'
   example_response: examples/scrapecreators.x.v1-linkedin-ad.json
   observed_time: 1.46
 - id: scrapecreators.x.v1-linkedin-ads-search
@@ -2669,6 +2736,7 @@ endpoints:
     queryParams:
       company: microsoft
   verified: '2026-07-28'
+  added: '2026-07-28'
   example_response: examples/scrapecreators.x.v1-linkedin-ads-search.json
   observed_time: 5.08
 - id: scrapecreators.x.v1-linkedin-company
@@ -2701,6 +2769,7 @@ endpoints:
     queryParams:
       url: https://linkedin.com/company/shopify
   verified: '2026-07-28'
+  added: '2026-07-28'
   example_response: examples/scrapecreators.x.v1-linkedin-company.json
   observed_time: 3.45
 - id: scrapecreators.x.v1-linkedin-company-posts
@@ -2738,6 +2807,7 @@ endpoints:
     queryParams:
       url: https://linkedin.com/company/shopify
   verified: '2026-07-28'
+  added: '2026-07-28'
   example_response: examples/scrapecreators.x.v1-linkedin-company-posts.json
   observed_time: 3.78
 - id: scrapecreators.x.v1-linkedin-post
@@ -2770,6 +2840,7 @@ endpoints:
     queryParams:
       url: https://www.linkedin.com/pulse/being-father-has-made-me-better-leader-vice-versa-austen-allred/
   verified: '2026-07-28'
+  added: '2026-07-28'
   example_response: examples/scrapecreators.x.v1-linkedin-post.json
   observed_time: 2.29
 - id: scrapecreators.x.v1-linkedin-post-transcript
@@ -2801,6 +2872,7 @@ endpoints:
     queryParams:
       url: https://www.linkedin.com/posts/gemini-35-flash-is-a-step-forward-for-google-ugcPost-7465082215316525056-MHBd/
   verified: '2026-07-28'
+  added: '2026-07-28'
   example_response: examples/scrapecreators.x.v1-linkedin-post-transcript.json
   observed_time: 2.75
 - id: scrapecreators.x.v1-linkedin-search-posts
@@ -2844,9 +2916,11 @@ endpoints:
     queryParams:
       query: ai agents
   verified: '2026-07-28'
+  added: '2026-07-28'
   example_response: examples/scrapecreators.x.v1-linkedin-search-posts.json
   observed_time: 17.75
 - id: scrapecreators.x.v1-linkme
+  added: '2026-07-28'
   tier: extended
   platform: linkinbio
   method: GET
@@ -2881,6 +2955,7 @@ endpoints:
       url: https://link.me/danucd
   skipped: not called — $1.0000 would exceed this run's $45.00 budget
 - id: scrapecreators.x.v1-linktree
+  added: '2026-07-28'
   tier: extended
   platform: linkinbio
   method: GET
@@ -2915,6 +2990,7 @@ endpoints:
       url: https://linktr.ee/miguelangeles
   skipped: not called — $1.0000 would exceed this run's $45.00 budget
 - id: scrapecreators.x.v1-pillar
+  added: '2026-07-28'
   tier: extended
   platform: linkinbio
   method: GET
@@ -2949,6 +3025,7 @@ endpoints:
       url: https://pillar.io/angelstrife
   skipped: not called — $1.0000 would exceed this run's $45.00 budget
 - id: scrapecreators.x.v1-pinterest-board
+  added: '2026-07-28'
   tier: extended
   platform: pinterest
   method: GET
@@ -2989,6 +3066,7 @@ endpoints:
   skipped: not called — $1.0000 would exceed this run's $45.00 budget
   capability: pinterest.board.pins
 - id: scrapecreators.x.v1-pinterest-pin
+  added: '2026-07-28'
   tier: extended
   platform: pinterest
   method: GET
@@ -3029,6 +3107,7 @@ endpoints:
   skipped: not called — $1.0000 would exceed this run's $45.00 budget
   capability: pinterest.pin.detail
 - id: scrapecreators.x.v1-pinterest-search
+  added: '2026-07-28'
   tier: extended
   platform: pinterest
   method: GET
@@ -3069,6 +3148,7 @@ endpoints:
   skipped: not called — $1.0000 would exceed this run's $45.00 budget
   capability: pinterest.search.pins
 - id: scrapecreators.x.v1-pinterest-user-boards
+  added: '2026-07-28'
   tier: extended
   platform: pinterest
   method: GET
@@ -3104,6 +3184,7 @@ endpoints:
   skipped: not called — $1.0000 would exceed this run's $45.00 budget
   capability: pinterest.user.boards
 - id: scrapecreators.x.v1-reddit-post-comments
+  added: '2026-07-28'
   tier: extended
   platform: reddit
   capability: reddit.post.comments
@@ -3144,6 +3225,7 @@ endpoints:
       url: https://www.reddit.com/r/AskReddit/comments/ablzuq/people_who_havent_pooped_in_2019_yet_why_are_you/
   skipped: not called — $1.0000 would exceed this run's $45.00 budget
 - id: scrapecreators.x.v1-reddit-post-transcript
+  added: '2026-07-28'
   tier: extended
   platform: reddit
   method: GET
@@ -3183,6 +3265,7 @@ endpoints:
       url: https://www.reddit.com/r/youseeingthisshit/comments/1oiu9xm/football_nostalgiasaints_punter_head_coach_cant/
   skipped: not called — $1.0000 would exceed this run's $45.00 budget
 - id: scrapecreators.x.v1-reddit-subreddit-details
+  added: '2026-07-28'
   tier: extended
   platform: reddit
   capability: reddit.subreddit.info
@@ -3223,6 +3306,7 @@ endpoints:
       subreddit: AskReddit
   skipped: not called — $1.0000 would exceed this run's $45.00 budget
 - id: scrapecreators.x.v1-reddit-subreddit-search
+  added: '2026-07-28'
   tier: extended
   platform: reddit
   method: GET
@@ -3269,6 +3353,7 @@ endpoints:
       query: push ups
   skipped: not called — $1.0000 would exceed this run's $45.00 budget
 - id: scrapecreators.x.v1-rumble-channel-videos
+  added: '2026-07-28'
   tier: extended
   platform: rumble
   method: GET
@@ -3309,6 +3394,7 @@ endpoints:
   skipped: not called — $1.0000 would exceed this run's $45.00 budget
   capability: rumble.channel.videos
 - id: scrapecreators.x.v1-rumble-search
+  added: '2026-07-28'
   tier: extended
   platform: rumble
   method: GET
@@ -3344,6 +3430,7 @@ endpoints:
   skipped: not called — $1.0000 would exceed this run's $45.00 budget
   capability: rumble.search.videos
 - id: scrapecreators.x.v1-rumble-video
+  added: '2026-07-28'
   tier: extended
   platform: rumble
   method: GET
@@ -3374,6 +3461,7 @@ endpoints:
   skipped: not called — $1.0000 would exceed this run's $45.00 budget
   capability: rumble.video.detail
 - id: scrapecreators.x.v1-rumble-video-comments
+  added: '2026-07-28'
   tier: extended
   platform: rumble
   method: GET
@@ -3404,6 +3492,7 @@ endpoints:
   skipped: not called — $1.0000 would exceed this run's $45.00 budget
   capability: rumble.video.comments
 - id: scrapecreators.x.v1-rumble-video-transcript
+  added: '2026-07-28'
   tier: extended
   platform: rumble
   method: GET
@@ -3434,6 +3523,7 @@ endpoints:
   skipped: not called — $1.0000 would exceed this run's $45.00 budget
   capability: rumble.video.transcript
 - id: scrapecreators.x.v1-snapchat-profile
+  added: '2026-07-28'
   tier: extended
   platform: snapchat
   method: GET
@@ -3463,6 +3553,7 @@ endpoints:
       handle: zane
   skipped: not called — $1.0000 would exceed this run's $45.00 budget
 - id: scrapecreators.x.v1-snapchat-spotlight
+  added: '2026-07-28'
   tier: extended
   platform: snapchat
   method: GET
@@ -3492,6 +3583,7 @@ endpoints:
       url: https://www.snapchat.com/@lilah4823/spotlight/W7_EDlXWTBiXAEEniNoMPwAAYY2pvZnd0ZXVmAZ8fgG8pAZ8ff-_IAAAAAQ
   skipped: not called — $1.0000 would exceed this run's $45.00 budget
 - id: scrapecreators.x.v1-snapchat-spotlight-comments
+  added: '2026-07-28'
   tier: extended
   platform: snapchat
   method: GET
@@ -3526,6 +3618,7 @@ endpoints:
       url: https://www.snapchat.com/@lilah4823/spotlight/W7_EDlXWTBiXAEEniNoMPwAAYY2pvZnd0ZXVmAZ8fgG8pAZ8ff-_IAAAAAQ
   skipped: not called — $1.0000 would exceed this run's $45.00 budget
 - id: scrapecreators.x.v1-soundcloud-artist
+  added: '2026-07-28'
   tier: extended
   platform: soundcloud
   method: GET
@@ -3560,6 +3653,7 @@ endpoints:
       handle: kehlanimusic
   skipped: not called — $1.0000 would exceed this run's $45.00 budget
 - id: scrapecreators.x.v1-soundcloud-artist-tracks
+  added: '2026-07-28'
   tier: extended
   platform: soundcloud
   method: GET
@@ -3599,6 +3693,7 @@ endpoints:
       handle: kehlanimusic
   skipped: not called — $1.0000 would exceed this run's $45.00 budget
 - id: scrapecreators.x.v1-soundcloud-track
+  added: '2026-07-28'
   tier: extended
   platform: soundcloud
   method: GET
@@ -3628,6 +3723,7 @@ endpoints:
       url: https://soundcloud.com/kehlanimusic/lights-on-feat-big-sean
   skipped: not called — $1.0000 would exceed this run's $45.00 budget
 - id: scrapecreators.x.v1-spotify-album
+  added: '2026-07-28'
   tier: extended
   platform: spotify
   method: GET
@@ -3663,6 +3759,7 @@ endpoints:
   skipped: not called — $1.0000 would exceed this run's $45.00 budget
   capability: spotify.album.detail
 - id: scrapecreators.x.v1-spotify-artist
+  added: '2026-07-28'
   tier: extended
   platform: spotify
   method: GET
@@ -3698,6 +3795,7 @@ endpoints:
   skipped: not called — $1.0000 would exceed this run's $45.00 budget
   capability: spotify.artist.detail
 - id: scrapecreators.x.v1-spotify-podcast
+  added: '2026-07-28'
   tier: extended
   platform: spotify
   method: GET
@@ -3733,6 +3831,7 @@ endpoints:
   skipped: not called — $1.0000 would exceed this run's $45.00 budget
   capability: spotify.podcast.detail
 - id: scrapecreators.x.v1-spotify-podcast-episodes
+  added: '2026-07-28'
   tier: extended
   platform: spotify
   method: GET
@@ -3773,6 +3872,7 @@ endpoints:
   skipped: not called — $1.0000 would exceed this run's $45.00 budget
   capability: spotify.podcast.episodes
 - id: scrapecreators.x.v1-spotify-search
+  added: '2026-07-28'
   tier: extended
   platform: spotify
   method: GET
@@ -3803,6 +3903,7 @@ endpoints:
   skipped: not called — $1.0000 would exceed this run's $45.00 budget
   capability: spotify.search
 - id: scrapecreators.x.v1-spotify-track
+  added: '2026-07-28'
   tier: extended
   platform: spotify
   method: GET
@@ -3838,6 +3939,7 @@ endpoints:
   skipped: not called — $1.0000 would exceed this run's $45.00 budget
   capability: spotify.track.detail
 - id: scrapecreators.x.v1-threads-post
+  added: '2026-07-28'
   tier: extended
   platform: threads
   capability: threads.post.detail
@@ -3878,6 +3980,7 @@ endpoints:
       url: https://www.threads.com/@trendspider/post/DIU8naHS6q_
   skipped: not called — $1.0000 would exceed this run's $45.00 budget
 - id: scrapecreators.x.v1-threads-profile
+  added: '2026-07-28'
   tier: extended
   platform: threads
   capability: threads.user.profile
@@ -3913,6 +4016,7 @@ endpoints:
       handle: trendspider
   skipped: not called — $1.0000 would exceed this run's $45.00 budget
 - id: scrapecreators.x.v1-threads-search
+  added: '2026-07-28'
   tier: extended
   platform: threads
   capability: threads.search.posts
@@ -3958,6 +4062,7 @@ endpoints:
       query: basketball
   skipped: not called — $1.0000 would exceed this run's $45.00 budget
 - id: scrapecreators.x.v1-threads-search-users
+  added: '2026-07-28'
   tier: extended
   platform: threads
   capability: threads.search.profiles
@@ -3988,6 +4093,7 @@ endpoints:
       query: shams
   skipped: not called — $1.0000 would exceed this run's $45.00 budget
 - id: scrapecreators.x.v1-threads-user-posts
+  added: '2026-07-28'
   tier: extended
   platform: threads
   capability: threads.user.posts
@@ -4023,6 +4129,7 @@ endpoints:
       handle: trendspider
   skipped: not called — $1.0000 would exceed this run's $45.00 budget
 - id: scrapecreators.x.v1-tiktok-ad-library-ad
+  added: '2026-07-28'
   tier: extended
   platform: tiktok-ads
   capability: tiktok-ads.library.ad.detail
@@ -4053,6 +4160,7 @@ endpoints:
       ad_id: '1869335220395266'
   skipped: not called — $1.0000 would exceed this run's $45.00 budget
 - id: scrapecreators.x.v1-tiktok-ad-library-search
+  added: '2026-07-28'
   tier: extended
   platform: tiktok-ads
   capability: tiktok-ads.library.search
@@ -4088,6 +4196,7 @@ endpoints:
       query: Anysphere
   skipped: not called — $1.0000 would exceed this run's $45.00 budget
 - id: scrapecreators.x.v1-tiktok-creators-popular
+  added: '2026-07-28'
   tier: extended
   platform: tiktok
   method: GET
@@ -4137,6 +4246,7 @@ endpoints:
       page: 1
   skipped: not called — $1.0000 would exceed this run's $45.00 budget
 - id: scrapecreators.x.v1-tiktok-get-trending-feed
+  added: '2026-07-28'
   tier: extended
   platform: tiktok
   capability: tiktok.feed.home
@@ -4172,6 +4282,7 @@ endpoints:
       region: US
   skipped: not called — $1.0000 would exceed this run's $45.00 budget
 - id: scrapecreators.x.v1-tiktok-live
+  added: '2026-07-28'
   tier: extended
   platform: tiktok
   capability: tiktok.live.detail
@@ -4208,6 +4319,7 @@ endpoints:
       user_id: '6742945285876515845'
   skipped: not called — $1.0000 would exceed this run's $45.00 budget
 - id: scrapecreators.x.v1-tiktok-product
+  added: '2026-07-28'
   tier: extended
   platform: tiktok-shop
   capability: tiktok-shop.product.detail
@@ -4243,6 +4355,7 @@ endpoints:
       url: https://www.tiktok.com/shop/pdp/goli-ashwagandha-gummies-with-vitamin-d-ksm-66-vegan-non-gmo/1729587769570529799
   skipped: not called — $1.0000 would exceed this run's $45.00 budget
 - id: scrapecreators.x.v1-tiktok-profile-region
+  added: '2026-07-28'
   tier: extended
   platform: tiktok
   capability: tiktok.user.country
@@ -4273,6 +4386,7 @@ endpoints:
       handle: stoolpresidente
   skipped: not called — $1.0000 would exceed this run's $45.00 budget
 - id: scrapecreators.x.v1-tiktok-search-hashtag
+  added: '2026-07-28'
   tier: extended
   platform: tiktok
   capability: tiktok.search.hashtags
@@ -4316,6 +4430,7 @@ endpoints:
       region: US
   skipped: not called — $1.0000 would exceed this run's $45.00 budget
 - id: scrapecreators.x.v1-tiktok-search-suggestions
+  added: '2026-07-28'
   tier: extended
   platform: tiktok
   capability: tiktok.search.suggestions
@@ -4351,6 +4466,7 @@ endpoints:
       query: dogs
   skipped: not called — $1.0000 would exceed this run's $45.00 budget
 - id: scrapecreators.x.v1-tiktok-search-top
+  added: '2026-07-28'
   tier: extended
   platform: tiktok
   capability: tiktok.search.general
@@ -4399,6 +4515,7 @@ endpoints:
       query: funny
   skipped: not called — $1.0000 would exceed this run's $45.00 budget
 - id: scrapecreators.x.v1-tiktok-search-users
+  added: '2026-07-28'
   tier: extended
   platform: tiktok
   capability: tiktok.search.users
@@ -4437,6 +4554,7 @@ endpoints:
       cursor: 10
   skipped: not called — $1.0000 would exceed this run's $45.00 budget
 - id: scrapecreators.x.v1-tiktok-shop-product-reviews
+  added: '2026-07-28'
   tier: extended
   platform: tiktok-shop
   capability: tiktok-shop.product.reviews
@@ -4482,6 +4600,7 @@ endpoints:
       url: https://www.tiktok.com/shop/pdp/cat-nail-clipper-by-potaroma-adjustable-sizes-built-in-file-safe-for-kittens-cats/1731578642912612516
   skipped: not called — $1.0000 would exceed this run's $45.00 budget
 - id: scrapecreators.x.v1-tiktok-shop-products
+  added: '2026-07-28'
   tier: extended
   platform: tiktok-shop
   capability: tiktok-shop.shop.products
@@ -4526,6 +4645,7 @@ endpoints:
       url: https://www.tiktok.com/shop/store/goli-nutrition/7495794203056835079
   skipped: not called — $1.0000 would exceed this run's $45.00 budget
 - id: scrapecreators.x.v1-tiktok-shop-search
+  added: '2026-07-28'
   tier: extended
   platform: tiktok-shop
   capability: tiktok-shop.search.products
@@ -4566,6 +4686,7 @@ endpoints:
       query: shoes
   skipped: not called — $1.0000 would exceed this run's $45.00 budget
 - id: scrapecreators.x.v1-tiktok-song
+  added: '2026-07-28'
   tier: extended
   platform: tiktok
   capability: tiktok.music.detail
@@ -4596,6 +4717,7 @@ endpoints:
       clipId: '7439295283975702544'
   skipped: not called — $1.0000 would exceed this run's $45.00 budget
 - id: scrapecreators.x.v1-tiktok-song-videos
+  added: '2026-07-28'
   tier: extended
   platform: tiktok
   capability: tiktok.music.videos
@@ -4631,6 +4753,7 @@ endpoints:
       clipId: '7439295283975702544'
   skipped: not called — $1.0000 would exceed this run's $45.00 budget
 - id: scrapecreators.x.v1-tiktok-user-audience
+  added: '2026-07-28'
   tier: extended
   platform: tiktok
   method: GET
@@ -4660,6 +4783,7 @@ endpoints:
       handle: shakira
   skipped: not called — $26.0000 would exceed this run's $45.00 budget
 - id: scrapecreators.x.v1-tiktok-user-followers
+  added: '2026-07-28'
   tier: extended
   platform: tiktok
   capability: tiktok.user.followers
@@ -4704,6 +4828,7 @@ endpoints:
       handle: stoolpresidente
   skipped: not called — $1.0000 would exceed this run's $45.00 budget
 - id: scrapecreators.x.v1-tiktok-user-following
+  added: '2026-07-28'
   tier: extended
   platform: tiktok
   capability: tiktok.user.following
@@ -4743,6 +4868,7 @@ endpoints:
       handle: stoolpresidente
   skipped: not called — $1.0000 would exceed this run's $45.00 budget
 - id: scrapecreators.x.v1-tiktok-user-live
+  added: '2026-07-28'
   tier: extended
   platform: tiktok
   capability: tiktok.live.status
@@ -4773,6 +4899,7 @@ endpoints:
       handle: thejustalex
   skipped: not called — $1.0000 would exceed this run's $45.00 budget
 - id: scrapecreators.x.v1-tiktok-user-showcase
+  added: '2026-07-28'
   tier: extended
   platform: tiktok-shop
   method: GET
@@ -4812,6 +4939,7 @@ endpoints:
       handle: mrtiktokreviews
   skipped: not called — $1.0000 would exceed this run's $45.00 budget
 - id: scrapecreators.x.v1-tiktok-video-comment-replies
+  added: '2026-07-28'
   tier: extended
   platform: tiktok
   capability: tiktok.comment.replies
@@ -4853,6 +4981,7 @@ endpoints:
       url: https://www.tiktok.com/@stoolpresidente/video/7623818255903329566
   skipped: not called — $1.0000 would exceed this run's $45.00 budget
 - id: scrapecreators.x.v1-tiktok-video-transcript
+  added: '2026-07-28'
   capability: tiktok.video.captions
   platform: tiktok
   tier: extended
@@ -4893,6 +5022,7 @@ endpoints:
       url: https://www.tiktok.com/@stoolpresidente/video/7499229683859426602
   skipped: not called — $1.0000 would exceed this run's $45.00 budget
 - id: scrapecreators.x.v1-truthsocial-post
+  added: '2026-07-28'
   tier: extended
   platform: truthsocial
   method: GET
@@ -4922,6 +5052,7 @@ endpoints:
       url: https://truthsocial.com/@realDonaldTrump/posts/114315219437063160
   skipped: not called — $1.0000 would exceed this run's $45.00 budget
 - id: scrapecreators.x.v1-truthsocial-profile
+  added: '2026-07-28'
   tier: extended
   platform: truthsocial
   method: GET
@@ -4951,6 +5082,7 @@ endpoints:
       handle: realDonaldTrump
   skipped: not called — $1.0000 would exceed this run's $45.00 budget
 - id: scrapecreators.x.v1-truthsocial-user-posts
+  added: '2026-07-28'
   tier: extended
   platform: truthsocial
   method: GET
@@ -5018,10 +5150,12 @@ endpoints:
     queryParams:
       url: https://www.twitch.tv/staryuuki/clip/CloudySavageMarjoramRuleFive--ErzsYbE7UWvgCMQ?filter=clips&range=all&sort=time
   verified: '2026-07-28'
+  added: '2026-07-28'
   example_response: examples/scrapecreators.x.v1-twitch-clip.json
   observed_time: 1.34
   capability: twitch.clip.detail
 - id: scrapecreators.x.v1-twitch-profile
+  added: '2026-07-28'
   tier: extended
   platform: twitch
   method: GET
@@ -5057,6 +5191,7 @@ endpoints:
   skipped: not called — $1.0000 would exceed this run's $45.00 budget
   capability: twitch.user.profile
 - id: scrapecreators.x.v1-twitch-user-schedule
+  added: '2026-07-28'
   tier: extended
   platform: twitch
   method: GET
@@ -5087,6 +5222,7 @@ endpoints:
   skipped: not called — $1.0000 would exceed this run's $45.00 budget
   capability: twitch.user.schedule
 - id: scrapecreators.x.v1-twitch-user-videos
+  added: '2026-07-28'
   tier: extended
   platform: twitch
   method: GET
@@ -5125,6 +5261,7 @@ endpoints:
   skipped: not called — $1.0000 would exceed this run's $45.00 budget
   capability: twitch.user.videos
 - id: scrapecreators.x.v1-twitter-community
+  added: '2026-07-28'
   tier: extended
   platform: x
   method: GET
@@ -5155,6 +5292,7 @@ endpoints:
   skipped: not called — $1.0000 would exceed this run's $45.00 budget
   capability: x.community.detail
 - id: scrapecreators.x.v1-twitter-community-tweets
+  added: '2026-07-28'
   tier: extended
   platform: x
   method: GET
@@ -5185,6 +5323,7 @@ endpoints:
   skipped: not called — $1.0000 would exceed this run's $45.00 budget
   capability: x.community.posts
 - id: scrapecreators.x.v1-twitter-tweet
+  added: '2026-07-28'
   tier: extended
   platform: x
   capability: x.post.detail
@@ -5224,6 +5363,7 @@ endpoints:
       trim: 'false'
   skipped: not called — $1.0000 would exceed this run's $45.00 budget
 - id: scrapecreators.x.v1-twitter-tweet-transcript
+  added: '2026-07-28'
   tier: extended
   platform: x
   method: GET
@@ -5260,6 +5400,7 @@ endpoints:
   skipped: not called — $1.0000 would exceed this run's $45.00 budget
   capability: x.post.transcript
 - id: scrapecreators.x.v1-youtube-channel-videos
+  added: '2026-07-28'
   tier: extended
   platform: youtube
   capability: youtube.channel.videos
@@ -5315,6 +5456,7 @@ endpoints:
       channelId: UC-9-kyTW8ZkZNDHQJ6FgpwQ
   skipped: not called — $1.0000 would exceed this run's $45.00 budget
 - id: scrapecreators.x.v1-youtube-channel-community-posts
+  added: '2026-07-28'
   tier: extended
   platform: youtube
   capability: youtube.channel.posts
@@ -5355,6 +5497,7 @@ endpoints:
       channelId: UCX6OQ3DkcsbYNE6H8uQQuVA
   skipped: not called — $1.0000 would exceed this run's $45.00 budget
 - id: scrapecreators.x.v1-youtube-channel-lives
+  added: '2026-07-28'
   tier: extended
   platform: youtube
   method: GET
@@ -5394,6 +5537,7 @@ endpoints:
       channelId: UCWsDFcIhY2DBi3GB5uykGXA
   skipped: not called — $1.0000 would exceed this run's $45.00 budget
 - id: scrapecreators.x.v1-youtube-channel-playlists
+  added: '2026-07-28'
   tier: extended
   platform: youtube
   method: GET
@@ -5433,6 +5577,7 @@ endpoints:
       channelId: UCX6OQ3DkcsbYNE6H8uQQuVA
   skipped: not called — $1.0000 would exceed this run's $45.00 budget
 - id: scrapecreators.x.v1-youtube-channel-shorts
+  added: '2026-07-28'
   tier: extended
   platform: youtube
   capability: youtube.channel.shorts
@@ -5478,6 +5623,7 @@ endpoints:
       handle: starterstory
   skipped: not called — $1.0000 would exceed this run's $45.00 budget
 - id: scrapecreators.x.v1-youtube-community-post
+  added: '2026-07-28'
   tier: extended
   platform: youtube
   capability: youtube.post.detail
@@ -5508,6 +5654,7 @@ endpoints:
       url: https://www.youtube.com/post/Ugkxvj2KoApYAXoqLWnKVr6zZe5JjeHrQeP8
   skipped: not called — $1.0000 would exceed this run's $45.00 budget
 - id: scrapecreators.x.v1-youtube-playlist
+  added: '2026-07-28'
   tier: extended
   platform: youtube
   method: GET
@@ -5537,6 +5684,7 @@ endpoints:
       playlist_id: PLP32wGpgzmIlInfgKVFfCwVsxgGqZNIiS
   skipped: not called — $1.0000 would exceed this run's $45.00 budget
 - id: scrapecreators.x.v1-youtube-search
+  added: '2026-07-28'
   tier: extended
   platform: youtube
   capability: youtube.search.videos
@@ -5604,6 +5752,7 @@ endpoints:
       sortBy: relevance
   skipped: not called — $1.0000 would exceed this run's $45.00 budget
 - id: scrapecreators.x.v1-youtube-search-hashtag
+  added: '2026-07-28'
   tier: extended
   platform: youtube
   method: GET
@@ -5643,6 +5792,7 @@ endpoints:
       hashtag: funny
   skipped: not called — $1.0000 would exceed this run's $45.00 budget
 - id: scrapecreators.x.v1-youtube-shorts-trending
+  added: '2026-07-28'
   tier: extended
   platform: youtube
   capability: youtube.trending.videos
@@ -5665,6 +5815,7 @@ endpoints:
     queryParams: {}
   skipped: not called — $1.0000 would exceed this run's $45.00 budget
 - id: scrapecreators.x.v1-youtube-video-comment-replies
+  added: '2026-07-28'
   tier: extended
   platform: youtube
   capability: youtube.comment.replies
@@ -5695,6 +5846,7 @@ endpoints:
       continuationToken: "<omitted: expires>"
   skipped: not called — $1.0000 would exceed this run's $45.00 budget
 - id: scrapecreators.x.v1-youtube-video-sponsors
+  added: '2026-07-28'
   tier: extended
   platform: youtube
   method: GET
@@ -5729,6 +5881,7 @@ endpoints:
       url: https://www.youtube.com/watch?v=AVO0ifle-OU
   skipped: not called — $1.0000 would exceed this run's $45.00 budget
 - id: scrapecreators.x.v1-youtube-video-transcript
+  added: '2026-07-28'
   tier: extended
   platform: youtube
   capability: youtube.video.captions
@@ -5769,6 +5922,7 @@ endpoints:
       url: https://www.youtube.com/watch?v=bjVIDXPP7Uk
   skipped: not called — $1.0000 would exceed this run's $45.00 budget
 - id: scrapecreators.x.v2-instagram-media-transcript
+  added: '2026-07-28'
   tier: extended
   platform: instagram
   method: GET
@@ -5842,9 +5996,11 @@ endpoints:
     queryParams:
       query: dogs
   verified: '2026-07-28'
+  added: '2026-07-28'
   example_response: examples/scrapecreators.x.v2-instagram-reels-search.json
   observed_time: 6.02
 - id: scrapecreators.x.v3-tiktok-profile-videos
+  added: '2026-07-28'
   tier: extended
   platform: tiktok
   capability: tiktok.user.videos

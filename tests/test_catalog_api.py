@@ -76,7 +76,7 @@ async def test_platform_detail_groups_the_same_job_across_providers(clients: Asy
 
     ep = next(e for e in profile["endpoints"] if e["provider"] == "tikhub")
     assert set(ep) == {"id", "provider", "provider_display", "name", "summary", "method", "path",
-                       "scope", "tier", "kind", "domain", "call_template", "cost", "verified", "docs_url",
+                       "scope", "tier", "kind", "domain", "call_template", "cost", "verified", "added", "docs_url",
                        "has_example", "input", "platform_eligible", "platform_blocked",
                        "test_request", "miss", "status", "status_note", "superseded_by", "async"}
     assert ep["kind"] == "data", "an endpoint with no explicit kind is data (the browse surface)"
@@ -201,6 +201,24 @@ def test_a_compared_job_carries_its_short_title_and_keeps_its_description(tmp_pa
     [row] = [r for s in cs.domain_rows(pairs, cat.capabilities, cat.capability_titles) for r in s["rows"]]
     assert row["title"] == "Find a person's work email"
     assert row["description"] == long
+
+
+def test_short_job_title_is_searchable_without_changing_the_full_description(tmp_path):
+    (tmp_path / "capabilities.yaml").write_text(
+        'platforms: {web: Web}\ncapabilities: {web.extract: "Read content from a URL"}\n'
+        'capability_titles: {web.extract: "Archive lookup"}\n')
+    for provider in ("one", "two"):
+        (tmp_path / f"{provider}.yaml").write_text(
+            f"provider: {provider}\nendpoints:\n  - id: {provider}.read\n"
+            "    platform: web\n    capability: web.extract\n    method: GET\n"
+            "    path: /read\n    summary: Read a URL\n")
+    cat = cs.load(directory=tmp_path)
+    matches, total = cs.search("archive", cat, platform="web")
+    assert total == 2
+    assert {ep["id"] for ep, _ in matches} == {"one.read", "two.read"}
+    from treg.domain.catalog import find_recall
+    candidates = find_recall.recall("archive", find_recall.index(cat), cat.aliases, platform="web")
+    assert any(candidate.unit.id == "web.extract" for candidate in candidates)
 
 
 def test_a_title_for_no_capability_fails_the_load(tmp_path):
@@ -330,9 +348,10 @@ async def test_search_finds_the_job_across_providers_best_first(clients: AsyncCl
     rows = body["results"]
     assert body["count"] == len(rows) <= body["total"]
 
-    top = [e["id"] for e in rows[:5]]
+    top = [e["id"] for e in rows[:6]]
     assert top[0] == "treg.tiktok.video.comments", "the routed endpoint for the job comes first"
     assert set(top[1:]) == {
+        "crawl4ai.tiktok.video.comments",
         "anyapi.tiktok.video.comments",
         "justoneapi.tiktok.video.comments",
         "tikhub.tiktok.video.comments",
@@ -566,9 +585,6 @@ async def test_platform_eligibility_refuses_everything_it_cannot_prove():
     # It stays discoverable (a team's OWN key on a bigger plan serves it) but is never an offer.
     assert not cat.platform_eligible({**ok, "platform_blocked": "plan gate"}), \
         "a plan-gated route is not an offer, however well priced"
-    blocked = cat.by_id["akta.companies.headcount_trend"]
-    assert blocked["platform_blocked"], "the akta alt-signals family carries its plan-gate reason"
-    assert not cat.platform_eligible(blocked)
 
 
 async def test_eligibility_rides_on_the_served_row(clients: AsyncClient):
@@ -1087,15 +1103,15 @@ def test_a_stored_EMPTY_json_body_survives_into_the_call_template():
 
 
 async def test_search_pulls_the_routed_parent_in_when_a_child_matches(clients: AsyncClient):
-    """`leadsforge email` matches leadsforge.* on the provider's NAME; the routed row for that job
-    carries no such word, yet it is the row to show first — so a matched child brings its parent
-    along. And `find leads` lands on the lead-search job itself (people.search says "leads")."""
-    rows = (await clients.get("/catalog/search", params={"q": "leadsforge email"})).json()["results"]
-    ids = [r["id"] for r in rows]
-    assert "treg.people.email.find" in ids, ids
-    assert ids.index("treg.people.email.find") < ids.index("leadsforge.people.email.find")
+    """`find leads` lands on the lead-search job itself (people.search says "leads"), and its routed
+    row leads. A query that names a provider (`leadsforge email`) asked for that provider: its rows
+    lead and no routed row is pulled in."""
     rows = (await clients.get("/catalog/search", params={"q": "find leads"})).json()["results"]
     assert rows[0]["id"] == "treg.people.search", [r["id"] for r in rows[:3]]
+    rows = (await clients.get("/catalog/search", params={"q": "leadsforge email"})).json()["results"]
+    ids = [r["id"] for r in rows]
+    assert ids[0] == "leadsforge.people.email.find", ids
+    assert not any(r.get("kind") == "routed" for r in rows), ids
 
 
 async def test_search_caps_a_routed_group_at_a_few_children(clients: AsyncClient):
@@ -1126,6 +1142,13 @@ def test_generic_display_prices_match_web_and_cli():
     maximum = cat.cost_view({'type': 'per_call', 'currency': 'USD', 'value': 0.064,
                              'display': {'unit': 'call', 'maximum': True}}, 'another-provider')
     assert _price_label(maximum) == _cost_usd(maximum) == _cost_label(maximum) == 'up to $0.064/call'
+    # A job held at its 500-page maximum but billed per page shows the page price; the hold does not move.
+    job = cat.cost_view({'type': 'per_success', 'currency': 'USD', 'value': 0.075, 'unit': 'call',
+                         'display': {'unit': 'page', 'value': 0.00015, 'variable': True}}, 'another-provider')
+    assert job['usd'] == 0.075 and job['display_usd'] == 0.00015 and cat.advertised_usd(job) == 0.00015
+    assert _price_label(job) == _cost_usd(job) == _cost_label(job) == '$0.00015+/page'
+    from treg.application.call.resolve import _platform_estimate_micro
+    assert _platform_estimate_micro(job, {}) == 75_000
 
 
 async def test_every_comparison_page_in_the_sitemap_serves(clients):

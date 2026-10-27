@@ -52,18 +52,17 @@ from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent / "src"))
 
-import yaml  # noqa: E402
+import yaml
 
-from treg.application import catalog_find, find_index  # noqa: E402
-from treg.config import get_settings  # noqa: E402
-from treg.domain.catalog import store  # noqa: E402
-from treg.infra import embed as embed_infra  # noqa: E402
-from treg.infra import judge as judge_infra  # noqa: E402
+from treg.application import catalog_find, find_index
+from treg.config import get_settings
+from treg.domain.catalog import store
+from treg.infra import embed as embed_infra
+from treg.infra import judge as judge_infra
 
 TASK_VERDICTS = ("strong", "closest")
 
 
-# ---- cases ---------------------------------------------------------------------------------------
 @dataclass(frozen=True)
 class Case:
     id: str
@@ -100,7 +99,6 @@ def load_cases(path: Path, labels_path: Path | None = None) -> list[Case]:
     return cases
 
 
-# ---- the catalog as the bench reads it -----------------------------------------------------------
 class View:
     """The catalog's shown endpoints (browsable, no routed parents) and each job's vendors."""
 
@@ -140,7 +138,6 @@ class View:
         return bad
 
 
-# ---- the judge, cached on disk -------------------------------------------------------------------
 class DiskJudge:
     """Wraps `infra.judge.judge`: an answer already on disk is served from there with the latency and
     tokens it cost live; an abstention is never stored, so a rerun retries it."""
@@ -171,7 +168,6 @@ class DiskJudge:
         return j
 
 
-# ---- engines -------------------------------------------------------------------------------------
 @dataclass
 class Answer:
     candidates: list[str]                 # unit ids the judge reads, in recall order
@@ -230,15 +226,15 @@ class V2:
     async def _recall(self, case: Case):
         r = await catalog_find.recall_with_meaning(case.q, self.cat, _provider_display)
         reach = [c["id"] for c in catalog_find._candidate_endpoints(r.cands, self.cat)]
-        return r.cands, Answer(candidates=[c.unit.id for c in r.cands], recall_ms=r.recall_ms, reach=reach,
-                               embed_error=r.embed.error)
+        return r, Answer(candidates=[c.unit.id for c in r.cands], recall_ms=r.recall_ms, reach=reach,
+                         embed_error=r.embed.error)
 
     async def recall(self, case: Case) -> Answer:
         return (await self._recall(case))[1]
 
     async def answer(self, case: Case) -> Answer:
-        cands, a = await self._recall(case)
-        found = await catalog_find.answer_v2(case.q, cands, self.cat, _provider_display)
+        r, a = await self._recall(case)
+        found = await catalog_find.answer_v2(case.q, r.cands, self.cat, _provider_display, focus=r.focus)
         j = found.judgement
         a.verdict = found.verdict
         a.kept = [(c.unit.id, round(p, 3)) for c, p in found.kept]
@@ -271,7 +267,6 @@ class Logged:
 ENGINES = {"v1": V1, "v2": V2, "logged": Logged}
 
 
-# ---- scoring -------------------------------------------------------------------------------------
 def score(case: Case, a: Answer, view: View) -> tuple[bool, str]:
     """A verdict is right when it is one `expect` allows AND, for a task verdict, the best judged row
     is gold; for a name verdict, it names the label's target when the label has one."""
@@ -381,7 +376,6 @@ def _baseline_ids(baseline: dict | None, cid: str, tier: str) -> list[str] | Non
     return row.get("shown") if tier == "judge" else row.get("reach") or row.get("candidates")
 
 
-# ---- report --------------------------------------------------------------------------------------
 def _frac(pair) -> str:
     n, d = pair
     return f"{n}/{d} = {n / d:.0%}" if d else "-"
@@ -434,7 +428,6 @@ def _diff(run: dict, baseline: dict) -> None:
         print("  no case flipped")
 
 
-# ---- main ----------------------------------------------------------------------------------------
 class DirStore:
     """Find's card vectors on local disk (`<cache>/find-vectors/...`), standing in for the object
     store so a bench rerun embeds no card twice."""
@@ -575,6 +568,8 @@ def bench(cases: list[Case], *, engine: str, tier: str, cache: Path | None = Non
 
 
 def main(argv: list[str] | None = None) -> None:
+    from treg import bootstrap
+    bootstrap.configure_provider_labels()   # provider display names, as the server wires them
     ap = argparse.ArgumentParser(description=__doc__.split("\n")[0])
     ap.add_argument("--cases", type=Path, required=True, help="YAML (labels inline) or JSONL (labels.yaml beside it)")
     ap.add_argument("--labels", type=Path, help="labels for a JSONL case file (default: labels.yaml beside it)")

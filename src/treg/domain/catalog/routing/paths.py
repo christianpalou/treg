@@ -56,8 +56,6 @@ def set_path(doc: dict, path: str, value: Any) -> None:
     cur[parts[-1]] = value
 
 
-# ---- named transforms -----------------------------------------------------------------------
-
 def split_first(name: Any) -> str | None:
     if not isinstance(name, str) or not name.strip():
         return None
@@ -84,16 +82,14 @@ def length(items: Any) -> int | None:
     return len(items) if isinstance(items, (list, dict, str)) else None
 
 
-# The location table, in miniature (routing plan §1.1 names a full one as an R1 deliverable): the
-# countries the SEO providers are actually called for, mapped to each provider's own code.
-_DFS_LOCATION = {"us": 2840, "gb": 2826, "uk": 2826, "ca": 2124, "au": 2036, "de": 2276, "fr": 2250, "es": 2724,
-                 "it": 2380, "nl": 2528, "in": 2356, "br": 2076, "mx": 2484, "jp": 2392, "sg": 2702, "ie": 2372,
-                 "se": 2752, "ch": 2756, "at": 2040, "be": 2056, "pl": 2616, "pt": 2620, "nz": 2554, "za": 2710,
-                 "ae": 2784, "kr": 2410, "tr": 2792, "id": 2360, "ph": 2608, "vn": 2704}
-
-
-def dfs_location(country: Any) -> int:
-    return _DFS_LOCATION.get(str(country or "us").lower(), 2840)
+def dfs_location(country: Any) -> int | None:
+    """DataForSEO's location_code for a country: its country codes are Google Ads geo target ids,
+    2000 + the ISO 3166-1 numeric code (us 2840, gb 2826, ma 2504). Takes an alpha-2 code, `uk`, or
+    a country name. None for a value that names no country, so the adapter sends no location and
+    the plan reports `country` as ignored instead of asking about the United States."""
+    code = _country_code(country if country not in (None, "") else "us")
+    numeric = _table("country_numeric.json").get(code or "")
+    return 2000 + int(numeric) if numeric else None
 
 
 def seranking_source(country: Any) -> str:
@@ -118,6 +114,15 @@ def at_least(v: Any, floor: Any) -> Any:
         return floor
 
 
+def ceil_to(v: Any, step: Any) -> Any:
+    """Round a caller's limit UP to a provider's step (results come in pages of 10): 25 -> 30."""
+    try:
+        s = int(step)
+        return max(s, -(-int(v) // s) * s)
+    except (TypeError, ValueError):
+        return step
+
+
 def at_most(v: Any, ceiling: Any) -> int:
     """Cap a provider's page size while keeping the routed quote at that same maximum."""
     try:
@@ -136,8 +141,7 @@ def linkedin_handle(v: Any) -> str | None:
 
 def linkedin_url(v: Any) -> str | None:
     """A handle → the public profile URL; a URL passes through; a scheme-less URL
-    (`linkedin.com/in/x`, `www.linkedin.com/in/x`) gets `https://` — quickenrich 422'd 311 routed
-    calls in two days with "linkedin url must be a valid URL" on exactly that shape (2026-09-18)."""
+    (`linkedin.com/in/x`, `www.linkedin.com/in/x`) gets `https://`."""
     if not isinstance(v, str) or not v:
         return None
     v = v.strip()
@@ -149,6 +153,11 @@ def linkedin_url(v: Any) -> str | None:
     return f"https://www.linkedin.com/in/{v.strip('/')}"
 
 
+def free_mail(domain: Any) -> bool:
+    """True for a mailbox domain anyone can open (gmail.com, outlook.com, ...)."""
+    return isinstance(domain, str) and domain.lower() in _FREE_MAIL
+
+
 def email_domain(v: Any) -> str | None:
     if not isinstance(v, str) or "@" not in v:
         return None
@@ -156,8 +165,37 @@ def email_domain(v: Any) -> str | None:
     return None if d in _FREE_MAIL else d
 
 
-_FREE_MAIL = {"gmail.com", "googlemail.com", "yahoo.com", "hotmail.com", "outlook.com", "icloud.com", "live.com",
-              "aol.com", "proton.me", "protonmail.com", "me.com", "msn.com", "qq.com", "163.com", "126.com"}
+# Mailboxes anyone can open (global and regional free mail, ISP mail, common disposable and alias services):
+# their domain says nothing about the person's company.
+_FREE_MAIL = frozenset({
+    # global free mail
+    "gmail.com", "googlemail.com", "outlook.com", "hotmail.com", "live.com", "msn.com", "yahoo.com",
+    "ymail.com", "rocketmail.com", "aol.com", "aim.com", "icloud.com", "me.com", "mac.com",
+    "proton.me", "protonmail.com", "protonmail.ch", "pm.me", "tutanota.com", "tuta.io", "zoho.com",
+    "zohomail.com", "gmx.com", "gmx.net", "mail.com", "email.com", "hey.com", "fastmail.com",
+    "yandex.com", "yandex.ru", "ya.ru", "mail.ru", "inbox.ru", "list.ru", "bk.ru", "rambler.ru",
+    # regional free mail
+    "qq.com", "foxmail.com", "163.com", "126.com", "yeah.net", "sina.com", "sina.cn", "sohu.com",
+    "aliyun.com", "139.com", "naver.com", "daum.net", "hanmail.net", "nate.com", "yahoo.co.jp",
+    "yahoo.co.uk", "yahoo.fr", "yahoo.de", "yahoo.es", "yahoo.it", "yahoo.com.br", "yahoo.co.in",
+    "hotmail.co.uk", "hotmail.fr", "hotmail.de", "hotmail.it", "hotmail.es", "outlook.de", "outlook.fr",
+    "outlook.es", "outlook.jp", "live.co.uk", "live.fr", "web.de", "gmx.de", "gmx.at", "gmx.ch",
+    "t-online.de", "freenet.de", "orange.fr", "wanadoo.fr", "free.fr", "laposte.net", "sfr.fr",
+    "libero.it", "virgilio.it", "tiscali.it", "seznam.cz", "wp.pl", "onet.pl", "o2.pl", "interia.pl",
+    "uol.com.br", "bol.com.br", "terra.com.br", "rediffmail.com",
+    # ISP mail
+    "comcast.net", "verizon.net", "att.net", "sbcglobal.net", "bellsouth.net", "cox.net", "charter.net",
+    "earthlink.net", "optonline.net", "btinternet.com", "sky.com", "virginmedia.com", "talktalk.net",
+    "shaw.ca", "rogers.com", "sympatico.ca", "bigpond.com", "optusnet.com.au", "xtra.co.nz",
+    # disposable
+    "mailinator.com", "guerrillamail.com", "10minutemail.com", "temp-mail.org", "tempmail.com",
+    "yopmail.com", "trashmail.com", "sharklasers.com", "getnada.com", "dispostable.com",
+    "maildrop.cc", "throwawaymail.com", "mohmal.com", "emailondeck.com", "fakeinbox.com",
+    # forwarding aliases: a real company's site, but anyone can get an address there
+    "duck.com", "privaterelay.appleid.com", "mozmail.com", "relay.firefox.com", "simplelogin.com",
+    "simplelogin.co", "simplelogin.fr", "slmail.me", "aleeas.com", "8alias.com", "addy.io", "anonaddy.com",
+    "anonaddy.me", "passmail.net", "passmail.com", "passinbox.com", "33mail.com",
+})
 
 
 def host(v: Any) -> str | None:
@@ -195,21 +233,38 @@ def csv(v: Any) -> str | None:
     return ",".join(str(x) for x in v) if isinstance(v, list) else str(v)
 
 
-_COUNTRIES: dict[str, str] | None = None
+_TABLES: dict[str, dict[str, str]] = {}
+
+
+def _table(name: str) -> dict[str, str]:
+    """An ISO 3166 table keyed by lowercase alpha-2 code, generated from pycountry: `countries.json`
+    (common names), `country_numeric.json` (the numeric code)."""
+    if name not in _TABLES:
+        from pathlib import Path
+        _TABLES[name] = json.loads((Path(__file__).resolve().parents[3] / "catalog" / name).read_text())
+    return _TABLES[name]
+
+
+def _country_code(v: Any) -> str | None:
+    """`TH`, `th`, `Thailand` or `uk` -> `th`/`gb`; None when the value names no ISO country."""
+    if not isinstance(v, str) or not v.strip():
+        return None
+    key = v.strip().lower()
+    if key == "uk":
+        return "gb"
+    names = _table("countries.json")
+    if key in names:
+        return key
+    return next((code for code, name in names.items() if name.lower() == key), None)
 
 
 def country_name(v: Any) -> str | None:
     """`country_name('fr')` → 'France' — the ISO 3166 alpha-2 table (catalog/countries.json, generated
-    from pycountry, 249 rows, common names). Providers that filter on a location NAME (icypeas,
-    lusha, apollo) get this; code-taking providers keep the code. A name passes through."""
-    global _COUNTRIES
+    from pycountry, common names). Providers that filter on a location NAME (icypeas, lusha, apollo)
+    get this; code-taking providers keep the code. A name passes through."""
     if not isinstance(v, str) or not v.strip():
         return None
-    if _COUNTRIES is None:
-        import json
-        from pathlib import Path
-        _COUNTRIES = json.loads((Path(__file__).resolve().parents[3] / "catalog" / "countries.json").read_text())
-    return _COUNTRIES.get(v.strip().lower(), v if len(v) > 3 else None)
+    return _table("countries.json").get(v.strip().lower(), v if len(v) > 3 else None)
 
 
 def as_list(v: Any) -> Any:
@@ -217,6 +272,61 @@ def as_list(v: Any) -> Any:
     if v is None:
         return None
     return v if isinstance(v, list) else [v]
+
+
+# Role words in a job title → the seniority and department a people search can filter by. Checked
+# in order; the first seniority that matches wins, every department that matches is kept.
+_SENIORITY = (
+    ("owner_founder", r"\b(owner|founder|co-?founder|proprietor)\b"),
+    ("c_level", r"\b(c[a-z]o|chief\b|president|managing director|general manager)\b"),
+    ("vp", r"\b(vp|svp|evp|vice[ -]president)\b"),
+    ("director", r"\b(director|head of|head)\b"),
+    ("manager", r"\b(manager|lead|supervisor)\b"),
+    ("intern", r"\b(intern|trainee)\b"),
+)
+_DEPARTMENT = (
+    ("executive", r"\b(ceo|coo|founder|owner|president|managing director|general manager)\b"),
+    ("engineering", r"\b(cto|engineer\w*|developer|devops|software)\b"),
+    ("product", r"\b(cpo|product)\b"),
+    ("sales", r"\b(cro|sales|account executive|business development|bdr|sdr)\b"),
+    ("marketing", r"\b(cmo|marketing|growth|brand|seo|content)\b"),
+    ("finance", r"\b(cfo|finance|financial|accounting|controller)\b"),
+    ("hr", r"\b(chro|hr|human resources|people|talent|recruit\w*)\b"),
+    ("operations", r"\b(operations|ops)\b"),
+    ("legal", r"\b(legal|counsel|general counsel)\b"),
+    ("it", r"\b(cio|it|information technology|security|ciso)\b"),
+    ("design", r"\b(design\w*|ux|ui)\b"),
+)
+
+
+def _role_texts(v: Any) -> list[str]:
+    items = v if isinstance(v, list) else [v]
+    return [str(x).lower() for x in items if x not in (None, "")]
+
+
+def role_seniority(v: Any) -> list[str] | None:
+    """`role_seniority(['CMO', 'VP Marketing'])` → ['c_level', 'vp']: each title's seniority, once."""
+    out: list[str] = []
+    for text in _role_texts(v):
+        hit = next((name for name, rx in _SENIORITY if re.search(rx, text)), None)
+        if hit and hit not in out:
+            out.append(hit)
+    return out or None
+
+
+def role_department(v: Any) -> list[str] | None:
+    """`role_department(['CMO', 'Head of Growth'])` → ['marketing']: every department a title names."""
+    out: list[str] = []
+    for text in _role_texts(v):
+        for name, rx in _DEPARTMENT:
+            if re.search(rx, text) and name not in out:
+                out.append(name)
+    return out or None
+
+
+def scalar(v: Any) -> Any:
+    """A one-element list → its element; anything else unchanged (`['stripe.com']` → 'stripe.com')."""
+    return v[0] if isinstance(v, list) and len(v) == 1 else v
 
 
 def null_if(value: Any, *sentinels: Any) -> Any:
@@ -230,10 +340,56 @@ def choose(condition: Any, when_true: Any, when_false: Any) -> Any:
     return when_true if condition else when_false
 
 
+def e164_digits(v: Any) -> str | None:
+    """`+44 7790 606023` or `0044…` → `447790606023`; None for a number not written internationally.
+
+    Digits alone are never trusted: a national `6175551212` reads as a `61` (Australian) number."""
+    if not isinstance(v, str):
+        return None
+    s = v.strip()
+    if s.startswith("+"):
+        digits = re.sub(r"\D", "", s)
+    elif s.startswith("00"):
+        digits = re.sub(r"\D", "", s)[2:]
+    else:
+        return None
+    return digits if 7 <= len(digits) <= 15 else None
+
+
+# A national number is trusted only with a country whose numbering plan it fits exactly.
+_NATIONAL_PLANS = {"US": ("1", re.compile(r"[2-9]\d{9}")), "CA": ("1", re.compile(r"[2-9]\d{9}"))}
+
+
+def with_country_code(v: Any, country: Any) -> Any:
+    """`6175550142` or `(617) 555-0142` with country `US` → `+16175550142`; anything else comes back unchanged.
+
+    Only national digits (spaces, `-`, `.` and parentheses aside) that fit the plan of a country in
+    `_NATIONAL_PLANS` are rewritten."""
+    plan = _NATIONAL_PLANS.get(country.strip().upper()) if isinstance(country, str) else None
+    digits = re.sub(r"[\s\-.()]", "", v) if isinstance(v, str) else ""
+    if plan is None or not plan[1].fullmatch(digits):
+        return v
+    return f"+{plan[0]}{digits}"
+
+
+def count_with(items: Any, path: Any) -> int | None:
+    """`count_with(people, 'email.value')` → how many rows carry a non-empty value at `path`."""
+    if not isinstance(items, list) or not isinstance(path, str):
+        return None
+    return sum(1 for item in items if get_path(item, path) not in (None, "", [], {}))
+
+
+def starts_with(v: Any, prefix: Any) -> bool:
+    return isinstance(v, str) and prefix is not None and v.startswith(str(prefix))
+
+
 TRANSFORMS = {"values": values, "get": get_path, "null_if": null_if, "choose": choose, "split_first": split_first, "split_last": split_last, "join": join, "has_type": has_type, "len": length,
               "dfs_location": dfs_location, "seranking_source": seranking_source, "lower": lower, "upper": upper,
-              "list": as_list, "at_least": at_least, "at_most": at_most, "linkedin_handle": linkedin_handle, "linkedin_url": linkedin_url,
-              "email_domain": email_domain, "host": host, "fmt": fmt, "obj": obj, "tca_filter": tca_filter, "csv": csv, "country_name": country_name}
+              "list": as_list, "at_least": at_least, "at_most": at_most, "ceil_to": ceil_to, "linkedin_handle": linkedin_handle, "linkedin_url": linkedin_url,
+              "email_domain": email_domain, "host": host, "fmt": fmt, "obj": obj, "tca_filter": tca_filter, "csv": csv, "country_name": country_name,
+              "e164_digits": e164_digits, "starts_with": starts_with, "with_country_code": with_country_code,
+              "count_with": count_with, "role_seniority": role_seniority, "role_department": role_department,
+              "scalar": scalar}
 
 _CALL = re.compile(r"^(\w+)\((.*)\)$")
 _DIV = re.compile(r"^(.+?)\s*/\s*(\d+(?:\.\d+)?)$")

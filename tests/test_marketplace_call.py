@@ -15,6 +15,7 @@ platform key must never appear in a response, an error, or an audit row.
 from __future__ import annotations
 
 import json
+import logging
 
 import httpx
 from datetime import datetime, timezone
@@ -23,6 +24,7 @@ import pytest
 from httpx import AsyncClient
 
 from treg import api as A, audit, oauth_providers
+from treg.infra import org_traffic
 from treg.domain import money as ledger
 from treg.domain.money import settlement as settlement_basis
 from treg.domain.catalog import store as catalog_store
@@ -157,6 +159,54 @@ async def test_adyntel_byok_pair_wins_and_remains_unmetered(
     assert captured["email"] == "own@example.com"
     assert "X-Treg-Cost-Micro" not in response.headers
     assert await _balance(clients) == before
+
+
+@pytest.fixture
+def hlrlookup_platform_on(monkeypatch):
+    monkeypatch.setenv("TREG_PLATFORM_KEY_HLRLOOKUP", "PLATFORM-HLR-KEY")
+    monkeypatch.setenv("TREG_PLATFORM_KEY_HLRLOOKUP_SECRET", "PLATFORM-HLR-SECRET")
+    monkeypatch.setenv("TREG_PLATFORM_PROVIDERS", "hlrlookup")
+    get_settings.cache_clear()
+    yield
+    get_settings.cache_clear()
+
+
+_HLR_LIVE = {"telephone_number": "447540822872", "save_to_cache": "PRIVATE",
+             "cache_days_global": 0, "cache_days_private": 0}
+
+
+async def test_hlrlookup_platform_pair_rides_the_body_and_settles_reported_credits(
+    clients, hlrlookup_platform_on,
+):
+    seen = []
+    answers = iter([
+        {"error": "NONE", "credits_spent": 1, "live_status": "LIVE"},
+        {"error": "NONE", "credits_spent": 2, "live_status": "LIVE"},
+        {"error": "NONE", "credits_spent": 0, "live_status": "NO_COVERAGE"},
+        {"error": "INSUFFICIENT_CREDIT"},
+    ])
+
+    def upstream(request: httpx.Request) -> httpx.Response:
+        assert request.url.path == "/apiv2/hlr"
+        seen.append(json.loads(request.content))
+        return httpx.Response(
+            200, stream=httpx.ByteStream(json.dumps({"results": [next(answers)]}).encode()),
+            headers={"content-type": "application/json"},
+        )
+
+    await A.app.state.http.aclose()
+    A.app.state.http = AsyncClient(transport=httpx.MockTransport(upstream))
+    charges = []
+    for body in (_HLR_LIVE, {**_HLR_LIVE, "usa_status": "YES"}, _HLR_LIVE, _HLR_LIVE):
+        before = await _balance(clients)
+        response = await clients.post("/call/hlrlookup.people.phone.verify", json=body)
+        assert response.status_code == 200, response.text
+        charges.append(before - await _balance(clients))
+    # One credit is $0.006608; a US mobile with usa_status costs two; free answers cost nothing.
+    assert charges == [6_608, 13_216, 0, 0]
+    assert seen[0] == {**_HLR_LIVE, "api_key": "PLATFORM-HLR-KEY",
+                       "api_secret": "PLATFORM-HLR-SECRET"}
+    assert seen[1]["usa_status"] == "YES"
 
 
 @pytest.fixture
@@ -390,6 +440,14 @@ async def test_method_mismatch_is_a_400_hint(clients: AsyncClient):
     assert "GET" in r.json()["detail"]
 
 
+async def test_a_json_body_to_a_form_endpoint_is_a_400_hint(clients: AsyncClient):
+    """JustOneAPI's WeChat search answers JSON with an opaque 415; the caller hears the fix instead."""
+    await clients.post("/secrets", json={"name": "justoneapi", "value": "K"})
+    r = await clients.post("/call/justoneapi.x.weixin-search-article-v1", json={"keyword": "ai"})
+    assert r.status_code == 400
+    assert "x-www-form-urlencoded" in r.json()["detail"]
+
+
 async def test_provider_name_404_points_at_the_marketplace(clients: AsyncClient):
     """`treg call tikhub /path` (no such tool) keeps failing, but no longer dead-ends."""
     r = await clients.get("/call/tikhub/api/v1/foo")
@@ -425,14 +483,22 @@ def test_path_placeholders_fill_from_query_and_are_consumed():
     assert exc.value.status_code == 400 and "siteUrl" in exc.value.detail
 
 
-async def test_deny_rules_cover_marketplace_calls(clients: AsyncClient):
+async def test_deny_rules_cover_marketplace_calls(clients: AsyncClient, caplog):
     """Policy is evaluated on the RESOLVED upstream — an endpoint-id call can't dodge a host block."""
     await clients.post("/secrets", json={"name": "tikhub", "value": "MKKEY"})
     org_id = (await clients.get("/orgs")).json()[0]["org_id"]
     r = await clients.post(f"/orgs/{org_id}/deny", json={"host": "api.tikhub.io", "note": "no tikhub"})
     assert r.status_code == 200, r.text
-    r = await clients.get(f"/call/{EP}?aweme_id=7")
+    caplog.set_level(logging.INFO, logger=org_traffic.log.name)
+    org_traffic.log.addHandler(caplog.handler)
+    try:
+        r = await clients.get(f"/call/{EP}?aweme_id=7")
+    finally:
+        org_traffic.log.removeHandler(caplog.handler)
     assert r.status_code == 403
+    [line] = [json.loads(m.getMessage().split(" ", 1)[1]) for m in caplog.records
+              if m.name == org_traffic.log.name and m.getMessage().startswith("request ")]
+    assert (line["provider"], line["refused_by"]) == ("tikhub", "policy"), "the request log names the refusal"
 
 
 # ---- tier 4: treg's own key, billed to the org balance ------------------------------------------
@@ -789,6 +855,44 @@ def test_hunter_domain_search_estimate_uses_credit_rounding():
     assert est_100 == 10 * credit_micro, f"limit=100 should reserve 10 credits: {est_100}"
 
 
+@pytest.mark.parametrize(("body", "credits"), [
+    ({"query": "fintech companies in San Francisco", "pageSize": 5}, 7),
+    ({"query": "fintech companies in San Francisco", "pageSize": 5, "pageToken": None}, 7),
+    ({"query": "fintech companies in San Francisco", "pageSize": 5, "pageToken": ""}, 7),
+    ({"query": "fintech companies in San Francisco", "pageSize": 5, "pageToken": "   "}, 7),
+    ({"pageSize": 5, "pageToken": 0}, 7),
+    ({"pageToken": "tok", "pageSize": 5}, 5),
+    ({"pageToken": " tok ", "pageSize": 5}, 5),
+])
+def test_fiber_ai_natural_language_first_page_reserves_interpretation(body, credits):
+    """A first page holds pageSize credits plus the 2-credit NL fee; a pageToken page does not.
+
+    pageToken counts only as a non-empty string. Raw micro-USD, before margin: one fiber-ai
+    credit is $0.02, so pageSize 5 is 100_000 and a first page is 140_000.
+    """
+    cat = catalog_store.load()
+    endpoint_id = "fiber-ai.people.search.natural_language"
+    cost = cat.cost_view(cat.by_id[endpoint_id]["cost"], "fiber-ai")
+    credit = call_resolution._usd_to_micro(cat.credit_rates["fiber-ai"])
+    assert credit == 20_000
+    estimate, unit = call_resolution._marketplace_pricing(
+        "fiber-ai", endpoint_id, cost, {}, json.dumps(body).encode(),
+    )
+    assert (estimate, unit) == (credits * credit, credit), body
+
+
+def test_fiber_ai_people_search_does_not_add_the_interpretation_fee():
+    """The +2 is only the natural-language run. A filtered people search stays pageSize credits."""
+    cat = catalog_store.load()
+    endpoint_id = "fiber-ai.people.search"
+    cost = cat.cost_view(cat.by_id[endpoint_id]["cost"], "fiber-ai")
+    credit = call_resolution._usd_to_micro(cat.credit_rates["fiber-ai"])
+    estimate, unit = call_resolution._marketplace_pricing(
+        "fiber-ai", endpoint_id, cost, {}, json.dumps({"pageSize": 5}).encode(),
+    )
+    assert (estimate, unit) == (5 * credit, credit)
+
+
 async def test_unmetered_call_keeps_the_callers_encoding(clients: AsyncClient):
     """Tier 2 (org's own key) still streams and must keep the relay contract: the caller's own
     compression choice travels upstream untouched."""
@@ -1066,9 +1170,14 @@ def test_aviato_conditional_prices_follow_live_balance_deltas():
 
 
 @pytest.mark.parametrize(("endpoint", "unit_micro", "body", "expected"), [
-    # bulk enrich settles from the rows it returned
-    ("aviato.companies.enrich.bulk", 150_000, b'{"companies": [{"id": "1"}, null]}', 150_000),
-    ("aviato.people.enrich.bulk", 70_000, b'[{"id": "1"}, null]', 70_000),
+    # bulk enrich settles from the rows whose lookup succeeded; a failed row is free
+    ("aviato.companies.enrich.bulk", 150_000,
+     b'{"companies": [{"lookupSuccessful": true, "company": {"id": "1"}},'
+     b' {"lookupSuccessful": false}, null]}', 150_000),
+    ("aviato.people.enrich.bulk", 70_000,
+     b'[{"lookupSuccessful": true, "person": {"id": "1"}}, {"lookupSuccessful": false}, null]',
+     70_000),
+    ("aviato.people.enrich.bulk", 50_000, b'[{"lookupSuccessful": false}, {"lookupSuccessful": false}]', 0),
     # simple search releases its unbilled enrich rider
     ("aviato.people.search.simple", 0,
      b'{"items": [{"id":"1"},{"id":"2"},{"id":"3"},{"id":"4"},{"id":"5"}]}', 2_500),
@@ -1079,6 +1188,31 @@ def test_aviato_conditional_prices_follow_live_balance_deltas():
 def test_aviato_settles_from_counts_and_releases_unbilled_riders(endpoint, unit_micro, body, expected):
     mk = _mk("aviato", endpoint_id=endpoint, unit_micro=unit_micro)
     assert call_settle._observed_cost_micro(mk, body) == expected
+
+
+async def test_aviato_people_bulk_enrich_of_only_failed_lookups_is_free(clients, monkeypatch):
+    monkeypatch.setenv("TREG_PLATFORM_KEY_AVIATO", "PLATFORM-AVIATO")
+    monkeypatch.setenv("TREG_PLATFORM_PROVIDERS", "aviato")
+    get_settings.cache_clear()
+    lookups = [{"email": f"person{i}@example.com"} for i in range(3)]
+    failed = json.dumps([{"lookupSuccessful": False}] * 3).encode()
+    monkeypatch.setattr(call_service, "relay", _fake_relay(200, failed))
+    try:
+        before = await _balance(clients)
+        response = await clients.post("/call/aviato.people.enrich.bulk", json={"lookups": lookups})
+        assert response.status_code == 200, response.text
+        assert response.headers["x-treg-cost-micro"] == "0"
+        assert await _balance(clients) == before
+
+        hit = json.dumps([{"lookupSuccessful": True, "person": {"id": "1"}},
+                          {"lookupSuccessful": False}, {"lookupSuccessful": False}]).encode()
+        monkeypatch.setattr(call_service, "relay", _fake_relay(200, hit))
+        response = await clients.post("/call/aviato.people.enrich.bulk", json={"lookups": lookups})
+        assert response.status_code == 200, response.text
+        assert response.headers["x-treg-cost-micro"] == "50000"
+        assert before - await _balance(clients) == 50_000
+    finally:
+        get_settings.cache_clear()
 
 
 def test_observed_cost_counts_resources_for_billed_oauth_reads():
@@ -1119,18 +1253,36 @@ def test_observed_cost_counts_resources_for_billed_oauth_reads():
 
 
 def test_apollo_settles_a_2xx_miss_at_zero():
-    """Apollo answers a no-match with 2xx and charges nothing for it — `organization: null` on
-    enrich, an empty `organizations` page on search. Status-based billing would charge the
-    caller the full credit for a response Apollo gave away; the body is what decides. A body
-    carrying neither documented shape (people enrichment's 1-9 credit range) stays at the
-    estimate — deriving is only safe where the rule is flat."""
+    """Apollo answers a no-match with 2xx and charges nothing for it — `organization: null` or a
+    bare `{}` on enrich (the live unmatched-domain shape), an empty `organizations` page on
+    search. Status-based billing would charge the caller the full credit for a response Apollo
+    gave away; the body is what decides. A people-enrichment body carrying neither organization
+    key stays at the estimate — deriving is only safe where the rule is flat."""
     credit = 26_000  # $0.026/credit (fx.yaml, Basic $65/mo / 2,500 credits)
     assert call_settle._observed_cost_micro(_mk("apollo"), b'{"organization": {"name": "Apple"}}') == credit
     assert call_settle._observed_cost_micro(_mk("apollo"), b'{"organization": null}') == 0, "a 2xx miss is free"
+    enrich = _mk("apollo", endpoint_id="apollo.companies.enrich", cost_type="per_success")
+    assert call_settle._observed_cost_micro(enrich, b'{}') == 0, "live bare {} miss is free via adapter"
     assert call_settle._observed_cost_micro(_mk("apollo"), b'{"organizations": [{"name": "Apple"}], "pagination": {}}') == credit
     assert call_settle._observed_cost_micro(_mk("apollo"), b'{"organizations": [], "pagination": {}}') == 0, "an empty page is free"
     assert call_settle._observed_cost_micro(_mk("apollo"), b'{"person": {"id": "x"}}') is None, "1-9 credit range: estimate, not a guess"
     assert call_settle._observed_cost_micro(_mk("apollo"), b"not json") is None
+
+
+def test_apollo_people_enrich_stub_is_a_free_miss():
+    """A people/match no-match is a 200 whose `person` echoes what was sent, with
+    `match_confidence: "none"`; Apollo drew no credit for it on the live meter. The rule is
+    Monid's: bill when the confidence is not `none` or the person carries an email."""
+    enrich = _mk("apollo", endpoint_id="apollo.people.enrich", cost_type="per_success")
+    stub = b'{"person": {"id": "x", "name": "Qwvx Brindlemoor", "match_confidence": "none", "email": null, "employment_history": []}}'
+    assert call_settle._observed_cost_micro(enrich, stub) == 0
+    assert call_settle._observed_cost_micro(enrich, b'{"person": null}') == 0
+    assert call_settle._observed_cost_micro(enrich, b'{"person": {"id": "x", "email": ""}}') == 0
+    for hit in (b'{"person": {"id": "x", "match_confidence": "high"}}',
+                b'{"person": {"id": "x", "match_confidence": "low", "email": null}}',
+                b'{"person": {"id": "x", "match_confidence": "none", "email": "a@stripe.com"}}',
+                b'{"person": {"id": "x", "email": "a@stripe.com"}}'):
+        assert call_settle._observed_cost_micro(enrich, hit) is None, hit
 
 
 def test_hunter_domain_search_settles_on_the_emails_it_returned():
@@ -1347,6 +1499,7 @@ def test_platform_estimate_normalizes_per_result_pricing():
     per_row = {"type": "per_result", "usd": 0.0001}
     assert call_resolution._platform_estimate_micro(per_row, {}) == 0.0001 * call_resolution._PLATFORM_PAGE_DEFAULT * 1_000_000
     assert call_resolution._platform_estimate_micro(per_row, {"limit": "5"}) == 500
+    assert call_resolution._platform_estimate_micro(per_row, {"pastNMonths": "1"}) == 100  # spyfu: a row a month
     assert call_resolution._platform_estimate_micro(per_row, {"limit": "100000"}) == 0.0001 * call_resolution._PLATFORM_PAGE_MAX * 1_000_000
     assert call_resolution._platform_estimate_micro({"type": "per_call", "usd": None}, {}) == 0
     # rounds UP — a sub-micro fraction must never round to free
@@ -2160,11 +2313,11 @@ async def test_the_trial_allowance_bites_at_the_fx_number(clients: AsyncClient, 
     from treg.models import CallRecord
 
     async with session_maker() as db:
-        for i in range(50):
+        for _ in range(50):
             db.add(CallRecord(org_id=1, user_email="u@example.com", tool_name="finnhub.quote",
                               method="GET", path="/quote", status_code=200,
                               credential_tier="platform"))
-        for i in range(10):  # failures do not consume the allowance
+        for _ in range(10):  # failures do not consume the allowance
             db.add(CallRecord(org_id=1, user_email="u@example.com", tool_name="finnhub.quote",
                               method="GET", path="/quote", status_code=502))
         await db.commit()
@@ -2182,7 +2335,7 @@ async def test_failures_alone_never_exhaust_a_trial(clients: AsyncClient, trial_
     from treg.models import CallRecord
 
     async with session_maker() as db:
-        for i in range(60):
+        for _ in range(60):
             db.add(CallRecord(org_id=1, user_email="u@example.com", tool_name="finnhub.quote",
                               method="GET", path="/quote", status_code=429))
         await db.commit()
@@ -2215,7 +2368,7 @@ async def test_another_orgs_usage_never_burns_MY_trial(clients: AsyncClient, tri
     other = await clients.post("/orgs", json={"name": "another-trial-team"})
     assert other.status_code == 200, other.text
     async with session_maker() as db:
-        for i in range(50):
+        for _ in range(50):
             db.add(CallRecord(org_id=other.json()["org_id"], user_email="other@example.com",
                               tool_name="finnhub.quote", method="GET", path="/quote",
                               status_code=200, credential_tier="platform"))
@@ -2306,7 +2459,7 @@ def test_observed_cost_counts_brightdata_records():
     assert call_settle._observed_cost_micro(bd, b'{"status": "running", "message": "not ready"}') == 0
     # ndjson: one record per line
     assert call_settle._observed_cost_micro(bd, b'{"url": "a"}\n{"url": "b"}\n') == 3000
-    # csv: header + rows
+    # a csv body counts the rows under its header line
     assert call_settle._observed_cost_micro(bd, b"url,name\na,x\nb,y\n") == 3000
     # a payload the 8MB metered buffer truncated must settle at the estimate, never a partial count
     assert call_settle._observed_cost_micro(bd, b'[{"url": "a"}, {"url"') is None
@@ -2317,16 +2470,80 @@ def test_observed_cost_counts_brightdata_records():
 
 
 def test_influencersclub_settle_counts_accounts():
+    """Verify influencersclub discovery settles at cost.value × credit_rate per row, not one whole
+    credit per row. unit_micro is ONE CREDIT ($0.598 = 598,000 micro-USD); cost.value is 0.01
+    credits per creator, so each creator costs $0.00598 = 5,980 micro-USD."""
     from types import SimpleNamespace
     from treg.application.call.settle import _observed_cost_micro
-    mk = SimpleNamespace(cost_type="per_result", unit_micro=5980, billed_oauth=False,
-                         endpoint_id="influencersclub.creators.search", provider="influencersclub")
+    # unit_micro = one whole credit = $0.598 = 598,000 micro-USD (from fx.yaml influencersclub rate)
+    # estimate_micro = reserve for 10 rows at 0.01 credits each = 10 × 5,980 = 59,800 micro-USD
+    mk = SimpleNamespace(cost_type="per_result", unit_micro=598_000, billed_oauth=False,
+                         endpoint_id="influencersclub.creators.search", provider="influencersclub",
+                         estimate_micro=59_800)
     body = json.dumps({"total": 634, "limit": 10,
                        "accounts": [{"user_id": i} for i in range(10)]}).encode()
-    # 10 creators returned → 10 × 5,980µ$ = $0.0598, NOT the 20-row estimate ($0.1196)
+    # 10 creators returned at 0.01 credits each → 10 × 0.01 × $0.598 = $0.0598 = 59,800 micro-USD
+    # (NOT 10 × $0.598 = $5.98 = 5,980,000 micro-USD, which was the ~100x bug)
     assert _observed_cost_micro(mk, body) == 59_800
     # an envelope with no rows costs nothing
     assert _observed_cost_micro(mk, json.dumps({"detail": "quota"}).encode()) == 0
+
+
+@pytest.mark.parametrize(('endpoint_id', 'rows', 'expected_micro'), [
+    # Regression tests for the ~100x billing bug fixed 2026-10: settlement was multiplying
+    # rows × unit_micro (one whole credit = $0.598) instead of rows × cost.value × unit_micro
+    # (0.01 credits = $0.00598 per creator). Catalog: cost.value=0.01, credit_rate=$0.598.
+    # Correct: per_row = 0.01 × 598,000 = 5,980 micro-USD ($0.00598)
+    #
+    # creators.search: 0.01 credits per creator
+    ("influencersclub.creators.search", 0, 0),        # 0 rows → $0
+    ("influencersclub.creators.search", 5, 29_900),   # 5 rows → $0.0299 (not $2.99)
+    ("influencersclub.creators.search", 10, 59_800),  # 10 rows → $0.0598 (not $5.98)
+    ("influencersclub.creators.search", 20, 119_600), # 20 rows → $0.1196 (not $11.96)
+    # creators.similar: same 0.01 credits per creator
+    ("influencersclub.creators.similar", 0, 0),
+    ("influencersclub.creators.similar", 5, 29_900),
+    ("influencersclub.creators.similar", 10, 59_800),
+    ("influencersclub.creators.similar", 20, 119_600),
+])
+def test_influencersclub_discovery_billing_regression(endpoint_id, rows, expected_micro):
+    """Verify influencersclub discovery endpoints bill at 0.01 credits per creator, not 1 credit.
+
+    Incident 2026-10: customers were charged ~100x the catalog price ($2.99 for 5 rows instead of
+    $0.0299). Root cause: settle.py multiplied rows by unit_micro (one credit = $0.598) instead
+    of by cost.value × unit_micro (0.01 credits = $0.00598 per row).
+    """
+    from types import SimpleNamespace
+    from treg.application.call.settle import _observed_cost_micro
+    # unit_micro = one credit = $0.598 = 598,000 micro-USD
+    # estimate_micro = reserve large enough to not cap the result
+    mk = SimpleNamespace(
+        cost_type="per_result", unit_micro=598_000, billed_oauth=False,
+        endpoint_id=endpoint_id, provider="influencersclub",
+        estimate_micro=rows * 5_980 + 100_000)  # add buffer to avoid capping
+    body = json.dumps({
+        "total": 100, "limit": rows,
+        "accounts": [{"user_id": i} for i in range(rows)] if rows else [],
+    }).encode()
+    assert _observed_cost_micro(mk, body) == expected_micro
+
+
+def test_influencersclub_settle_capped_at_hold():
+    """Settlement must never exceed the reserve (hold), even if more rows are returned than
+    requested. This prevents a rogue response from overbilling the caller."""
+    from types import SimpleNamespace
+    from treg.application.call.settle import _observed_cost_micro
+    mk = SimpleNamespace(
+        cost_type="per_result", unit_micro=598_000, billed_oauth=False,
+        endpoint_id="influencersclub.creators.search", provider="influencersclub",
+        estimate_micro=29_900)  # reserve for 5 rows = $0.0299
+    # Response returns 10 rows but only 5 were reserved
+    body = json.dumps({
+        "total": 100, "limit": 10,
+        "accounts": [{"user_id": i} for i in range(10)],
+    }).encode()
+    # Should be capped at the hold (29,900), not 10 × 5,980 = 59,800
+    assert _observed_cost_micro(mk, body) == 29_900
 
 
 @pytest.mark.parametrize(('query', 'count', 'page_size', 'credits'), [
@@ -2469,6 +2686,116 @@ def test_reported_charge_uses_catalog_path_for_any_provider(monkeypatch, amount,
     body = json.dumps({'billing': {'actual': amount}, 'credits': {'jobCredits': 999}}).encode()
     assert call_settle._observed_cost_micro(
         _mk('example', endpoint_id=endpoint['id']), body) == expected
+
+
+@pytest.mark.parametrize('endpoint', [
+    'oceanio.companies.lookalike', 'oceanio.companies.search', 'oceanio.people.search',
+])
+@pytest.mark.parametrize('size,valid', [(1, True), (100, True), (0, False),
+                                       (101, False), (True, False), ('10', False),
+                                       (None, False)])
+def test_oceanio_platform_search_reserve_matches_bounded_size(endpoint, size, valid):
+    cat = catalog_store.load()
+    ep = cat.by_id[endpoint]
+    body = json.dumps({'size': size}).encode()
+    if not valid:
+        with pytest.raises(ResolutionFailed) as exc:
+            call_resolution._enforce_platform_request(ep, body)
+        assert exc.value.detail['parameter'] == 'body.size'
+        return
+    call_resolution._enforce_platform_request(ep, body)
+    cost = cat.cost_view(ep['cost'], 'oceanio')
+    estimate, _ = call_resolution._marketplace_pricing('oceanio', endpoint, cost, {}, body)
+    assert estimate == size * 16_200
+
+
+@pytest.mark.parametrize('field', ['revealEmails', 'revealPhones'])
+def test_oceanio_platform_person_enrich_refuses_separately_billed_reveals(field):
+    ep = catalog_store.load().by_id['oceanio.people.enrich']
+    call_resolution._enforce_platform_request(ep, b'{"person":{"linkedin":"example"}}')
+    with pytest.raises(ResolutionFailed) as exc:
+        call_resolution._enforce_platform_request(
+            ep, json.dumps({'person': {'linkedin': 'example'}, field: {}}).encode())
+    assert exc.value.detail['parameter'] == f'body.{field}'
+
+
+@pytest.mark.parametrize('name', ['reveal_phone_number', 'webhook_url', 'poll_only',
+                                  'run_waterfall_email', 'run_waterfall_phone'])
+def test_apollo_platform_person_enrich_refuses_webhook_channels(name):
+    ep = catalog_store.load().by_id['apollo.people.enrich']
+    call_resolution._enforce_platform_request(
+        ep, b'', query=call_resolution.QueryValues((('email', 'a@stripe.com'), ('reveal_personal_emails', 'true'))))
+    with pytest.raises(ResolutionFailed) as exc:
+        call_resolution._enforce_platform_request(
+            ep, b'', query=call_resolution.QueryValues((('email', 'a@stripe.com'), (name, 'false'))))
+    assert exc.value.detail['parameter'] == f'queryParams.{name}'
+
+
+@pytest.mark.parametrize('endpoint,credits,expected', [
+    ('oceanio.companies.lookalike', 0.2, 16_200),
+    ('oceanio.companies.search', 0, 0),
+    ('oceanio.people.search', 0.4, 32_400),
+    ('oceanio.people.enrich', 0.1, 8_100),
+])
+def test_oceanio_platform_settles_reported_credits(endpoint, credits, expected):
+    mk = _mk('oceanio', endpoint_id=endpoint, reported_charge_unit_micro=81_000)
+    assert call_settle._observed_cost_micro(
+        mk, json.dumps({'creditsUsed': credits}).encode()) == expected
+
+
+@pytest.mark.parametrize('endpoint,body,expected', [
+    ('oceanio.companies.lookalike',
+     {'size': 1, 'companiesFilters': {'lookalikeDomains': ['example.com']}}, 16_200),
+    ('oceanio.companies.search', {'size': 1}, 16_200),
+    ('oceanio.people.search', {'size': 1}, 16_200),
+    ('oceanio.people.enrich', {'person': {'linkedin': 'example'}}, 8_100),
+])
+async def test_oceanio_shared_key_calls_settle_reported_credits(
+    clients, monkeypatch, endpoint, body, expected,
+):
+    monkeypatch.setenv('TREG_PLATFORM_KEY_OCEANIO', 'PLATFORM-OCEANIO')
+    monkeypatch.setenv('TREG_PLATFORM_PROVIDERS', 'oceanio')
+    get_settings.cache_clear()
+
+    def upstream(request):
+        assert request.headers['x-api-token'] == 'PLATFORM-OCEANIO'
+        assert json.loads(request.content) == body
+        return _dropleads_response(200, {'creditsUsed': expected / 81_000})
+
+    try:
+        before = await _balance(clients)
+        async with AsyncClient(transport=httpx.MockTransport(upstream)) as vendor:
+            monkeypatch.setattr(A.app.state, 'http', vendor)
+            response = await clients.post(f'/call/{endpoint}', json=body)
+        assert response.status_code == 200, response.text
+        assert response.headers['x-treg-cost-micro'] == str(expected)
+        assert before - await _balance(clients) == expected
+    finally:
+        get_settings.cache_clear()
+
+
+async def test_oceanio_own_key_keeps_upstream_search_limit_and_is_unmetered(clients, monkeypatch):
+    monkeypatch.setenv('TREG_PLATFORM_KEY_OCEANIO', 'PLATFORM-OCEANIO')
+    monkeypatch.setenv('TREG_PLATFORM_PROVIDERS', 'oceanio')
+    get_settings.cache_clear()
+    saved = await clients.post('/secrets', json={'name': 'oceanio', 'value': 'OWN-OCEANIO'})
+    assert saved.status_code == 200, saved.text
+
+    def upstream(request):
+        assert request.headers['x-api-token'] == 'OWN-OCEANIO'
+        assert json.loads(request.content)['size'] == 101
+        return _dropleads_response(200, {'creditsUsed': 20.2})
+
+    try:
+        before = await _balance(clients)
+        async with AsyncClient(transport=httpx.MockTransport(upstream)) as vendor:
+            monkeypatch.setattr(A.app.state, 'http', vendor)
+            response = await clients.post('/call/oceanio.companies.search', json={'size': 101})
+        assert response.status_code == 200, response.text
+        assert 'x-treg-cost-micro' not in response.headers
+        assert await _balance(clients) == before
+    finally:
+        get_settings.cache_clear()
 
 
 @pytest.mark.parametrize('body,valid', [
@@ -2903,6 +3230,13 @@ def _usd_to_micro_for_test(usd) -> int:
     ("theirstack.jobs.search", None, {"posted_at_max_age_days": 7, "limit": 10}, b'{"metadata":{},"data":[{},{}]}', 2),
     ("theirstack.companies.search", None, {"limit": 10}, b'{"metadata":{},"data":[{},{},{}]}', 3),
     ("theirstack.companies.search", None, {"limit": 10}, b'{"error":{"title":"x"}}', None),
+    # SpyFu: one row per `results` item, an empty list is free, an unknown shape estimates.
+    ("spyfu.google.domain.overview", {"domain": "example.com", "pastNMonths": "1"}, None,
+     b'{"resultCount":1,"domain":"example.com","results":[{}]}', 1),
+    ("spyfu.google.domain.paid_keywords", {"query": "example.com", "pageSize": "10"}, None,
+     b'{"resultCount":0,"totalMatchingResults":0,"results":[]}', 0),
+    ("spyfu.google.domain.paid_keywords", {"query": "example.com", "pageSize": "10"}, None,
+     b'{"message":"unexpected"}', None),
 ])
 def test_per_result_search_settles_on_rows_returned_not_rows_requested(endpoint_id, query, req, body, rows):
     """Each reserves the requested page; the body says how many rows the vendor billed. The unit
@@ -2987,6 +3321,46 @@ def test_icypeas_company_scrape_bills_the_company_rate():
     assert call_settle._observed_cost_micro(mk, found) == 3 * mk.unit_micro  # 1.5 credits each
 
 
+_ERROR_IN_2XX = [
+    ("justoneapi", "GET", "/call/justoneapi.x.twitter-search-v1?keyword=example&searchType=Top&cursor=0",
+     None, b'{"code":301,"data":null,"message":"COLLECT FAILED, SEND REQUEST AGAIN"}'),
+    ("harvestapi", "GET", "/call/harvestapi.linkedin.user.profile?publicIdentifier=someone-example",
+     None, b'{"data":null,"error":"Too many queued requests (code_22)","status":429}'),
+    ("harvestapi", "GET", "/call/harvestapi.linkedin.user.profile?publicIdentifier=someone-example",
+     None, b'{"data":null,"error":"No active backend servers available.","status":503}'),
+    ("serpstat", "POST", "/call/serpstat.web.backlinks.summary",
+     {"id": "1", "method": "SerpstatBacklinksProcedure.getSummaryV2", "params": {"query": "example.com"}},
+     b'{"id":"1","error":{"code":-32016,"message":"Invalid domain"}}'),
+    ("icypeas", "POST", "/call/icypeas.people.email.find",
+     {"firstname": "Ada", "lastname": "Example", "domainOrCompany": "company.example"},
+     b'{"success":false,"validationErrors":[{"type":"FirstLastMandatoryDiscoveryError"}]}'),
+    ("brightdata", "POST", "/call/brightdata.x.tiktok-profiles?dataset_id=gd_l1villgoiiidt09ci&format=json",
+     [{"url": "https://www.tiktok.com/@someone-example"}], b""),
+]
+
+
+@pytest.mark.parametrize(("provider", "method", "path", "payload", "body"), _ERROR_IN_2XX)
+async def test_an_error_or_empty_2xx_is_not_a_billed_success(
+    clients: AsyncClient, monkeypatch, provider, method, path, payload, body,
+):
+    monkeypatch.setenv(f"TREG_PLATFORM_KEY_{provider.upper().replace('-', '_')}", "SYNTHETIC-KEY")
+    monkeypatch.setenv("TREG_PLATFORM_PROVIDERS", provider)
+    get_settings.cache_clear()
+    monkeypatch.setattr(call_service, "relay", _fake_relay(200, body))
+    try:
+        before = await _balance(clients)
+        response = await clients.request(method, path, json=payload)
+        assert response.status_code == 200, response.text
+        assert response.content == body
+        assert await _balance(clients) == before
+        telemetry = await _telemetry(clients)
+        assert telemetry["cost_estimated_micro"] > 0
+        assert telemetry["cost_observed_micro"] == 0
+        assert telemetry["cost_charged_micro"] == 0
+    finally:
+        get_settings.cache_clear()
+
+
 # ---------------------------------------------------------------------------------------------
 # A synchronous `settle: usage` endpoint (Jev through OpenRouter, added for the AI visibility tool)
 
@@ -3026,6 +3400,117 @@ async def test_a_sync_usage_settled_call_charges_the_providers_reported_cost(
     assert r.json() == reply
     assert r.headers["x-treg-cost-micro"] == "20"
     assert before - await _balance(clients) == 20
+
+
+@pytest.mark.parametrize(("endpoint", "body", "usage", "base", "charged"), [
+    # Live 2026-10-09: 15 turbo results reported the search plus five results past ten.
+    ("parallel.web.search", {"search_queries": ["x"], "mode": "fast",
+                             "advanced_settings": {"max_results": 15}},
+     [{"name": "sku_search", "count": 1}, {"name": "sku_extract_excerpts", "count": 5}], "0.001", 6_000),
+    # basic and advanced report the same `sku_search` name; the row prices the mode.
+    ("parallel.web.search.advanced", {"search_queries": ["x"]},
+     [{"name": "sku_search", "count": 1}], "0.005", 5_000),
+    ("parallel.web.extract", {"urls": ["https://example.com", "https://example.org"]},
+     [{"name": "sku_extract_excerpts", "count": 2}], "0.001", 2_000),
+])
+async def test_parallel_platform_call_settles_its_reported_usage_skus(
+    clients, monkeypatch, endpoint, body, usage, base, charged,
+):
+    """The hold is the base price, so a caller capped at it (Web Arena caps each leg at the
+    catalog price) is served; the reported usage then settles any extra results or URLs."""
+    monkeypatch.setenv("TREG_PLATFORM_KEY_PARALLEL", "PLATFORM-PARALLEL")
+    monkeypatch.setenv("TREG_PLATFORM_PROVIDERS", "parallel")
+    get_settings.cache_clear()
+    reply = {"results": [{"url": "https://example.com", "excerpts": ["Example Domain"]}],
+             "usage": usage}
+    seen = []
+
+    def serve(request):
+        seen.append(request.headers["x-api-key"])
+        return _dropleads_response(200, reply)
+
+    try:
+        async with httpx.AsyncClient(transport=httpx.MockTransport(serve)) as upstream:
+            monkeypatch.setattr(A.app.state, "http", upstream)
+            before = await _balance(clients)
+            r = await clients.post(f"/call/{endpoint}", json=body,
+                                   headers={"X-Treg-Route-Max-Cost": base})
+            assert r.status_code == 200, r.text
+            assert r.json() == reply
+            assert r.headers["x-treg-cost-micro"] == str(charged)
+            assert before - await _balance(clients) == charged
+
+            await clients.post("/secrets", json={"name": "parallel", "value": "OWN-PARALLEL"})
+            before = await _balance(clients)
+            own = await clients.post(f"/call/{endpoint}", json=body)
+            assert own.status_code == 200, own.text
+            assert "x-treg-cost-micro" not in own.headers
+            assert await _balance(clients) == before
+    finally:
+        get_settings.cache_clear()
+    assert seen == ["PLATFORM-PARALLEL", "OWN-PARALLEL"]
+
+
+@pytest.mark.parametrize(("endpoint", "body", "reply", "charged"), [
+    # The first page is empty but the second has text: usage[], not the first page, decides.
+    ("parallel.web.extract", {"urls": ["https://example.com", "https://example.org"]},
+     {"results": [{"url": "https://example.com", "excerpts": [], "full_content": None},
+                  {"url": "https://example.org", "excerpts": ["Example"], "full_content": None}],
+      "usage": [{"name": "sku_extract_excerpts", "count": 1}]}, 1_000),
+    # Two empty pages with an explicitly empty usage[]: Parallel billed nothing, so neither does treg.
+    ("parallel.web.extract", {"urls": ["https://example.com", "https://example.org"]},
+     {"results": [{"url": "https://example.com", "excerpts": [], "full_content": None},
+                  {"url": "https://example.org", "excerpts": [], "full_content": None}],
+      "usage": []}, 0),
+    # The same pages with no usage field at all are unobserved: the base-price fallback settles.
+    ("parallel.web.extract", {"urls": ["https://example.com", "https://example.org"]},
+     {"results": [{"url": "https://example.com", "excerpts": [], "full_content": None},
+                  {"url": "https://example.org", "excerpts": [], "full_content": None}]}, 1_000),
+    # A successful answer without usage[] settles the base price the row holds, never more.
+    ("parallel.web.search", {"search_queries": ["x"], "mode": "fast"},
+     {"results": [{"url": "https://example.com", "excerpts": ["Example"]}]}, 1_000),
+    ("parallel.web.extract", {"urls": ["https://example.com"]},
+     {"results": [{"url": "https://example.com", "excerpts": ["Example"]}]}, 1_000),
+])
+async def test_parallel_settles_usage_or_the_base_price_never_a_first_page_miss(
+    clients, monkeypatch, endpoint, body, reply, charged,
+):
+    monkeypatch.setenv("TREG_PLATFORM_KEY_PARALLEL", "PLATFORM-PARALLEL")
+    monkeypatch.setenv("TREG_PLATFORM_PROVIDERS", "parallel")
+    get_settings.cache_clear()
+    try:
+        async with httpx.AsyncClient(transport=httpx.MockTransport(
+                lambda request: _dropleads_response(200, reply))) as upstream:
+            monkeypatch.setattr(A.app.state, "http", upstream)
+            before = await _balance(clients)
+            r = await clients.post(f"/call/{endpoint}", json=body)
+    finally:
+        get_settings.cache_clear()
+    assert r.status_code == 200, r.text
+    assert r.headers["x-treg-cost-micro"] == str(charged)
+    assert before - await _balance(clients) == charged
+
+
+async def test_parallel_extract_of_only_unreadable_urls_is_free(clients, monkeypatch):
+    """Live 2026-10-09: an unreachable URL comes back under errors[] with an empty usage list."""
+    monkeypatch.setenv("TREG_PLATFORM_KEY_PARALLEL", "PLATFORM-PARALLEL")
+    monkeypatch.setenv("TREG_PLATFORM_PROVIDERS", "parallel")
+    get_settings.cache_clear()
+    reply = {"results": [], "usage": [], "errors": [
+        {"url": "https://unreachable.invalid/", "error_type": "connect_error",
+         "http_status_code": None, "content": None}]}
+    try:
+        async with httpx.AsyncClient(transport=httpx.MockTransport(
+                lambda request: _dropleads_response(200, reply))) as upstream:
+            monkeypatch.setattr(A.app.state, "http", upstream)
+            before = await _balance(clients)
+            r = await clients.post("/call/parallel.web.extract",
+                                   json={"urls": ["https://unreachable.invalid/"]})
+    finally:
+        get_settings.cache_clear()
+    assert r.status_code == 200, r.text
+    assert r.json() == reply
+    assert await _balance(clients) == before
 
 
 
@@ -3232,3 +3717,97 @@ def test_octen_runtime_uses_frozen_rates_and_checks_platform_shape():
         call_resolution._enforce_platform_request({"provider": "octen", "id": endpoint},
                                           json.dumps({"urls": ["https://example.com"] * 21}).encode())
     assert caught.value.kind == "catalog_parameter_invalid"
+
+
+async def test_an_answer_over_the_size_limit_is_not_kept_and_a_retry_never_runs_again(
+        clients: AsyncClient, platform_on, monkeypatch):
+    """Finding 5 (2026-09-21): retry rows kept every body whole for 24 h, up to 7.9 MB, while the
+    archive refuses anything over 2 MB. Over the limit, the caller still gets the full answer once;
+    a retry gets a stored 410 with the charge, and the provider is not called a second time."""
+    from sqlmodel import select
+
+    from treg.infra.db import session_maker
+    from treg.models import IdempotentCall
+
+    monkeypatch.setenv("TREG_ARCHIVE_MAX_BODY_BYTES", "10")      # any real answer is "large" now
+    get_settings.cache_clear()
+    calls = []
+    real = call_service.relay
+
+    async def counting(*a, **kw):
+        calls.append(1)
+        return await real(*a, **kw)
+    monkeypatch.setattr(call_service, "relay", counting)
+
+    headers = {"Idempotency-Key": "big-answer"}
+    first = await clients.get(f"/call/{EP}?aweme_id=big", headers=headers)
+    assert first.status_code == 200 and len(first.content) > 10, first.text   # the full answer, once
+    before = await _balance(clients)
+    retry = await clients.get(f"/call/{EP}?aweme_id=big", headers=headers)
+    assert retry.status_code == 410 and retry.headers["X-Treg-Idempotent-Replay"] == "true"
+    detail = retry.json()["detail"]
+    assert detail["error"] == "idempotency_response_too_large" and detail["size_bytes"] == len(first.content)
+    assert detail["call_id"] == first.headers["X-Treg-Call-Id"] and detail["charged_micro"] > 0
+    assert len(calls) == 1 and await _balance(clients) == before        # no second run, no second charge
+    async with session_maker() as db:
+        row = (await db.execute(select(IdempotentCall).where(IdempotentCall.key == "big-answer"))).scalar_one()
+    assert row.response_body != first.content and len(row.response_body) < 1000
+    get_settings.cache_clear()
+
+
+async def test_the_call_record_splits_out_the_providers_share_of_the_time(
+        clients: AsyncClient, platform_on, monkeypatch):
+    """Finding 7 (2026-09-21): only the total existed, including an OAuth refresh that makes its own
+    network request, so a slow call could not be pinned on the provider or on treg. A provider
+    that takes 300 ms shows it, inside the total."""
+    import asyncio
+
+    from sqlmodel import select
+
+    from treg.infra.db import session_maker
+    from treg.models import CallRecord
+
+    real = call_service.relay
+
+    async def slow_provider(*a, **kw):
+        await asyncio.sleep(0.3)
+        return await real(*a, **kw)
+
+    monkeypatch.setattr(call_service, "relay", slow_provider)
+    r = await clients.get(f"/call/{EP}?aweme_id=timed")
+    assert r.status_code == 200
+    await audit.drain()
+    async with session_maker() as db:
+        row = (await db.execute(select(CallRecord).where(
+            CallRecord.call_ref == r.headers["X-Treg-Call-Id"]))).scalar_one()
+    assert 300 <= row.upstream_ms < 450, row.upstream_ms
+    assert row.duration_ms >= row.upstream_ms, (row.duration_ms, row.upstream_ms)
+
+
+async def test_a_balance_refusal_asks_for_an_auto_top_up(clients: AsyncClient, platform_on, monkeypatch):
+    """Only a call that got through used to schedule a refill, so a team at $0 with auto top-up on
+    stayed empty until something else ran, refusing every call meanwhile."""
+    from treg.application import billing
+    from treg.models import Org
+
+    org_id = (await clients.get("/orgs")).json()[0]["org_id"]
+    async with session_maker() as db:
+        await ledger.reserve(db, org_id, "drain", 1_000_000)
+        org = await db.get(Org, org_id)
+        org.autotopup_enabled, org.autotopup_consented_at = True, billing._now()
+        org.stripe_customer_id, org.stripe_default_pm = "cus_x", "pm_x"
+        db.add(org)
+        await db.commit()
+    monkeypatch.setattr(billing, "configured", lambda: True)
+    asked: list[int] = []
+
+    async def fake_run(oid):
+        asked.append(oid)
+        billing._scheduled.discard(oid)
+    monkeypatch.setattr(billing, "_run_autotopup", fake_run)
+    r = await clients.get(f"/call/{EP}?aweme_id=7")
+    assert r.status_code == 402, r.text
+    import asyncio
+    await asyncio.sleep(0)
+    assert asked == [org_id]
+    assert "5 times per hour" in r.json()["detail"]["message"]

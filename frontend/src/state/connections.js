@@ -1,6 +1,5 @@
 
 export default {
-// ---- connections (registry OAuth) ----
     async loadConnections(){
       this.connErr=''; const live=this.ticket('connections');
       this.loadPlatforms();  // fire-and-forget, and first: the catalog must neither hold up nor wait for the connect UI
@@ -167,6 +166,7 @@ async chooseCapability(cap){
 connProvider(c){ return this.providerIndex.get(c.provider)||null; },
 // The one thing a connection needs from a person, if anything: the card's status and its action.
     connState(c){
+      if(c.paused) return {key:'paused', tone:'quiet', label:'Paused', title:c.paused_message};
       if(c.expiry_state==='expired') return {key:'reconnect', tone:'bad', label:'Expired', title:'This credential has expired. Reconnect to keep calling.'};
       if(c.needs_reconnect) return {key:'reconnect', tone:'warn', label:'Expires soon', title:'treg cannot renew this one. Reconnect before '+(c.expires_at||'it expires')+'.'};
       if(c.needs_extra_credential) return {key:'second', tone:'warn', label:'Needs a second credential', title:c.extra_credential_note};
@@ -205,16 +205,20 @@ async openResources(c){
         const d=await this.api('/connections/'+c.id+'/resources');
         if(!this.resPick || this.resPick.id!==c.id) return;  // user closed it or opened another
         this.resPick={id:c.id, label:d.resource_label||label, plural:d.resource_plural||plural,
-                      rows:d.resources||[], selected:d.selected||'', loading:false,
+                      rows:d.resources||[], selected:d.selected||'', loading:false, scoped:!!d.resource_scoped,
                       err:d.setup_required?(d.setup_detail||'Account setup is required.'):''};
         // Discovery can change the row underneath us — it backfills a missing label and records
         // that the credential works — so pull the list again rather than leaving stale text on screen.
         this.loadConnections();
       }catch(e){
-        // e.detail carries the server's (and often the upstream's) actual words; e.message is just 'http'.
         if(!this.resPick || this.resPick.id!==c.id) return;
         this.resPick.loading=false;
-        this.resPick.err='Could not list '+plural+': '+(e.detail||e.message||e);
+        if(e.detail?.code==='youtube_quota_exceeded'){
+          this.resPick.err='YouTube is temporarily unavailable. We’re seeing high usage and have reached our current Google API limit. We’ve requested a higher limit and are waiting for Google’s response. Please try again later.';
+        }else{
+          // e.detail carries the server's (and often the upstream's) actual words; e.message is just 'http'.
+          this.resPick.err='Could not list '+plural+': '+(e.detail||e.message||e);
+        }
       }
     },
 async chooseResource(r){

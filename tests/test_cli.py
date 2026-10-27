@@ -2,9 +2,11 @@
 
 from __future__ import annotations
 
+import io
 import json
 import stat
 
+import httpx
 import pytest
 
 from treg import cli
@@ -457,11 +459,17 @@ def test_oauth_connect_prints_provider_guidance_from_the_api(monkeypatch, capsys
         def json(self):
             return {"status": "done", "secret_id": 7, "name": "future-provider"}
 
+    class ProvidersResponse:
+        status_code = 200
+
+        def json(self):
+            return [{"service": "future-provider", "auth_kind": "oauth"}]
+
     class Client:
         def __enter__(self): return self
         def __exit__(self, *args): return False
         def post(self, path, json): return Response()
-        def get(self, path): return StatusResponse()
+        def get(self, path): return ProvidersResponse() if path == "/oauth/providers" else StatusResponse()
 
     monkeypatch.setattr(cli, "_client", lambda cfg: Client())
     monkeypatch.setattr(cli.time, "sleep", lambda seconds: None)
@@ -471,6 +479,175 @@ def test_oauth_connect_prints_provider_guidance_from_the_api(monkeypatch, capsys
     cli.cmd_oauth_connect(args, {"base_url": "http://x"})
     output = capsys.readouterr().out
     assert "Use the linked workspace administrator grant." in output
+
+
+_MOZ = {"service": "moz", "display_name": "Moz", "auth_kind": "key",
+        "token_label": "AccessID:SecretKey", "setup_url": "https://moz.com/api/dashboard"}
+_TOMBA = {"service": "tomba", "display_name": "Tomba", "auth_kind": "key", "token_label": "API key",
+          "needs_extra_credential": True, "extra_credential_label": "API secret"}
+_LISTING = [_MOZ, _TOMBA, {"service": "google-search-console", "auth_kind": "oauth"}]
+
+
+def _registry(monkeypatch, *, providers=None, connect_status=200, connect_body=None):
+    """A fake registry over MockTransport that lists Moz as a pasted-key provider. `providers` is
+    the `/oauth/providers` answer: an httpx.Response, or an exception to raise. Returns the requests
+    it saw so a test can assert what was (and was not) sent."""
+    seen = []
+
+    def handle(request):
+        seen.append(request)
+        if request.url.path == "/oauth/providers":
+            if isinstance(providers, Exception):
+                raise providers
+            return providers or httpx.Response(200, json=_LISTING)
+        if request.url.path == "/connections/token":
+            return httpx.Response(connect_status, json=connect_body or {"id": 12, "name": "moz"})
+        if request.url.path == "/connections/12/extra-credential":
+            return httpx.Response(200, json={"id": 12, "name": "tomba", "ready": True})
+        if request.url.path == "/oauth/start":
+            return httpx.Response(422, json={"detail": "the server's own answer"})
+        return httpx.Response(500, json={"detail": f"unexpected {request.url.path}"})
+
+    monkeypatch.setattr(cli, "_client", lambda cfg: httpx.Client(
+        transport=httpx.MockTransport(handle), base_url="https://registry.example.test"))
+    return seen
+
+
+class _Tty(io.StringIO):
+    def isatty(self): return True
+
+
+def _connect(*argv):
+    cli.cmd_oauth_connect(cli.build_parser().parse_args(["connections", "connect", *argv]),
+                          {"base_url": "http://x"})
+
+
+def _posted(seen):
+    return [r.url.path for r in seen if r.method == "POST"]
+
+
+def test_a_key_provider_connects_with_a_piped_key_not_oauth(monkeypatch, capsys):
+    """The bug: `connect --provider moz` went to /oauth/start and failed "moz has no capability ''"."""
+    seen = _registry(monkeypatch)
+    monkeypatch.setattr(cli.sys, "stdin", io.StringIO("  access-id:secret-key\n"))
+    _connect("--provider", "moz", "--key-stdin")
+    assert _posted(seen) == ["/connections/token"]
+    assert json.loads(seen[-1].content) == {"provider": "moz", "token": "access-id:secret-key"}
+    assert "Connected Moz. Connection id: 12 (moz)" in capsys.readouterr().out
+
+
+def test_a_key_typed_at_a_terminal_is_read_hidden(monkeypatch, capsys):
+    seen = _registry(monkeypatch)
+    monkeypatch.setattr(cli.sys, "stdin", _Tty())
+    prompts = []
+    monkeypatch.setattr(cli.getpass, "getpass", lambda prompt: prompts.append(prompt) or "typed-key")
+    _connect("--provider", "moz")
+    assert prompts == ["Paste your Moz AccessID:SecretKey (input hidden): "]
+    assert json.loads(seen[-1].content)["token"] == "typed-key"
+    out = capsys.readouterr().out
+    assert "https://moz.com/api/dashboard" in out and "typed-key" not in out
+
+
+@pytest.mark.parametrize("interrupt", [KeyboardInterrupt, EOFError])
+def test_cancelling_the_prompt_exits_cleanly(monkeypatch, interrupt):
+    seen = _registry(monkeypatch)
+    monkeypatch.setattr(cli.sys, "stdin", _Tty())
+
+    def cancel(prompt):
+        raise interrupt
+    monkeypatch.setattr(cli.getpass, "getpass", cancel)
+    with pytest.raises(SystemExit, match="cancelled"):
+        _connect("--provider", "moz")
+    assert not _posted(seen)
+
+
+def test_unattended_stdin_is_read_only_with_key_stdin(monkeypatch):
+    """An agent whose stdin is an idle pipe must get an answer, not a hang on a read."""
+    seen = _registry(monkeypatch)
+
+    class IdlePipe(io.StringIO):
+        def read(self, *a): pytest.fail("stdin must not be read without --key-stdin")
+        readline = read
+    monkeypatch.setattr(cli.sys, "stdin", IdlePipe())
+    with pytest.raises(SystemExit, match="--key-stdin"):
+        _connect("--provider", "moz")
+    assert not _posted(seen)
+
+
+@pytest.mark.parametrize("argv,stdin", [
+    pytest.param(("--provider", "moz", "--key-stdin"), io.StringIO("  \n"), id="empty-key"),
+    pytest.param(("--provider", "moz", "--key-stdin"), _Tty("k"), id="key-stdin-at-a-terminal"),
+    pytest.param(("--provider", "moz", "--key-stdin", "--capability", "write"), io.StringIO("k"),
+                 id="capability-on-a-key"),
+    pytest.param(("my-moz", "--provider", "moz", "--key-stdin"), io.StringIO("k"), id="name-on-a-key"),
+    pytest.param(("--provider", "moz", "--key-stdin", "--client-secret", "s.json"), io.StringIO("k"),
+                 id="client-secret-on-a-key"),
+    pytest.param(("--provider", "google-search-console", "--key-stdin"), io.StringIO("k"),
+                 id="key-stdin-on-an-oauth-provider"),
+])
+def test_bad_connect_input_is_refused_before_anything_is_sent(monkeypatch, argv, stdin):
+    seen = _registry(monkeypatch)
+    monkeypatch.setattr(cli.sys, "stdin", stdin)
+    with pytest.raises(SystemExit):
+        _connect(*argv)
+    assert not _posted(seen)
+
+
+def test_a_paired_key_provider_sends_both_halves(monkeypatch, capsys):
+    """Tomba signs with key + secret; connecting only the key left a tool that could not be called."""
+    seen = _registry(monkeypatch)
+    monkeypatch.setattr(cli.sys, "stdin", io.StringIO("ta_key\n ts_secret \n"))
+    _connect("--provider", "tomba", "--key-stdin")
+    assert _posted(seen) == ["/connections/token", "/connections/12/extra-credential"]
+    assert json.loads(seen[-2].content) == {"provider": "tomba", "token": "ta_key"}
+    assert json.loads(seen[-1].content) == {"value": "ts_secret"}
+    assert "Connected Tomba" in capsys.readouterr().out
+
+
+def test_a_paired_key_provider_prompts_for_both_at_a_terminal(monkeypatch):
+    seen = _registry(monkeypatch)
+    monkeypatch.setattr(cli.sys, "stdin", _Tty())
+    answers = iter(["ta_key", "ts_secret"])
+    prompts = []
+    monkeypatch.setattr(cli.getpass, "getpass", lambda prompt: prompts.append(prompt) or next(answers))
+    _connect("--provider", "tomba")
+    assert prompts == ["Paste your Tomba API key (input hidden): ",
+                       "Paste your Tomba API secret (input hidden): "]
+    assert json.loads(seen[-1].content) == {"value": "ts_secret"}
+
+
+def test_a_paired_key_provider_without_its_second_half_sends_nothing(monkeypatch):
+    seen = _registry(monkeypatch)
+    monkeypatch.setattr(cli.sys, "stdin", io.StringIO("ta_key\n"))
+    with pytest.raises(SystemExit, match="second line"):
+        _connect("--provider", "tomba", "--key-stdin")
+    assert not _posted(seen)
+
+
+@pytest.mark.parametrize("status,code", [(422, 1), (307, 1)])
+def test_a_key_that_did_not_connect_exits_nonzero(monkeypatch, capsys, status, code):
+    """A rejected key shows the server's reason; a redirect (not followed) is not a success either."""
+    _registry(monkeypatch, connect_status=status, connect_body={"detail": "Moz rejected that key (HTTP 401)"})
+    monkeypatch.setattr(cli.sys, "stdin", io.StringIO("bad"))
+    with pytest.raises(SystemExit) as exc:
+        _connect("--provider", "moz", "--key-stdin")
+    assert exc.value.code == code
+    out = capsys.readouterr().out
+    assert "Moz rejected that key" in out and "Connected" not in out
+
+
+@pytest.mark.parametrize("providers", [
+    pytest.param(httpx.Response(404, json={"detail": "Not Found"}), id="older-server"),
+    pytest.param(httpx.Response(200, text="<html>proxy</html>"), id="not-json"),
+    pytest.param(httpx.Response(200, json={"providers": []}), id="not-a-list"),
+    pytest.param(httpx.ConnectError("refused"), id="unreachable"),
+])
+def test_an_unreadable_provider_listing_falls_back_to_oauth_start(monkeypatch, capsys, providers):
+    seen = _registry(monkeypatch, providers=providers)
+    with pytest.raises(SystemExit):
+        _connect("--provider", "moz")
+    assert _posted(seen) == ["/oauth/start"]
+    assert "the server's own answer" in capsys.readouterr().out
 
 
 def test_clear_active_only_when_targeted(monkeypatch):
@@ -825,6 +1002,214 @@ def test_a_credit_price_reads_as_dollars_with_the_credits_behind_it():
     assert cli._cost_usd(per_second) == "$0.119-$0.462/s"
     assert cli._cost_usd(unpriced) == "3 credits/success"
     assert "$" not in cli._cost_usd(unpriced), "no rate, no invented dollar figure"
+
+
+def test_catalog_search_new_and_newest(monkeypatch, capsys):
+    """`--new [DAYS]` (30 when bare) and `--sort newest` reach the server; words become optional,
+    every row shows its ADDED day, and a capped window says so in one line."""
+    p = cli.build_parser()
+    assert p.parse_args(["catalog", "search", "--new"]).new == 30
+    a = p.parse_args(["catalog", "search", "phone", "--new", "60", "--sort", "newest"])
+    assert a.rest == ["phone"] and a.new == 60 and a.sort == "newest"
+    assert p.parse_args(["catalog", "search", "phone"]).new is None
+    with pytest.raises(SystemExit):
+        p.parse_args(["catalog", "search", "--new", "phone"])
+    assert "put search words before --new" in capsys.readouterr().err
+
+    seen = []
+    body = {"query": "", "count": 2, "total": 2, "sort": "newest", "added_within_days": 365,
+            "capped_at_days": 365, "hints": [], "results": [
+                {"id": "hlrlookup.people.phone.verify", "provider": "hlrlookup", "summary": "Verify a phone",
+                 "cost": {"type": "per_call", "usd": 0.01}, "added": "2026-10-07"},
+                {"id": "tavily.web.search", "provider": "tavily", "summary": "Search the web",
+                 "cost": {"type": "per_call", "usd": 0.008}, "added": "2026-09-21"}]}
+
+    class _C:
+        def __enter__(self): return self
+        def __exit__(self, *a): return False
+        def get(self, url, params=None):
+            seen.append((url, params))
+            return _CatalogResp(body)
+    monkeypatch.setattr(cli, "_client", lambda cfg, auth=True: _C())
+    monkeypatch.setattr(cli, "_connected_providers", lambda cfg: set())
+    cli.cmd_catalog(p.parse_args(["catalog", "search", "--new", "900"]), {"base_url": "http://x"})
+    assert seen[-1] == ("/catalog/search", {"q": "", "limit": 25, "added_within_days": 900})
+    out = capsys.readouterr().out
+    assert "capped at 365 days" in out
+    assert "2 tools added in the last 365 days, newest first" in out
+    assert "ADDED" in out and "2026-10-07" in out and "2026-09-21" in out
+
+    cli.cmd_catalog(p.parse_args(["catalog", "search", "web", "--sort", "newest"]), {"base_url": "http://x"})
+    assert seen[-1][1] == {"q": "web", "limit": 25, "sort": "newest"}
+    capsys.readouterr()
+
+    # an older server ignores both options: its plain answer is not labelled as new tools
+    for key in ("sort", "added_within_days", "capped_at_days"):
+        body.pop(key, None)
+    for argv in (["catalog", "search", "--new"], ["catalog", "search", "web", "--sort", "newest"]):
+        cli.cmd_catalog(p.parse_args(argv), {"base_url": "http://x"})
+        out = capsys.readouterr().out
+        assert "this server does not support --new yet" in out and "added in the last" not in out
+    with pytest.raises(SystemExit):
+        cli.cmd_catalog(p.parse_args(["catalog", "search"]), {"base_url": "http://x"})
+
+
+def test_catalog_search_explains_routing_once(monkeypatch, capsys):
+    """Every reader is an agent paying per token: two routed groups share one explanation."""
+    def routed(cap, children):
+        return [{"id": f"treg.{cap}", "kind": "routed", "provider": "treg", "capability": cap,
+                 "summary": cap, "routed_children": children, "cost": {"type": "per_success", "usd": 0.01}}] + [
+            {"id": child, "provider": child.split(".")[0], "capability": cap, "summary": child,
+             "cost": {"type": "per_call", "usd": 0.001}, "added": "2026-07-28"} for child in children]
+    rows = routed("web.backlinks.list", ["moz.web.backlinks.list", "serpstat.web.backlinks.list"]) \
+        + routed("web.anchors.list", ["moz.web.anchors.list", "serpstat.web.anchors.list"])
+    _stub_catalog_client(monkeypatch, {"/catalog/search": _CatalogResp(
+        {"query": "backlinks", "total": len(rows), "verdict": "strong", "results": rows})})
+    monkeypatch.setattr(cli, "_connected_providers", lambda cfg: set())
+    cli.cmd_catalog(cli.build_parser().parse_args(["catalog", "search", "backlinks"]), {"base_url": "http://x"})
+    out = capsys.readouterr().out
+    assert out.count("hint: a ▸ ROUTED row") == 1
+    assert out.index("hint:") > out.index("serpstat.web.anchors.list"), "below the table, not inside it"
+    assert out.rstrip().endswith("for its params, price and a ready `treg call` line")
+    assert "next: treg catalog get <id> (e.g. treg.web.backlinks.list)" in out
+    assert out.count("ROUTED (2 providers)") == 2, "each routed row still says how many it draws on"
+    assert "serpstat.web.anchors.list" in out
+
+
+def _home_registry(monkeypatch, *, me=None, orgs=None, balance_micro=1_000_000, balance=None, tools=(),
+                   fail=None):
+    """A fake registry for bare `treg`. `me` is /auth/me's answer (an httpx.Response or a body);
+    `orgs=None` is refused, as the server refuses an agent key; `fail` maps a path to an exception.
+    TREG_TOKEN is cleared so only the test's config decides who is signed in."""
+    monkeypatch.delenv("TREG_TOKEN", raising=False)
+    seen = []
+
+    def handle(request):
+        seen.append(request.url.path)
+        path = request.url.path
+        if path in (fail or {}):
+            raise fail[path]
+        if path == "/auth/me":
+            return me if isinstance(me, httpx.Response) else httpx.Response(200, json=me)
+        if path == "/orgs":
+            return httpx.Response(403, json={"detail": "agent key"}) if orgs is None else httpx.Response(200, json=orgs)
+        if path.endswith("/balance"):
+            return balance or httpx.Response(200, json={"balance_micro": balance_micro, "entries": {"items": []}})
+        if path == "/tools":
+            return httpx.Response(200, json=[{"name": n} for n in tools])
+        return httpx.Response(500, json={"detail": f"unexpected {path}"})
+
+    monkeypatch.setattr(cli, "_client", lambda cfg, auth=True: httpx.Client(
+        transport=httpx.MockTransport(handle), base_url="https://registry.example.test"))
+    return seen
+
+
+def _home(cfg=None):
+    cli.cmd_home(None, {"base_url": "https://registry.example.test", **(cfg or {})})
+
+
+def test_bare_treg_shows_live_state_and_next_commands(monkeypatch, capsys):
+    """Content first: an agent that runs bare `treg` gets its team, balance and own tools, then
+    runnable next steps, instead of a usage error that costs it a turn on `--help`."""
+    seen = _home_registry(monkeypatch, me={"email": "a@example.com"},
+                          orgs=[{"org_id": 3, "slug": "other", "role": "member"},
+                                {"org_id": 7, "slug": "acme", "role": "admin"}],
+                          tools=("stripe", "gh"))
+    _home({"token": "t", "active_org": "acme"})
+    out = capsys.readouterr().out
+    assert "account: a@example.com" in out and "team: acme (admin)" in out
+    assert "balance: $1.00" in out and "own_tools[2]: stripe, gh" in out
+    assert "/orgs/7/balance" in seen, "the active team's balance, not the first membership's"
+    assert "help[4]:" in out and "Run `treg call <tool>/<path>`" in out and "treg topup" not in out
+
+
+def test_bare_treg_with_a_team_key_takes_its_team_from_auth_me(monkeypatch, capsys):
+    """/orgs refuses an agent key; /auth/me names its one team, as `treg balance` resolves it."""
+    seen = _home_registry(monkeypatch, me={"email": "a@example.com", "org_id": 7, "org": "acme",
+                                           "role": "member"}, balance_micro=0)
+    _home({"token": "t"})
+    out = capsys.readouterr().out
+    assert "/orgs/7/balance" in seen and "team: acme (member)" in out
+    assert "own_tools: none registered" in out
+    help_lines = out.split("help[", 1)[1]
+    assert help_lines.index("treg topup") < help_lines.index("treg catalog search"), "the blocker leads"
+
+
+@pytest.mark.parametrize("cfg, me, expect", [
+    ({}, None, "Run `treg login`"),
+    ({"token": "t"}, httpx.Response(401, json={"detail": "no session"}), "(token rejected)"),
+    ({"token": "t"}, {"email": "a@example.com"}, "Run `treg org create"),  # signed in, in no team
+])
+def test_bare_treg_names_what_is_missing(monkeypatch, capsys, cfg, me, expect):
+    _home_registry(monkeypatch, me=me, orgs=[])
+    _home(cfg)
+    out = capsys.readouterr().out
+    assert expect in out and "Run `treg catalog search" in out and "balance:" not in out
+
+
+def test_bare_treg_survives_an_unreachable_registry(monkeypatch, capsys):
+    _home_registry(monkeypatch, fail={"/auth/me": httpx.ConnectError("refused")})
+    _home({"token": "t"})
+    out = capsys.readouterr().out
+    assert "(ConnectError reaching the registry)" in out and "account:" not in out
+    assert "Run `treg config`" in out
+
+
+@pytest.mark.parametrize("me, shown, first_help", [
+    # a host that answers 200 with a page, not a registry: a wrong base URL, not a crash
+    (httpx.Response(200, text="<html>portal</html>"), "is not a treg answer", "Run `treg config`"),
+    # the right registry having a bad moment: retry, do not rewrite a correct base URL
+    (httpx.Response(503, json={"detail": "deploying"}), "(HTTP 503 from /auth/me)", "Run `treg` again"),
+])
+def test_bare_treg_tells_a_wrong_registry_from_a_failing_one(monkeypatch, capsys, me, shown, first_help):
+    _home_registry(monkeypatch, me=me)
+    _home({"token": "t"})
+    out = capsys.readouterr().out
+    assert shown in out and "account:" not in out
+    assert out.split("help[", 1)[1].split("\n")[1].strip().startswith(first_help)
+
+
+def test_bare_treg_leaves_out_only_the_line_that_failed(monkeypatch, capsys):
+    """A late read timing out, or a balance body of the wrong shape, drops its own line only."""
+    _home_registry(monkeypatch, me={"email": "a@example.com", "org_id": 7, "org": "acme", "role": "owner"},
+                   balance=httpx.Response(200, json=[1, 2]), fail={"/tools": httpx.ReadTimeout("slow")})
+    _home({"token": "t"})
+    out = capsys.readouterr().out
+    assert "account: a@example.com" in out and "team: acme (owner)" in out
+    assert "balance:" not in out and "own_tools" not in out and "registry: https://registry.example.test\n" in out
+
+
+def test_bare_treg_resolves_the_team_like_balance_does(monkeypatch, capsys):
+    """/orgs honors --org/TREG_ORG; a team claim in /auth/me must not override it, or `treg` and
+    `treg balance` would name different teams."""
+    seen = _home_registry(monkeypatch, me={"email": "a@example.com", "org_id": 1, "org": "claimed", "role": "owner"},
+                          orgs=[{"org_id": 1, "slug": "claimed", "role": "owner"},
+                                {"org_id": 7, "slug": "chosen", "role": "member"}])
+    _home({"token": "t", "active_org": "chosen"})
+    out = capsys.readouterr().out
+    assert "team: chosen (member)" in out and "/orgs/7/balance" in seen
+
+
+def test_bare_treg_with_teams_but_none_active_points_at_org_use(monkeypatch, capsys):
+    """A stale active team is not "no team": creating one would make a duplicate."""
+    _home_registry(monkeypatch, me={"email": "a@example.com"},
+                   orgs=[{"org_id": 3, "slug": "kept", "role": "member"}])
+    _home({"token": "t", "active_org": "left-long-ago"})
+    out = capsys.readouterr().out
+    assert "team: none" in out and "Run `treg org ls`" in out and "org create" not in out
+
+
+def test_bare_treg_json_and_dispatch(monkeypatch, capsys):
+    """`treg` and `treg --json` both reach the home view through `main`; JSON keeps micro-USD."""
+    _home_registry(monkeypatch, me={"email": "a@example.com", "org_id": 7, "org": "acme", "role": "owner"})
+    monkeypatch.setattr(cli, "_load_config", lambda: {"base_url": "https://registry.example.test",
+                                                      "token": "t"})
+    monkeypatch.setattr("treg.cli_analytics.track_command", lambda **kw: None)
+    cli.main(["--json"])
+    body = json.loads(capsys.readouterr().out)
+    assert body["team"] == "acme" and body["balance_micro"] == 1_000_000 and body["help"]
+    cli.main([])
+    assert capsys.readouterr().out.startswith("bin: ")
 
 
 def test_catalog_get_needs_an_id_and_404s_helpfully(monkeypatch, capsys):

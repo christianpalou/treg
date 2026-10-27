@@ -19,12 +19,21 @@
     {
       "exception": "sqlalchemy.exc.TimeoutError",
       "handler": "treg.api._pool_saturated"
+    },
+    {
+      "exception": "treg.infra.db.ReportBusy",
+      "handler": "treg.bootstrap_handlers._report_busy"
     }
   ],
   "middleware": [
     {
       "args": [],
       "class": "treg.mcp.NormalizeDirectoryMCPPath",
+      "kwargs": {}
+    },
+    {
+      "args": [],
+      "class": "treg.infra.org_traffic.RequestLogMiddleware",
       "kwargs": {}
     },
     {

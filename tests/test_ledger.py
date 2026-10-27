@@ -867,10 +867,11 @@ def test_cli_balance_renders_credit_holds_and_ledger(monkeypatch, capsys):
         def get(self, path, **kw): return _Resp()
 
     monkeypatch.setattr(cli, "_client", lambda cfg, **kw: _C())
-    monkeypatch.setattr(cli, "_active_org_id", lambda cfg, c: 1)
+    monkeypatch.setattr(cli, "_active_org", lambda cfg, c: {"org_id": 1, "slug": "acme"})
     cli.cmd_balance(cli.build_parser().parse_args(["balance"]), {})
     out = capsys.readouterr().out
     assert "$0.9874" in out                    # the balance, to the sub-cent
+    assert "team acme" in out                  # the team from the same /orgs read, not a second one
     assert "promotional" in out and "in flight" in out   # credit source + held-not-spent
     assert "$0.0120" in out                    # the hold, sub-cent precision preserved
     assert "settle" in out and "-$0.0006" in out and "tikhub.x.y" in out  # sign outside the $
@@ -936,7 +937,7 @@ async def test_concurrent_settles_lock_by_id_but_consume_by_business_priority(c,
             return await ledger.settle(db, call_id)
     assert await asyncio.gather(settle('ordered-one'), settle('ordered-two')) == [1000, 1000]
     assert len(statements) == 2
-    assert all('ORDER BY creditblock.id FOR UPDATE' in sql for sql in statements)
+    assert all('ORDER BY creditblock.org_id, creditblock.id FOR UPDATE' in sql for sql in statements)
     async with session_maker() as db:
         blocks = await ledger.blocks_of(db, org_id)
         assert {b.id: b.remaining_micro for b in blocks} == {'a-new': 1000, 'b-old': 0, 'z-promo': 0}

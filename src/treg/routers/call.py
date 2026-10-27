@@ -45,11 +45,11 @@ from ..domain.governance import publicdemo as publicdemo_policy
 from ..domain.governance import usage as usage_policy
 from ..domain.identity.access import Caller, require_member
 from ..infra.db import get_session
+from ..infra import org_concurrency, org_flow_control, org_traffic
 from ..models import Tool
 from .auth import _client_ip
 
 
-# The app alias preserves the moved handlers' decorator text byte-for-byte.
 app = APIRouter()
 router = app
 
@@ -63,6 +63,23 @@ class _HttpRequestBody:
 
     async def read(self) -> bytes:
         return await self._request.body()
+
+
+class _LeasedStreamingResponse(StreamingResponse):
+    """Retain the root slot through send/disconnect errors as well as body iteration."""
+
+    def __init__(self, response: StreamingResponse, slot, close) -> None:
+        super().__init__(response.body_iterator, status_code=response.status_code,
+                         background=response.background)
+        self.raw_headers = response.raw_headers
+        self._slot = slot
+        self._close = close
+
+    async def __call__(self, scope, receive, send) -> None:
+        try:
+            await super().__call__(scope, receive, send)
+        finally:
+            await self._slot.finish(self._close)
 
 
 def _http_upstream_response(upstream: UpstreamResponse) -> StreamingResponse:
@@ -136,7 +153,8 @@ async def _enforce_daily_cap(caller: Caller, db: AsyncSession) -> None:
 
 
 def _translate_call_failure(exc: CallFailure) -> HTTPException:
-    return HTTPException(status_code=exc.status_code, detail=exc.detail)
+    headers = {"Retry-After": str(exc.retry_after_s)} if exc.retry_after_s is not None else None
+    return HTTPException(status_code=exc.status_code, detail=exc.detail, headers=headers)
 
 
 def _parse_call_meta(request: Request, caller: Caller | None = None) -> CallMeta:
@@ -203,6 +221,7 @@ def _capture_exceptional_call(
         props["provider"] = urlsplit(target.upstream).hostname or ""
     org_id, email = getattr(request.state, "call_identity", (None, ""))
     team_slug = getattr(request.state, "call_team_slug", "")
+    request.state.call_failure_kind = props["failure_kind"]
     analytics.capture(
         email or "anonymous",
         "tool_called",
@@ -244,11 +263,6 @@ async def _stamp_call_exit(
             _capture_exceptional_call(
                 request, call_ref=call_ref, status_code=status_code, failure_kind=failure_kind)
         request.state.call_audited = True
-    # A failed call must not keep its idempotency label. The claim is taken before the upstream
-    # call, and a request that dies anywhere after that — a bad parameter, a deny rule, an empty
-    # balance, a saturated pool — would otherwise hold the label for the whole window and answer
-    # every retry with 409. Worse than the problem this feature exists to solve, and found by the
-    # test for it.
     await _release_idempotent_claim(request)
 
 
@@ -305,9 +319,24 @@ async def _relay_answer(request: Request, context, upstream: UpstreamResponse, r
             if kind == "review":
                 response.headers["X-Treg-Review"] = "requested"  # read by CLI <= 0.18
             _capture_hint(request, context, kind)
-    except Exception:
+    except Exception:  # noqa: BLE001 - a fault here can only lose the hint header
         pass  # A fault here can only lose the header; the answer is already built.
+    if routed := _routed_alternative(context, response.status_code):
+        response.headers["X-Treg-Routed-Tool"] = routed
     return response
+
+
+def _routed_alternative(context, status: int) -> str | None:
+    """The routed `treg.<capability>` tool for a successful direct call to one provider's endpoint
+    of that capability, so the surfaces can point an agent to the tool that picks the provider and
+    falls back. Never on a routed call itself."""
+    marketplace = context.marketplace
+    if marketplace is None or not 200 <= status < 300 or marketplace.endpoint_id.startswith("treg."):
+        return None
+    by_id = catalog_store.load().by_id
+    capability = (by_id.get(marketplace.endpoint_id) or {}).get("capability")
+    routed = f"treg.{capability}" if capability else None
+    return routed if routed in by_id else None
 
 
 async def run_call_surface(rest: str, request: Request, caller: Caller, *, prefix: str, finish,
@@ -319,6 +348,8 @@ async def run_call_surface(rest: str, request: Request, caller: Caller, *, prefi
     rest)` runs inside the same try, so a fault there is audited and released like any other.
     `headers`, when given, replaces the request's raw headers for the upstream call (`/table/` asks
     the provider for uncompressed bytes); `/call/` never passes it."""
+    org_traffic.identify(request.scope, caller.org_id, enter=True,
+                         api_key_id=caller.api_key.id if caller.api_key else None)
     # Identity for the refusal fallback in `_mark_treg_own_errors`: a raise anywhere below (unknown
     # tool, deny rule, daily cap) leaves this handler without an audit row, and the exception handler
     # is the one place every such refusal passes through — but it has no Caller of its own.
@@ -358,9 +389,27 @@ async def run_call_surface(rest: str, request: Request, caller: Caller, *, prefi
         raise _translate_call_failure(exc) from exc
     request.state.call_ref = context.call_ref
     request.state.call_context = context
+    slot = None
+    upstream = None
+    streaming = False
     try:
+        # Caller is trusted; every root HTTP/MCP call enters here, routing children do not.
+        snapshot = await org_flow_control.check(caller.org_id, context.call_ref)
+        slot = await org_concurrency.acquire(
+            caller.org_id, limit=snapshot.max_in_flight if snapshot else None,
+            version=snapshot.version if snapshot else 0,
+            rate_limit=snapshot.rate_limit if snapshot else None)
         upstream = await execute_call(context, request.app.state.http)
-        return await finish(request, context, upstream, rest)
+        if slot is not None:
+            upstream.close = org_concurrency.cleanup_once(upstream.close)
+        response = await finish(request, context, upstream, rest)
+        if slot is not None and isinstance(response, StreamingResponse):
+            response = _LeasedStreamingResponse(response, slot, upstream.close)
+            streaming = True  # The ASGI response now owns cleanup and slot release.
+        return response
+    except (org_concurrency.AdmissionRejected, org_flow_control.PauseRejected) as exc:
+        raise HTTPException(status_code=exc.status_code, detail=exc.detail,
+                            headers={"Retry-After": str(exc.retry_after_s)}) from exc
     except CallFailure as exc:
         raise _translate_call_failure(exc) from exc
     except PoolTimeoutError:
@@ -381,6 +430,12 @@ async def run_call_surface(rest: str, request: Request, caller: Caller, *, prefi
         request.state.idem_claim = context.idempotency
         request.state.call_audited = context.audited
         request.state.call_cost_micro = context.cost_micro
+        org_traffic.describe(request.scope, tool_name=context.tool_name,
+                             endpoint_id=context.endpoint_id, replay_of=context.replay_of,
+                             provider=context.provider, credential_tier=context.credential_tier,
+                             refused_by=context.refused_by)
+        if slot is not None and not streaming:
+            await slot.finish(upstream.close if upstream is not None else None)
 
 
 @app.api_route(
@@ -394,6 +449,8 @@ async def call_catalog_endpoint(
     caller: Caller = Depends(require_member),
 ):
     """Call one catalog endpoint through the same policy, billing, audit, and relay path as /call."""
+    org_traffic.identify(request.scope, caller.org_id,
+                         api_key_id=caller.api_key.id if caller.api_key else None)
     if not get_settings().claude_connector_enabled:
         raise HTTPException(status_code=404, detail="Claude catalog connector is not enabled")
     request.state.catalog_only = True

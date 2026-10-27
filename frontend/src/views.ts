@@ -43,7 +43,7 @@ export function loadScript(src: string): Promise<void> {
       const script = document.createElement('script')
       script.src = src
       script.onload = () => resolve()
-      // The Help view has empty fallbacks for missing data, as it did when the tag failed.
+      // The Help view has empty fallbacks for missing data.
       script.onerror = () => { scripts.delete(src); console.error('Failed to load', src); resolve() }
       document.head.appendChild(script)
     })
@@ -75,9 +75,6 @@ export const pages = {
 }
 type View = keyof typeof pages
 
-// The catalog-v2 experiment's control arm (state/catalogExperiment.js): goes when the experiment does.
-export const LegacyPlatformPage = lazy(() => import('./pages/LegacyPlatformPage.vue'))
-
 export const dialogs = {
   FishVoiceDialog: lazy(() => import('./dialogs/FishVoiceDialog.vue')),
   ConnectTokenDialog: lazy(() => import('./dialogs/ConnectTokenDialog.vue')),
@@ -97,6 +94,7 @@ export const dialogs = {
   RunToolDialog: lazy(() => import('./dialogs/RunToolDialog.vue')),
   CallDetailsDialog: lazy(() => import('./dialogs/CallDetailsDialog.vue')),
   TryEndpointDialog: lazy(() => import('./dialogs/TryEndpointDialog.vue')),
+  UserAvatarDialog: lazy(() => import('./dialogs/UserAvatarDialog.vue')),
 }
 
 function prefetch(component: Lazy) {
@@ -114,11 +112,15 @@ function initialView(): View {
   if (route.mkFromPath!(path)) return 'provider'
   if (route.routeFromPath!(path)) return 'detail'
   if (route.platformFromHash!()) return 'platform'
-  return route.viewFromHash!.call({}) || 'start'
+  const view = route.viewFromHash!.call({}) || 'start'
+  return (view as string) === 'usage' ? 'activity' : view  // `#usage` is the Activity page's tab
 }
 
+// A guess only: a name with no page (an old alias) preloads nothing rather than stopping the
+// app from mounting, which an exception here, before mount, would do.
 export function preloadInitialView() {
-  void prefetch(pages[initialView()])
+  const page = pages[initialView()]
+  if (page) void prefetch(page)
 }
 
 const idle = () => new Promise<void>(resolve => {

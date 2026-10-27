@@ -39,6 +39,7 @@ _BLAME_BY_KIND: dict[str, Blame] = {
     "trial_allowance_unavailable": "treg",
     "trial_allowance_reached": "caller",
     "platform_cap_unavailable": "treg",
+    "money_admission_timeout": "treg",
     "catalog_price_invalid": "treg",
     "platform_daily_cap_reached": "caller",
     "tag_budget_unavailable": "treg",
@@ -50,13 +51,22 @@ _BLAME_BY_KIND: dict[str, Blame] = {
     # treg's OWN vendor account for the provider is out (balance/quota) — a 503 the caller cannot
     # fix, answered before any hold exists, with the same-capability alternatives named.
     "provider_capacity": "treg",
+    # This deployment paused the provider (TREG_PAUSED_PROVIDERS): refused before any hold.
+    "provider_paused": "treg",
+    # Fair share: the provider on treg's key is fully used and this team already holds calls on it
+    # (domain/capacity/fair_share.py). Not charged; a routed job moves to its next provider.
+    "share_busy": "caller",
     # Routed endpoints (treg.<capability>): the caller's identity fits no provider, or the
     # ceiling they set is below the cheapest candidate, or every candidate failed.
     "route_no_candidate": "caller",
     "route_max_cost": "caller",
     "route_failed": "upstream",
     "route_caller_fault": "caller",
+    "route_not_found": "caller",       # the requested page or record does not exist at its source
     "injection_failed": "treg",
+    "platform_account_retired": "treg",
+    "platform_account_split": "treg",
+    "platform_account_unavailable": "treg",
     "ssrf_refused": "treg",
     "connect_failed": "upstream",
     "read_timeout": "upstream",
@@ -78,12 +88,14 @@ class CallFailure(Exception):
         *,
         status_code: int,
         detail: str | dict,
+        retry_after_s: int | None = None,
     ) -> None:
         super().__init__(str(detail))
         self.kind = kind
         self.blame = _BLAME_BY_KIND[kind]
         self.status_code = status_code
         self.detail = detail
+        self.retry_after_s = retry_after_s
 
 
 class IntakeFailed(CallFailure):
@@ -150,6 +162,8 @@ class OrgSnapshot:
     autotopup_amount_micro: int
     autotopup_monthly_cap_micro: int
     first_call_at: Any
+    autotopup_max_per_hour: int = 0
+    archive_opt_out_at: Any = None   # set = the team opted out of the archive (archive.md)
 
 
 @dataclass(frozen=True)
@@ -208,6 +222,8 @@ class CallerSnapshot:
                 autotopup_threshold_micro=org.autotopup_threshold_micro,
                 autotopup_amount_micro=org.autotopup_amount_micro,
                 autotopup_monthly_cap_micro=org.autotopup_monthly_cap_micro,
+                autotopup_max_per_hour=int(getattr(org, 'autotopup_max_per_hour', 0) or 0),
+                archive_opt_out_at=getattr(org, 'archive_opt_out_at', None),
                 first_call_at=org.first_call_at,
             ),
             api_key_id=key.id if key else None,
@@ -230,7 +246,7 @@ class CallInput:
     # The reviewed /catalog/call surface accepts only a catalog id — team tools never shadow it.
     catalog_only: bool = False
     # Set on every child call of a hub run: a child never resolves to a hub tool (no nested
-    # runs, no undisclosed second price; 8.1 review).
+    # runs, no undisclosed second price).
     child_of: str | None = None
 
 
@@ -258,6 +274,16 @@ class CallContext:
     # Set by a routed parent on each child: the child leaves its hold OPEN here instead of settling,
     # and the parent charges or releases every one at the end (route.py `_close_deferred`).
     deferred_settles: list | None = None
+    # Scalar snapshots for root request logs; never resolve a target just for telemetry.
+    tool_name: str | None = None
+    endpoint_id: str | None = None
+    replay_of: str | None = None
+    provider: str | None = None
+    credential_tier: str | None = None
+    refused_by: str | None = None
+    # A routed parent's outcome for its call event (route.py `_summarize`): identity, output,
+    # served_by, tried_count, hit, verdict, check_verdict. Never read by money or relay.
+    route_summary: dict | None = None
 
 
 @dataclass(frozen=True)

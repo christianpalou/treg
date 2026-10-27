@@ -37,6 +37,22 @@ def configure(store: ObjectStore | None) -> None:
     _uploaded, _inflight, _queued_hashes = OrderedDict(), {}, set()
 
 
+async def _still_stored(content_hash: str) -> bool:
+    if _store is None:
+        return False
+    try:
+        async with asyncio.timeout(get_settings().archive_r2_read_timeout_s):
+            return await _store.head(content_hash) is not None
+    except Exception:  # noqa: BLE001 - an unanswered HEAD is not proof; upload again
+        return False
+
+
+def forget(content_hash: str) -> None:
+    """Drop one hash from the upload cache: its object was deleted (application/archive_erasure),
+    so the next identical answer must upload again rather than point at bytes that are gone."""
+    _uploaded.pop(content_hash, None)
+
+
 def uses_r2() -> bool:
     s = get_settings()
     return s.archive_body_write != "db" or any(
@@ -143,10 +159,16 @@ async def prepare(body: bytes, content_hash: str, *, mode: str, observation: Sto
         return WritePlan("db")
     uploaded, inflight = _uploaded, _inflight
     if content_hash in uploaded:
-        uploaded.move_to_end(content_hash)
-        observation.props["archive_body_upload_status"] = "skipped_duplicate"
-        outcomes["skipped_duplicate"] += 1
-        return WritePlan(mode)
+        # The store is no longer append-only: an erasure (application/archive_erasure.py) can
+        # delete an object this process, or another, remembers as uploaded. One HEAD confirms
+        # the bytes are still there before a pointer is committed to them; a missing or
+        # unreachable object falls through to a fresh upload, never to a dangling pointer.
+        if await _still_stored(content_hash):
+            uploaded.move_to_end(content_hash)
+            observation.props["archive_body_upload_status"] = "skipped_duplicate"
+            outcomes["skipped_duplicate"] += 1
+            return WritePlan(mode)
+        uploaded.pop(content_hash, None)
 
     flight = inflight.get(content_hash)
     if flight is not None:
@@ -201,7 +223,7 @@ async def prepare(body: bytes, content_hash: str, *, mode: str, observation: Sto
                             if info != ObjectInfo(content_hash, len(body)):
                                 raise ObjectStoreError("hash_mismatch")
                         reason = None
-                    except Exception as exc:
+                    except Exception as exc:  # noqa: BLE001 - every upload failure is classified into the report
                         reason, error_type = failure_reason(exc), exception_name(exc)
                     finally:
                         observation.props["archive_body_upload_ms"] += (
@@ -379,6 +401,8 @@ async def read(pointer: BodyPointer, path: str, *, diagnostics: dict | None = No
         raise
     finally:
         report["total_ms"] = round((time.monotonic() - started) * 1000, 3)
+        if report["outcome"] in {"unavailable", "db_error"} and pointer.snapshot_id is not None:
+            report["snapshot_id"] = pointer.snapshot_id
         outcomes["read_" + path + "_" + report["outcome"]] += 1
         if diagnostics is not None:
             diagnostics.update(cache_body_source=report["source"],
@@ -387,8 +411,8 @@ async def read(pointer: BodyPointer, path: str, *, diagnostics: dict | None = No
                                cache_r2_attempts=report["r2_attempts"],
                                cache_r2_retry_reason=report["r2_retry_reason"],
                                cache_r2_retry_recovered=report["r2_retry_recovered"])
-        # Best-effort, bounded fields only. A completed fallback event records whether DB actually
-        # rescued the read; failure logs alone cannot provide this or a success denominator.
+        # Best-effort completion event; snapshot identity is limited to unresolved reads.
+        # A completed fallback records whether DB rescued the read, unlike a fallback log.
         analytics.capture("archive", "archive_body_read", report)
 
 
@@ -413,7 +437,7 @@ async def _read_object(pointer, path, report):
                 if report["r2_retry_recovered"]:
                     outcomes["read_retry_recovered_" + path] += 1
                 return body
-            except Exception as exc:
+            except Exception as exc:  # noqa: BLE001 - every read failure is classified, then retried or reported
                 reason, error_type = failure_reason(exc), exception_name(exc)
             if reason not in _RETRYABLE_FAILURES or attempt == _READ_ATTEMPTS:
                 break

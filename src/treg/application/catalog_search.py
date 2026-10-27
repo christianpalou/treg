@@ -127,9 +127,28 @@ async def lexical(query: str, cat: catalog_store.Catalog, limit: int, *, observe
     return Page(rows, total, tie_truncated, stats, hidden, steer)
 
 
-# --------------------------------------------------------------------------------------------
-# v2: the job-first answer, laid out for an agent
-# --------------------------------------------------------------------------------------------
+async def added_page(query: str, cat: catalog_store.Catalog, limit: int, opts: catalog_store.AddedOptions, *,
+                     caller: Caller, observed: Observed) -> Page:
+    """A recently-added page (catalog.md "`added`"), for every surface: a flat list of tools inside
+    the window, best match first when there are words, newest first with `sort=newest` or with no
+    words. No routed parent (a choice among tools, not a tool added on a day), no grouping, no
+    judge and no experiment record: the options ask for a date list, which is deterministic.
+    Listed hub tools take part on the day treg approved them."""
+    keep = catalog_store.added_keep(opts)
+    async with session_maker() as db:
+        hub_rows, hub_stats = await hub_app.search_listed(
+            db, query, cat, org_slug=caller.hub_slug, email=caller.hub_email, everything=not query.strip())
+    hub_rows = [(ep, score) for ep, score in hub_rows if keep(ep)]
+    if opts.newest or not query.strip():
+        rows, total = catalog_store.added_rows(query, cat, opts)
+        rows = catalog_store.newest_first(rows + hub_rows)[:limit]
+        stats = await observed([ep["id"] for ep, _ in rows if ep.get("kind") != "hub"])
+    else:
+        rows, total, _ = catalog_store.rank_band(query, cat, limit, keep=keep)
+        stats = await observed([ep["id"] for ep, _ in rows])
+        rows = catalog_store.merge_by_score(catalog_store.rerank(rows, stats, cat), hub_rows)[:limit]
+    return Page(rows, total + len(hub_rows), False, {**stats, **hub_stats}, {}, False)
+
 
 def _leads(row: dict, high: float) -> bool:
     """A member the judge rated on its own at or over high: the vendor whose own words matched
@@ -150,11 +169,13 @@ def _groups(found: find.Found, cat: catalog_store.Catalog, hub: Rows, steer: boo
     if task:
         for g in out:
             g.rows.sort(key=lambda r: not _leads(r, high))     # stable: both classes keep their order
+            if found.providers:   # a provider the query named leads its job
+                g.rows.sort(key=lambda r: r["ep"]["provider"] not in found.providers)
         for ep, _ in hub:
             g = by_job.get(ep.get("capability") or "")
             if g is not None:
                 g.rows.append({"ep": ep, "p": None, "fit_from": None})
-    if task and steer:
+    if task and steer and not found.providers:   # a named provider is the choice; no "let treg choose"
         for g in out:
             parent = catalog_store.routed_parent(cat, g.capability)
             if parent is not None:
@@ -232,7 +253,8 @@ async def _v2(query: str, cat: catalog_store.Catalog, limit: int, *, page: Page,
     `serve_it=False` judges and records only (the lexical holdout): no rows are laid out."""
     r = await find.recall_with_meaning(query, cat, provider_display)
     found = await find.judge_and_decide(query, r.cands, cat, provider_display,
-                                        timeout_s=float(get_settings().typesafe_timeout_s), not_task=find.KEYWORD)
+                                        timeout_s=float(get_settings().typesafe_timeout_s), not_task=find.KEYWORD,
+                                        focus=r.focus)
     if serve_it:
         seen: dict[str, dict] = {}
 
@@ -255,7 +277,8 @@ async def _v2(query: str, cat: catalog_store.Catalog, limit: int, *, page: Page,
 
 
 async def search(query: str, limit: int, *, cat: catalog_store.Catalog, source: str, caller: Caller,
-                 observed: Observed, identify: Identify, provider_display=lambda s: s) -> Page:
+                 observed: Observed, identify: Identify, provider_display=lambda s: s,
+                 client_ip: str | None = None) -> Page:
     """The page this caller sees, recorded. The lexical page first; while the experiment is on, the
     judge reads a wider recall (v1) or the jobs (v2) and the arm decides what is shown - whatever
     it does, the result is a page. The miss log: in v1 modes it is judged by the LEXICAL page (it
@@ -280,8 +303,11 @@ async def search(query: str, limit: int, *, cat: catalog_store.Catalog, source: 
 
     # The cap is keyed by WHO the caller is; a token the search could not resolve (the tool reads
     # the catalog without validating a per-team token, so any string reaches here) shares one
-    # bucket, or a caller rotating made-up tokens would have a fresh cap per search.
-    if mode == "v2" and not await _judge_cap(identity or UNRESOLVED):
+    # bucket, or a caller rotating made-up tokens would have a fresh cap per search. A surface that
+    # knows the caller's address (`client_ip`, the open HTTP route) keys the unresolved by it
+    # instead, so one script cannot spend every signed-out caller's judge.
+    unresolved = f"ip:{client_ip}" if client_ip else UNRESOLVED
+    if mode == "v2" and not await _judge_cap(identity or unresolved):
         # past the cap no judge runs for this caller this hour, whichever arm: the lexical page,
         # recorded as such (a search is not metered; this is the bound on what one can spend)
         page.arm = arm
@@ -318,7 +344,7 @@ async def search(query: str, limit: int, *, cat: catalog_store.Catalog, source: 
     try:
         fields = await _v2(query, cat, limit, page=page, observed=observed, provider_display=provider_display,
                            hub=hub[0], serve_it=serve_it)
-    except Exception:  # noqa: BLE001 - a search degrades to the shipped ranker, never fails
+    except Exception:
         log.warning("v2 search failed; serving the lexical page", exc_info=True)
         if serve_it:
             page.verdict, page.reason = find.KEYWORD, "error"       # a holdout's page carries no verdict

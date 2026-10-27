@@ -13,43 +13,38 @@ from fastapi.responses import HTMLResponse, JSONResponse, PlainTextResponse, Red
 from pydantic import BaseModel
 from sqlalchemy.ext.asyncio import AsyncSession
 
-from .. import crypto
+from .. import client_ip, crypto
 from ..application import auth as auth_use_cases
 from ..application import signup
+from ..application import images
 from ..application.auth import (
-    CLI_APPROVE_MAX_TRIES,
-    EMAIL_CODE_TTL,
-    HANDSHAKE_TTL,
-    MAX_OTP_ATTEMPTS,
-    OTP_NS,
-    OTP_START_MAX_PER_EMAIL,
-    OTP_START_MAX_PER_IP,
-    OTP_START_NS,
-    OTP_START_WINDOW_S,
+    CLI_APPROVE_MAX_TRIES as CLI_APPROVE_MAX_TRIES,
+    MAX_OTP_ATTEMPTS as MAX_OTP_ATTEMPTS,
+    OTP_START_MAX_PER_EMAIL as OTP_START_MAX_PER_EMAIL,
+    OTP_START_MAX_PER_IP as OTP_START_MAX_PER_IP,
 )
-from ..config import PUBLIC_HOST_ALIASES, get_settings
+from ..config import get_settings
 from ..domain.identity import mcp_oauth
 from ..domain.identity import session as sess
 from ..domain.identity.access import require_identity
-from ..domain.identity.mcp_oauth import REFRESH_TTL_S
 from ..models import User
 from .auth_helpers import _is_https, _remember_oauth_return, _same_origin, require_managed_cli
 from .web import _esc_html
 
-# The app alias preserves the moved handlers' original @app.post decorator text byte-for-byte.
 app = APIRouter()
 email_router = app
 
 
-# ---- human login via email one-time code (the third identity door) ------------------------
-# OTP code + its brute-force counter, and the /auth/email/start throttle, live in the DB (treg.ratestore
-# over the Ephemeral table) — NOT per-process dicts — so a restart can't reset them and they stay correct
-# across instances (backlog #3). The 'otp' namespace holds {code_hash, attempts} keyed by email; the
-# 'otp_start' namespace holds the per-email + per-IP sliding windows (email-bomb + brute-force guard).
+# Human login via email one-time code. OTP code + its brute-force counter, and the
+# /auth/email/start throttle, live in the DB (treg.ratestore over the Ephemeral table) - NOT
+# per-process dicts - so a restart can't reset them and they stay correct across instances. The
+# 'otp' namespace holds {code_hash, attempts} keyed by email; the 'otp_start' namespace holds the
+# per-email + per-IP sliding windows (email-bomb + brute-force guard).
 
 
 class EmailStartIn(BaseModel):
     email: str
+    captcha_token: str = ""  # Turnstile widget token; only read when the deployment enables it
 
 
 class EmailVerifyIn(BaseModel):
@@ -64,14 +59,40 @@ _EMAIL_HTTP_ERRORS = {
     # what is on it.
     "blocked_domain": (403, "this address cannot be used to sign in"),
     "rate_limited": (429, "too many code requests — please wait a few minutes"),
+    "captcha_failed": (400, "We couldn't verify this browser. Refresh the page and try again, "
+                            "or continue with Google or GitHub."),
+    "captcha_blocked": (400, "Your browser blocked the security check from challenges.cloudflare.com. "
+                             "Allow it and try again, or continue with Google or GitHub."),
+    "captcha_pending": (400, "Tick the security check below the form, then send the code again."),
     "invalid_code": (401, "invalid code"),
     "suspended": (403, "account suspended"),
 }
 
 
-def _email_http_error(exc: auth_use_cases.EmailAuthError) -> HTTPException:
+# Marks a refusal for want of a browser check, so a client (the CLI's `login --email`) can react
+# to it without matching the English detail.
+CAPTCHA_HEADER = "X-Treg-Captcha"
+
+
+# A terminal cannot pass a browser check. Released CLIs print `detail` and stop, so tell them the
+# command that works; newer ones read the header and continue in the browser on their own.
+_CLI_CAPTCHA_DETAIL = ("Email codes need a browser check on this server. "
+                       "Run `treg login` without --email to sign in through the browser.")
+
+
+def _email_http_error(exc: auth_use_cases.EmailAuthError, client: str = "browser") -> HTTPException:
     status_code, detail = _EMAIL_HTTP_ERRORS[exc.kind]
-    return HTTPException(status_code=status_code, detail=detail)
+    headers = None
+    if exc.kind.startswith("captcha_"):
+        headers = {CAPTCHA_HEADER: "required"}
+        if client == "cli":
+            detail = _CLI_CAPTCHA_DETAIL
+    return HTTPException(status_code=status_code, detail=detail, headers=headers)
+
+
+def _client(request: Request) -> str:
+    """`cli` for the terminal's email door (`treg login --email`), else `browser`; for the logs."""
+    return "cli" if request.headers.get("X-Treg-Key-Protocol") == "1" else "browser"
 
 
 @app.post("/auth/email/start")
@@ -84,9 +105,10 @@ async def auth_email_start(
     brute-force counter at will. All this state is in the DB (survives restart, correct multi-instance)."""
     require_managed_cli(request)
     try:
-        return await auth_use_cases.start_email_login(body.email, _client_ip(request))
+        return await auth_use_cases.start_email_login(
+            body.email, _client_ip(request), captcha_token=body.captcha_token, client=_client(request))
     except auth_use_cases.EmailAuthError as exc:
-        raise _email_http_error(exc) from exc
+        raise _email_http_error(exc, _client(request)) from exc
 
 
 @app.post("/auth/email/verify")
@@ -99,9 +121,11 @@ async def auth_email_verify(
     require_managed_cli(request)
     try:
         verified = await auth_use_cases.verify_email_login(body.email, body.code,
-            entry_surface=request.cookies.get("treg_entry_surface", ""))
+            entry_surface=request.cookies.get("treg_entry_surface", ""), client=_client(request))
     except auth_use_cases.EmailAuthError as exc:
         raise _email_http_error(exc) from exc
+    # Only a proven email: stashing at /start would let anyone tie their click to any address.
+    await signup.stash_ad_click(verified.email, request.cookies.get("treg_ad", ""))
     resp = JSONResponse({"token": verified.token, "email": verified.email})
     resp.headers["Cache-Control"] = "no-store"
     resp.set_cookie(sess.COOKIE, verified.session_cookie, httponly=True,
@@ -123,20 +147,11 @@ async def _find_or_create_user(db: AsyncSession, email: str) -> User:
 
 
 def _client_ip(request: Request) -> str:
-    """Best-effort client IP — first hop of X-Forwarded-For behind the reverse proxy (Render), else the socket peer."""
-    xff = request.headers.get("x-forwarded-for")
-    if xff:
-        return xff.split(",")[0].strip()
-    return request.client.host if request.client else "?"
+    """The client address every per-IP limiter keys on; the rules live in client_ip.py."""
+    return client_ip.of(request)
 
 
-# The pairing state machine belongs to the application use case. These aliases keep the staged
-# api.py compatibility exports and the social-login handshake on the exact same mutable objects.
-_cli_states = auth_use_cases._cli_states
-_cli_results = auth_use_cases._cli_results
-_cli_pending = auth_use_cases._cli_pending
 _PAIR_ALPHABET = auth_use_cases._PAIR_ALPHABET
-_prune_handshakes = auth_use_cases._prune_handshakes
 _norm_pair_code = auth_use_cases._norm_pair_code
 _orgs_brief = auth_use_cases._orgs_brief
 
@@ -164,7 +179,7 @@ _AUTH_HEAD = (
     ".pbtn{display:inline-block;background:linear-gradient(180deg,#fdfcf7,#eae7de);color:#1c1b19;border:0;"
     "border-radius:999px;padding:12px 24px;font:500 14px var(--mono);cursor:pointer;"
     "box-shadow:rgba(178,168,165,.2) -1.3px -1.3px 2.5px 0, rgba(0,0,0,.4) 2px 2px 1.5px 0}"
-    "</style></head>"
+    '</style><script src="/adtrack.js" defer></script></head>'
 )
 
 
@@ -176,12 +191,11 @@ def _login_callback_base(request: Request) -> str:
     keep building the OLD host's callback. Any recognized alias Host therefore wins — in BOTH
     directions, so a login minted on treg.to also survives a TREG_PUBLIC_URL rollback."""
     host = request.headers.get("host", "").split(":")[0].rstrip(".").lower()
-    if host in PUBLIC_HOST_ALIASES:
+    if host in get_settings().public_host_aliases:
         return f"https://{host}"
     return get_settings().public_url.rstrip("/")
 
 
-# The app alias preserves the moved handlers' original @app.get decorators byte-for-byte.
 app = APIRouter()
 social_router = app
 
@@ -211,11 +225,12 @@ def _social_http_error(exc: auth_use_cases.SocialLoginError) -> HTTPException:
     return HTTPException(status_code=status_code, detail=detail)
 
 
-# ---- human login via GitHub OAuth (dashboard sessions) ------------------------------------
 @app.get("/auth/github")
 async def auth_github(request: Request, cli: str = "", return_to: str = ""):
     try:
-        started = auth_use_cases.start_github_login(cli, lambda: _login_callback_base(request))
+        started = await auth_use_cases.start_github_login(cli, lambda: _login_callback_base(request))
+    except auth_use_cases.CliPairingError as exc:
+        raise _cli_http_error(exc) from exc
     except auth_use_cases.SocialLoginError as exc:
         raise _social_http_error(exc) from exc
     resp = RedirectResponse(started.url, status_code=302)
@@ -245,7 +260,7 @@ def _arena_return_target(target: str) -> str:
     except ValueError:
         return ""
     if url.scheme or url.netloc or url.fragment or url.path not in {
-        "/enrich-arena", "/enrich-arena/leaderboard", "/enrich-arena/people-search-bench",
+        "/enrich-arena", "/enrich-arena/leaderboard", "/enrich-arena/people-search-bench", "/web-arena",
     }:
         return ""
     params = parse_qsl(url.query, keep_blank_values=True)
@@ -303,8 +318,11 @@ async def auth_github_callback(
             lambda: _login_callback_base(request),
             entry_surface=request.cookies.get("treg_entry_surface", ""),
         )
+    except auth_use_cases.CliPairingError:
+        return _social_login_failure(auth_use_cases.SocialLoginError("callback_failed"))
     except auth_use_cases.SocialLoginError as exc:
         return _social_login_failure(exc)
+    await signup.stash_ad_click(proof.user.email, request.cookies.get("treg_ad", ""))
     return _finish_oauth_login(request, proof.user, proof.cli_state)
 
 
@@ -312,7 +330,9 @@ async def auth_github_callback(
 async def auth_google(request: Request, cli: str = "", return_to: str = ""):
     """Human login via Google OAuth — a parallel door to GitHub, same session/CLI-handshake plumbing."""
     try:
-        started = auth_use_cases.start_google_login(cli, lambda: _login_callback_base(request))
+        started = await auth_use_cases.start_google_login(cli, lambda: _login_callback_base(request))
+    except auth_use_cases.CliPairingError as exc:
+        raise _cli_http_error(exc) from exc
     except auth_use_cases.SocialLoginError as exc:
         raise _social_http_error(exc) from exc
     resp = RedirectResponse(started.url, status_code=302)
@@ -333,24 +353,30 @@ async def auth_google_callback(
             lambda: _login_callback_base(request),
             entry_surface=request.cookies.get("treg_entry_surface", ""),
         )
+    except auth_use_cases.CliPairingError:
+        return _social_login_failure(auth_use_cases.SocialLoginError("callback_failed"))
     except auth_use_cases.SocialLoginError as exc:
         return _social_login_failure(exc)
+    await signup.stash_ad_click(proof.user.email, request.cookies.get("treg_ad", ""))
     return _finish_oauth_login(request, proof.user, proof.cli_state)
 
 
-# The app alias preserves the moved handlers' original @app decorators byte-for-byte.
 app = APIRouter()
 cli_router = app
 
 
 @app.post("/auth/cli/start")
-async def auth_cli_start() -> dict:
+async def auth_cli_start(response: Response) -> dict:
     """`treg login` calls this FIRST. The SERVER mints both the login_id and a short pairing code and
     remembers them (pending approval). The code is shown only in that terminal; the browser must echo it
     back at approve time, where it's validated server-side, before any token is issued. So a login the
     user didn't start (a phished /login?cli=<id> link) can't be completed, and the poll endpoint carries
     no code to brute-force. Unauthenticated — on its own it grants nothing."""
-    return await auth_use_cases.start_cli_login()
+    response.headers["Cache-Control"] = "no-store"
+    try:
+        return await auth_use_cases.start_cli_login()
+    except auth_use_cases.CliPairingError as exc:
+        raise _cli_http_error(exc) from exc
 
 
 @app.get("/auth/cli/poll")
@@ -358,9 +384,13 @@ async def auth_cli_poll(response: Response, login_id: str = "") -> dict:
     """The CLI polls this after opening the browser; returns the identity token once, then forgets it.
     A token only lands here after auth_cli_approve validated the terminal pairing code, so a login the
     user didn't approve never yields one — there is nothing here to brute-force (no code parameter)."""
-    result = await auth_use_cases.poll_cli_login(login_id)
     response.headers["Cache-Control"] = "no-store"
-    return result
+    if not _LOGIN_ID_RE.fullmatch(login_id):
+        return {"status": "pending"}
+    try:
+        return await auth_use_cases.poll_cli_login(login_id)
+    except auth_use_cases.CliPairingError as exc:
+        raise _cli_http_error(exc) from exc
 
 
 # `treg login` mints the login_id with token_urlsafe(18) (24 chars); anything outside this shape is
@@ -387,12 +417,14 @@ _CLI_HTTP_ERRORS = {
     "too_many_wrong_codes": (400, "too many wrong codes — run `treg login` again"),
     "wrong_code": (400, "that code doesn't match the one in your terminal"),
     "not_member": (403, "not a member of that team"),
+    "sign_in_through_sso": (403, "sign in through this team's SSO"),
+    "unavailable": (503, "login storage unavailable — please try again"),
 }
 
 
 def _cli_http_error(exc: auth_use_cases.CliPairingError) -> HTTPException:
     status_code, detail = _CLI_HTTP_ERRORS[exc.kind]
-    return HTTPException(status_code=status_code, detail=detail)
+    return HTTPException(status_code=status_code, detail=detail, headers={"Cache-Control": "no-store"})
 
 
 @app.post("/auth/cli/approve")
@@ -421,12 +453,13 @@ async def auth_cli_approve(
 
 
 @app.get("/login", include_in_schema=False)
-async def login_page(cli: str = "", treg_session: str = Cookie(default="")):
+async def login_page(request: Request, cli: str = "", treg_session: str = Cookie(default="")):
     """The universal sign-in page `treg login` opens: reuses an existing dashboard session with one
     click ("Continue as …"), else offers every configured door — GitHub, Google, email one-time code.
     The email door is always present, so login works even with no OAuth app configured."""
     if not cli:
-        return RedirectResponse("/app", status_code=302)  # a bare visit belongs on the dashboard
+        return RedirectResponse("/app" + ("?" + request.url.query if request.url.query else ""),
+                                status_code=302)  # preserve incoming attribution for the SPA
     if not _LOGIN_ID_RE.fullmatch(cli):
         return _auth_page("Login failed", "Bad login link. Run <code>treg login</code> again.", ok=False, status=400)
     s = get_settings()
@@ -439,8 +472,6 @@ async def login_page(cli: str = "", treg_session: str = Cookie(default="")):
 def _login_page_html(login_id: str, *, session_email: str | None, github: bool, google: bool) -> str:
     """Server-rendered /login card. login_id is whitelist-validated by the caller; the session email
     is HTML-escaped (it's the only other interpolated value)."""
-    from html import escape
-
     # A pairing-code block sits above everything: whichever door the user takes, approve() won't complete
     # the CLI handshake until the code shown in their own terminal is echoed back (phishing guard — a
     # login they didn't start has no matching code). A `treg login` link carries the code in the URL
@@ -467,7 +498,7 @@ def _login_page_html(login_id: str, *, session_email: str | None, github: bool, 
         doors.append(f'<a class="btn" href="/auth/google?cli={login_id}">Sign in with Google</a>')
     doors.append(
         '<div id="email-door">'
-        '<div id="email-row"><input id="em" type="email" placeholder="you@company.com" autocomplete="email">'
+        '<div id="email-row"><input id="em" type="email" data-captcha="email_start" placeholder="you@company.com" autocomplete="email">'
         '<button class="btn" onclick="sendCode()">Email me a code</button></div>'
         '<div id="code-row" style="display:none"><input id="code" inputmode="numeric" placeholder="6-digit code">'
         '<button class="btn primary" onclick="verifyCode()">Verify</button></div>'
@@ -482,6 +513,7 @@ def _login_page_html(login_id: str, *, session_email: str | None, github: bool, 
         f'<p>to connect the <b>treg</b> CLI to your account</p>'
         f'<div class="stack">{"".join(parts)}</div><div class="err" id="err"></div>'
         f"</div></div>"
+        f'<script src="/captcha.js" defer></script>'
         f"<script>const HAS_SESSION={has_session};{_LOGIN_JS.replace('__LOGIN_ID__', login_id)}</script></body></html>"
     )
 
@@ -582,10 +614,12 @@ async function loadOrgs(){const box=document.getElementById('orgpick');if(!box)r
   box.appendChild(b)});
  if(orgs.length===1){box.firstChild.classList.add('primary')}}
 async function sendCode(){err('');const em=document.getElementById('em').value.trim();if(!em)return err('enter your email');
- try{const d=await post('/auth/email/start',{email:em});
+ const b=document.querySelector('#email-row button');if(b.disabled)return;b.disabled=true;
+ try{const t=window.tregCaptcha?await window.tregCaptcha.token('email_start'):'';  // /captcha.js
+  const d=await post('/auth/email/start',{email:em,captcha_token:t});
   document.getElementById('code-row').style.display='';
   document.getElementById('hint').textContent=d.dev_code?('dev code: '+d.dev_code):('code sent to '+d.email);
- }catch(e){err(e.message)}}
+ }catch(e){err(e.message)}finally{b.disabled=false}}
 async function verifyCode(){err('');const em=document.getElementById('em').value.trim(),co=document.getElementById('code').value.trim();
  if(!co)return err('enter the code');
  try{await post('/auth/email/verify',{email:em,code:co});
@@ -597,7 +631,6 @@ async function verifyCode(){err('');const em=document.getElementById('em').value
 if(HAS_SESSION)loadOrgs();
 """
 
-# The app alias preserves the moved handlers' original @app decorators byte-for-byte.
 app = APIRouter()
 session_router = app
 
@@ -625,7 +658,8 @@ async def auth_me(
     except auth_use_cases.IdentityLookupError as exc:
         raise HTTPException(status_code=401, detail="no session") from exc
     out = {"email": identity.email, "is_superadmin": identity.is_superadmin, "onboarded": identity.onboarded,
-           "github": identity.github}
+           "github": identity.github, "avatar_url": images.public_url(identity.avatar_key),
+           "uploads": images.enabled()}
     if (ich := _intercom_user_hash(identity.email)):
         out["intercom_user_hash"] = ich
     if identity.org_id is not None:
@@ -644,7 +678,6 @@ async def auth_logout(request: Request) -> JSONResponse:
     return resp
 
 
-# The app alias preserves the moved handlers' original @app decorators byte-for-byte.
 app = APIRouter()
 invite_router = app
 
@@ -672,7 +705,6 @@ async def auth_invite_signin(
     email through a real door (OTP / GitHub / Google) and the invite auto-appears via /invites/mine.
     An invalid/expired secret of either kind just lands on the site."""
     from urllib.parse import quote
-    base = get_settings().public_url.rstrip("/")
     try:
         landing = await auth_use_cases.invite_signin_landing(t, code, treg_session)
     except auth_use_cases.InviteSigninError as exc:
@@ -736,7 +768,6 @@ async def auth_invite_signin_confirm(request: Request):
     return resp
 
 
-# The app alias preserves the moved handlers' original @app decorators byte-for-byte.
 app = APIRouter()
 oauth_server_router = app
 
@@ -958,9 +989,7 @@ async def oauth_authorize(
         return _oauth_server_failure(exc, redirect_uri, state)
     if view is None:
         # Sign in first, then come back to THIS request. Parked in a cookie rather than a `?next=`
-        # query the sign-in page would have to understand — the first version invented that
-        # convention and nothing implemented it, so the user signed in and landed on the dashboard
-        # with the authorization silently dropped.
+        # query the sign-in page would have to understand.
         # The query is only a UI cue. The validated request stays in the HttpOnly return cookie.
         resp = RedirectResponse("/?signin=oauth", status_code=302)
         _remember_oauth_return(resp, request)
@@ -1078,17 +1107,21 @@ async def oauth_token(
 
 @app.get("/.well-known/oauth-protected-resource", include_in_schema=False)
 @app.get("/.well-known/oauth-protected-resource/mcp", include_in_schema=False)
+@app.get("/.well-known/oauth-protected-resource/mcp/", include_in_schema=False)
 async def oauth_protected_resource():
     """Tells an MCP client which authorization server guards /mcp/ and what it may ask for.
 
-    Two paths for one document: the spec has clients look it up either at the host root or under the
-    resource's own path, and which one a given client tries is not something we get to choose.
+    Several paths for one document: the spec has clients look it up either at the host root or under
+    the resource's own path, and which one a given client tries is not something we get to choose.
+    The resource is `/mcp/`, so RFC 9728's path insertion yields the trailing-slash form; it is
+    served directly because some clients do not follow a redirect during discovery.
     """
     return JSONResponse(mcp_oauth.protected_resource_metadata(),
                         headers={"Cache-Control": "public, max-age=3600"})
 
 
 @app.get("/.well-known/oauth-protected-resource/mcp/v2", include_in_schema=False)
+@app.get("/.well-known/oauth-protected-resource/mcp/v2/", include_in_schema=False)
 async def oauth_protected_resource_v2():
     """Protected-resource metadata for the catalog-only connector."""
     if not get_settings().claude_connector_enabled:
@@ -1121,7 +1154,6 @@ async def openai_apps_challenge():
     return PlainTextResponse(token, headers={"Cache-Control": "no-store"})
 
 
-# The app alias preserves the moved handlers' original @app decorators byte-for-byte.
 app = APIRouter()
 grants_router = app
 
@@ -1164,7 +1196,6 @@ async def oauth_grant_set_team(family_id: str, body: GrantTeamIn,
         raise HTTPException(status_code=404, detail=exc.detail) from exc
 
 
-# The app alias preserves the moved handlers' original @app decorators byte-for-byte.
 app = APIRouter()
 token_router = app
 
@@ -1172,9 +1203,11 @@ token_router = app
 @app.get("/auth/cli-token")
 async def auth_cli_token(
     response: Response,
+    request: Request,
     user: User = Depends(require_identity),
     x_treg_org: str = Header(default=""),
     x_treg_token: str = Header(default=""),
+    treg_session: str = Cookie(default=""),
 ) -> dict:
     """Mint a fresh CLI/bearer token for the authenticated caller (session cookie OR token). Identity
     tokens are signed (`sess.make_identity`); minting the current generation invalidates nothing — it lets
@@ -1193,12 +1226,14 @@ async def auth_cli_token(
     if (claims or {}).get("scope") == sess.BOOTSTRAP_SCOPE:
         raise HTTPException(status_code=403, detail=(
             "complete team selection in the browser — a bootstrap token cannot mint a Default key"))
-    result = await auth_use_cases.issue_cli_token(
-        user_id=user.id,
-        email=user.email,
-        token_version=user.token_version,
-        org_ref=x_treg_org,
-    )
+    try:
+        result = await auth_use_cases.issue_cli_token(
+            user_id=user.id, email=user.email, token_version=user.token_version,
+            org_ref=x_treg_org,
+            sso_org_id=getattr(request.state, "sso_org_id", None),
+        )
+    except auth_use_cases.IdentityLookupError as exc:
+        raise HTTPException(403, str(exc)) from exc
     response.headers["Cache-Control"] = "no-store"
     return result
 
@@ -1215,7 +1250,8 @@ async def auth_revoke_tokens(
     a fresh session cookie + token for the caller, so the device that pressed the button stays signed in
     while every other device is signed out. (Org membership tokens from accept-invite are a separate token
     type and are unaffected — those are revoked by removing the membership.)"""
-    revoked = await auth_use_cases.revoke_identity_tokens(user.id)
+    revoked = await auth_use_cases.revoke_identity_tokens(
+        user.id, sso_org_id=getattr(request.state, "sso_org_id", None))
     resp = JSONResponse({"token": revoked.token, "email": revoked.email, "revoked": True})
     resp.headers["Cache-Control"] = "no-store"
     resp.set_cookie(sess.COOKIE, revoked.session_cookie, httponly=True,

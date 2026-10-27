@@ -27,18 +27,45 @@ contracts:
       linkedin_url: "linkedin_url(linkedin_handle)"
       linkedin_handle: "linkedin_handle(linkedin_url)"
     filters: {}
+    # `analytics` says where an output field lands in a call event: `key` (HMAC'd identifier),
+    # `value` (non-sensitive, as is) or `skip` (the default). docs/context/architecture/call-events.md
     output:
-      email: {type: str, required: true}
-      confidence: {type: float, note: "0..1 — provider scales mapped; the original rides in raw"}
-      first_name: {type: str}
-      last_name: {type: str}
-      verified: {type: bool, note: "the provider says it checked the mailbox"}
+      email: {type: str, required: true, analytics: key}
+      confidence: {type: float, note: "0..1 — provider scales mapped; the original rides in raw", analytics: value}
+      first_name: {type: str, analytics: skip}
+      last_name: {type: str, analytics: skip}
+      verified: {type: bool, note: "the provider says it checked the mailbox", analytics: value}
     miss: "email == null"
     idempotent: true            # a lookup — error-fallback to the next provider is safe
+    one_subject: true           # every variant names one person: cost per hit ranks first
+    # The provider's own claim, stored per call; a finder with no `verified` output stores none.
+    verdict: {from: verified, words: [verified, unverified], map: {true: verified, false: unverified}}
     # Attached as `_treg.advice` when a hit's `verified` is not true. A find is a guess the provider
     # scored, not a delivery check: 2026-09-06 one team sent to catch-all (`accept_all`) and
     # pattern-guessed hits without verifying and bounced on most of them.
-    advice_unverified: "This address was found, not confirmed deliverable (verified != true). Run treg.people.email.verify on it before outreach — a fraction of a cent, and it catches catch-all domains and dead mailboxes."
+    advice_unverified: "This address was found, not confirmed deliverable (verified != true). Send X-Treg-Route-Verify: true and treg checks it with treg.people.email.verify in the same call, or run that check yourself before outreach — a fraction of a cent, and it catches catch-all domains and dead mailboxes."
+    # `X-Treg-Route-Verify`: checks every hit, a finder's own `verified` included; BounceBan first here only.
+    check: {endpoint: treg.people.email.verify, field: email, prefer: [bounceban]}
+
+  people.email.find.personal:
+    summary: "Find someone's personal email from their LinkedIn URL or work email — treg picks the provider (own keys first, then cheapest per hit) and names the one that served"
+    identity:
+      - {linkedin_url: url}
+      - {linkedin_handle: str}
+      - {email: str}
+    derive:
+      linkedin_url: "linkedin_url(linkedin_handle)"
+      linkedin_handle: "linkedin_handle(linkedin_url)"
+    filters: {}
+    output:
+      email: {type: str, required: true, note: "a personal mailbox (gmail, outlook, …), not the work address", analytics: key}
+      verified: {type: bool, note: "the provider says it checked the mailbox", analytics: value}
+    miss: "email == null"
+    idempotent: true
+    one_subject: true           # every variant names one person: cost per hit ranks first
+    # A personal find is a guess tied to a profile: one finder's hits have belonged to someone else.
+    advice_unverified: "A personal email is found, not confirmed to belong to this person or to accept mail. Send X-Treg-Route-Verify: true and treg checks it with treg.people.email.verify in the same call, or run that check yourself before outreach."
+    check: {endpoint: treg.people.email.verify, field: email, prefer: [bounceban]}
 
   # ---- batch 1: social lookups (2026-08-28) ---------------------------------------------------
   instagram.user.profile:
@@ -122,13 +149,34 @@ contracts:
       linkedin_handle: "linkedin_handle(linkedin_url)"
     filters: {}
     output:
-      phone: {type: str, required: true, note: "as the provider formats it; E.164 when it offers one"}
-      line_type: {type: str}
-      country_code: {type: str}
+      phone: {type: str, required: true, note: "as the provider formats it; E.164 when it offers one, and +1 added to a 10-digit number the provider marks US or CA"}
+      line_type: {type: str, analytics: value}
+      country_code: {type: str, analytics: value}
     miss: "phone == null"
     idempotent: true
+    one_subject: true           # every variant names one person: cost per hit ranks first
     # No phone provider reports a line check, so every hit carries this.
-    advice_unverified: "This number was found, not confirmed live. Validate it (catalog_search 'verify phone number', e.g. tomba.people.phone.verify) before dialing or texting."
+    advice_unverified: "This number was found, not confirmed live. Send X-Treg-Route-Verify: true and treg checks the line with a live network lookup (hlrlookup.people.phone.verify) in the same call. For a US number, trestleiq.people.contact.verify also checks that it belongs to this person."
+    # `X-Treg-Route-Verify`: HLR's live check; a national-form number would be read as another country's.
+    check: {endpoint: hlrlookup.people.phone.verify, field: phone, when: "e164_digits(phone) != null", skip_reason: not_international,
+            skip_advice: "This number has no country code, so it was not checked: a live lookup would read its first digits as a country code. Add the country code (+ and the digits), or call hlrlookup.people.phone.verify with input_format set to the ISO3 country code (for example USA)."}
+
+  people.phone.live:
+    summary: "Check whether a phone number is live on its network — a live network lookup, not a format check"
+    routed: false               # one provider; the phone find's check calls it directly
+    identity:
+      - {phone: str}
+    filters: {}
+    output:
+      live_status: {type: str, required: true, note: "the provider's own word (LIVE, DEAD, ABSENT_SUBSCRIBER, …)"}
+      phone: {type: str}
+      line_type: {type: str}
+      current_network: {type: str}
+      ported: {type: bool}
+    miss: "live_status == null"
+    idempotent: true
+    # Never `verified`: a live line is not proof it is this person's number.
+    verdict: {from: live_status, words: [live, dead, unknown]}
 
   people.phone.verify:
     summary: "Validate a phone number's format and numbering-plan validity; not a live-line check"
@@ -137,10 +185,10 @@ contracts:
     filters:
       country_code: {type: str, note: "ISO-2 country context for parsing a national-format number, e.g. US; unnecessary for an international number"}
     output:
-      valid: {type: bool, required: true, note: "numbering-plan validity, not proof the line is active"}
+      valid: {type: bool, required: true, note: "numbering-plan validity, not proof the line is active", analytics: value}
       phone: {type: str}
-      country_code: {type: str}
-      line_type: {type: str}
+      country_code: {type: str, analytics: value}
+      line_type: {type: str, analytics: value}
       carrier: {type: str}
     miss: "valid == null"
     idempotent: true
@@ -151,11 +199,14 @@ contracts:
       - {email: str}
     filters: {}
     output:
-      valid: {type: bool, required: true, note: "the provider says the mailbox accepts mail"}
-      status: {type: str, note: "the provider's own verdict word (valid | invalid | accept_all | unknown | …)"}
-      score: {type: int}
+      valid: {type: bool, required: true, note: "the provider says the mailbox accepts mail", analytics: value}
+      status: {type: str, note: "the provider's own verdict word (valid | invalid | accept_all | unknown | …)", analytics: value}
+      score: {type: int, analytics: value}
     miss: "status == null"
     idempotent: true
+    # Stored per call. Each adapter maps its provider's words (`verdicts`); `unknown` is a word,
+    # not a miss, and catch-all is kept apart from `risky` so it can be counted on its own.
+    verdict: {from: status, words: [valid, invalid, catch_all, risky, unknown]}
 
   people.enrich:
     summary: "Enrich a person from an email, a LinkedIn URL or a name + company domain — treg picks the provider and names the one that served"
@@ -179,9 +230,9 @@ contracts:
       last_name: {type: str}
       title: {type: str}
       company: {type: str}
-      company_domain: {type: str}
+      company_domain: {type: str, analytics: key}
       linkedin_url: {type: str}
-      location: {type: str}
+      location: {type: str, analytics: value}
     miss: "full_name == null"
     idempotent: true
 
@@ -252,15 +303,20 @@ contracts:
     summary: "Google organic results for a keyword — provider-native result rows in `results`; `limit` is the depth"
     identity:
       - {q: str}
+      - {q: str, ai_overview: bool}   # ai_overview true: only providers that return Google's AI Overview whenever Google shows one
     filters:
       country: {type: str, default: us, note: "ISO country code; mapped to each provider's location code / gl / region"}
       language: {type: str, default: en}
       limit: {type: int, default: 10, note: "results to return where the provider bills by depth"}
+    # A provider that never returns the AI Overview answers a different question for a caller who needs it.
+    scoping: [ai_overview]
     output:
       results: {type: list, required: true, note: "the provider's own organic result rows (title, link/url, snippet…) — shapes differ per provider"}
       count: {type: int}
     miss: "results == []"
     idempotent: true
+    empty_is_failure: true   # an empty answer is the provider failing the job
+    prefer: [crawl4ai]
 
   people.search:
     summary: "Find people by a free-text description, or by company domain / title / country — provider-native rows in `people`"
@@ -271,7 +327,7 @@ contracts:
       - {title: str}
       - {full_name: str}
     filters:
-      country: {type: str, default: null, note: "ISO country code, where the provider supports it"}
+      country: {type: str, default: null, note: "ISO country code, where the provider supports it", analytics: value}
       location: {type: str, default: null, note: "free-text place ('London, United Kingdom', 'Greater Phoenix') passed through to providers that take one; finer than country, never normalised"}
       limit: {type: int, default: 10, note: "rows to return — THE price dial: most providers bill per row"}
       keywords: {type: list, default: null, note: "skills, topics or domain terms the person must match ('microservices', 'match analysis') — the SUBSTANCE of most briefs; a provider with no keyword field answers a looser question and ranks below one that has it"}
@@ -306,13 +362,13 @@ contracts:
     filters: {}
     output:
       name: {type: str, required: true}
-      domain: {type: str}
+      domain: {type: str, analytics: key}
       website: {type: str}
       description: {type: str}
-      industry: {type: str}
-      employees: {type: str, note: "headcount or a range, as the provider states it"}
-      founded: {type: int}
-      location: {type: str}
+      industry: {type: str, analytics: value}
+      employees: {type: str, note: "headcount or a range, as the provider states it", analytics: value}
+      founded: {type: int, analytics: value}
+      location: {type: str, analytics: value}
       linkedin_url: {type: str}
     miss: "name == null"
     idempotent: true
@@ -337,7 +393,7 @@ contracts:
       - {technology: str}
       - {domain: str}
     filters:
-      country: {type: str, default: null, note: "ISO country code, where the provider supports it"}
+      country: {type: str, default: null, note: "ISO country code, where the provider supports it", analytics: value}
       limit: {type: int, default: 10, note: "rows to return — THE price dial: most providers bill per row"}
     output:
       companies: {type: list, required: true, note: "the provider's own company rows (name, domain, industry, size, location…) — shapes differ per provider; raw is the same body"}
@@ -358,6 +414,7 @@ contracts:
       count: {type: int}
     miss: "places == []"
     idempotent: true
+    prefer: [crawl4ai]
 
   tiktok.user.videos:
     summary: "List a TikTok user's recent videos by secUid — provider-native video objects in `videos`"
@@ -386,7 +443,7 @@ contracts:
       first_name: {type: str}
       last_name: {type: str}
       headline: {type: str}
-      location: {type: str}
+      location: {type: str, analytics: value}
       followers: {type: int}
       connections: {type: int}
       about: {type: str}
@@ -441,6 +498,7 @@ contracts:
     filters:
       country: {type: str, default: us}
       language: {type: str, default: en}
+      limit: {type: int, note: "article count where supported"}
     output:
       results: {type: list, required: true, note: "the provider's own news rows (title, link, source, date…)"}
       count: {type: int}
@@ -510,6 +568,30 @@ contracts:
       videos: {type: list, required: true}
       next_cursor: {type: str}
     miss: "videos == []"
+    idempotent: true
+
+  web.search.publications:
+    summary: "Search research publications by topic — provider-native paper rows in `results`"
+    identity:
+      - {q: str}
+    filters:
+      limit: {type: int, default: 10}
+    output:
+      results: {type: list, required: true}
+      count: {type: int}
+    miss: "results == []"
+    idempotent: true
+
+  google.serp.scholar:
+    summary: "Search Google Scholar publications — provider-native paper rows in `results`"
+    identity:
+      - {q: str}
+    filters:
+      limit: {type: int, default: 10}
+    output:
+      results: {type: list, required: true}
+      count: {type: int}
+    miss: "results == []"
     idempotent: true
 
   threads.search.posts:
@@ -587,7 +669,7 @@ contracts:
     idempotent: true
 
   tiktok.search.videos:
-    summary: "Search TikTok videos by keyword — provider-native video rows in `videos`"
+    summary: "Search TikTok videos by keyword, first page only — provider-native video rows in `videos`; to page deeper, call the provider named in X-Treg-Served-By directly with its offset or cursor"
     identity:
       - {q: str}
     filters:
@@ -689,10 +771,10 @@ contracts:
     output:
       name: {type: str, required: true}
       description: {type: str}
-      website: {type: str}
+      website: {type: str, analytics: key}
       followers: {type: int}
-      employees: {type: str}
-      location: {type: str}
+      employees: {type: str, analytics: value}
+      location: {type: str, analytics: value}
       linkedin_url: {type: str}
     miss: "name == null"
     idempotent: true
@@ -829,6 +911,42 @@ contracts:
       next_cursor: {type: str}
     miss: "posts == []"
     idempotent: true
+
+  meta-ads.library.advertiser:
+    summary: "The ads one Facebook page is running in the Meta Ad Library, by page id, company name, domain or Facebook URL — provider-native ad rows in `ads`"
+    identity:
+      - {page_id: str}
+      - {company_name: str}
+      - {company_domain: str}
+      - {facebook_url: url}
+    filters: {}
+    output:
+      ads: {type: list, required: true, note: "the provider's own ad rows (id, dates, text, media…) — shapes differ per provider; raw is the same body"}
+      page_id: {type: str}
+      page_name: {type: str}
+      count: {type: int}
+      next_cursor: {type: str}
+    # No ads is a miss, so the next provider is tried: a provider whose fetch was blocked answers
+    # an empty list that looks like a page with no ads. Every child is free on an empty answer
+    # except a per_call one, which bills it.
+    miss: "ads == []"
+    idempotent: true
+    prefer: [crawl4ai]
+
+  google.maps.reviews:
+    summary: "The reviews Google Maps shows for one place, by place id — provider-native review rows in `reviews`"
+    identity:
+      - {place_id: str}
+    filters:
+      limit: {type: int, default: 5, note: "reviews to return; a provider that returns fewer is skipped for a bigger request"}
+      sort: {type: str, default: null, note: "newest, or the provider's relevant order when empty"}
+    output:
+      reviews: {type: list, required: true, note: "the provider's own review rows (stars, text, date, reviewer…) — shapes differ per provider; raw is the same body"}
+      count: {type: int}
+      next_cursor: {type: str}
+    miss: "reviews == []"
+    idempotent: true
+    prefer: [crawl4ai]
 
   facebook.user.profile:
     summary: "A public Facebook profile or page by URL or profile id — treg picks the provider and names the one that served"
@@ -1115,6 +1233,22 @@ contracts:
     idempotent: true
 
   # ---- open web -----------------------------------------------------------------------------
+  ai-search.perplexity.answer:
+    summary: "Ask Perplexity a question — the answer text and its cited sources; `source_kind` says whether it came from the Perplexity website or its model API"
+    identity:
+      - {prompt: str}
+    filters:
+      country: {type: str, default: "US", note: "ISO 3166-1 alpha-2: where the question is asked from"}
+    output:
+      answer: {type: str, required: true}
+      sources: {type: list, note: "the provider's own cited-source objects; raw is the same body"}
+      source_kind: {type: str, note: "website = the public Perplexity site, as a user there sees it; model_api = Perplexity's model API (sonar). The two cite largely different sources for the same question"}
+    miss: "answer == null"
+    idempotent: true
+    # DataForSEO answers far more often and much faster than Cloro (see their observed stats). Cloro reads the
+    # website itself; a caller who needs that sends X-Treg-Route-Prefer: cloro or calls it directly.
+    prefer: [dataforseo]
+
   web.search:
     summary: "Search the open web — provider-native result rows in `results`"
     identity:
@@ -1123,6 +1257,20 @@ contracts:
       limit: {type: int, default: 10, note: "maximum results, where the provider accepts one"}
     output:
       results: {type: list, required: true, note: "the provider's own ranked result objects; raw is the same body"}
+      count: {type: int}
+    miss: "results == []"
+    idempotent: true
+    empty_is_failure: true   # an empty answer is the provider failing the job
+    prefer: [crawl4ai]
+
+  web.search.news:
+    summary: "Search recent news — provider-native article rows in `results`"
+    identity:
+      - {q: str}
+    filters:
+      limit: {type: int, default: 10, note: "maximum compared results; sent upstream where supported"}
+    output:
+      results: {type: list, required: true, note: "the provider's own ranked news articles"}
       count: {type: int}
     miss: "results == []"
     idempotent: true
@@ -1137,6 +1285,22 @@ contracts:
       count: {type: int}
     miss: "pages == []"
     idempotent: true
+    empty_is_failure: true   # an empty answer is the provider failing the job
+    prefer: [crawl4ai]
+
+  web.extract.structured:
+    summary: "Extract typed JSON from one web page, described by a JSON schema and/or a plain-English instruction — the extracted data in `data`"
+    identity:
+      # Most complete first: the first variant the caller fills is the one every field rides on.
+      - {url: url, schema: object, instruction: str}
+      - {url: url, schema: object}
+      - {url: url, instruction: str}
+    filters: {}
+    output:
+      data: {type: any, required: true, note: "the extracted records, in the shape the schema asked for; raw is the provider's whole body"}
+    miss: "data == null"
+    idempotent: true
+    prefer: [crawl4ai]
 
   web.map:
     summary: "Discover the URLs on a website — provider-native map rows in `results`"

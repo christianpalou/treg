@@ -92,8 +92,9 @@ An empty list means every team.
 `recipe.json` (the manifest), `run.js` (script recipes), `check.json`, `README.md`, and
 optionally `data.csv`. `treg hub init <name> [--script]` writes a vendor-neutral skeleton.
 `docs/hub-recipes/` holds three worked recipes, each with a matrix test: a public sheet served as a
-tool, an uploaded CSV, and `engineering-team-size`, a script ladder over three catalog tools
-(free identity resolution, CrustData's role headcount, PDL's R&D class) with a $0.15 `ctx.charge` fee.
+tool, an uploaded CSV, and `engineering-team-size`, a script ladder over two catalog tools
+(company enrichment for identity and a possible R&D class fallback, plus CrustData's role headcount)
+with a $0.15 `ctx.charge` fee.
 Four more, one per road, chosen from what customers call most and ask for, are live-verified but
 carry no matrix test yet: `seo-domain-snapshot` (JSON steps, a fixed price), `brand-mentions` (a script
 over Reddit and routed X search that drops loose matches, charged per mention), `email-list-hygiene`
@@ -146,6 +147,12 @@ maker knows what one run costs), else $1.00 (price plus steps, counting what is 
 - **JSON road:** every ready step starts, four at a time, waiting on whichever finishes first;
   `for_each` fans a step into counted units; `skip_if_empty`; `allow_fail`.
 - **Script road:** `run.js` in the sandbox; every `ctx.call` is the same child call.
+
+The seller-price reserve uses `reserve_admission`, just like a metered catalog reserve. When its
+configured money admission wait expires, it returns 429 `money_admission_timeout` with
+the same jittered `Retry-After` as catalog reserves before opening the price hold or starting any
+steps. Redis infrastructure errors retain the existing database fallback; seller-price settlement
+and release are unchanged.
 
 Each unit is one `execute_call` under the child hold `{run}:s{n}` (`{run}:s{n}.{i}` for an
 item): the same gates, the same key injection, the same reserve-and-settle as a direct call.
@@ -303,7 +310,9 @@ bump; a script's amounts change only with a new version of run.js.
   listing (a `HubListing` row in state `approved`, below): the newest live version is scored by `catalog_store.score_extra` with the catalog's
   own tokens, aliases, platform boost, idf and admission gate, then merged by score with no boost
   (`merge_by_score`, catalog rows first on a tie). The row is the public contract plus its 30-day ok
-  rate from runs by others; unlisted, unapproved, failed and retired never appear.
+  rate from runs by others; unlisted, unapproved, failed and retired never appear. Its `added` is the
+  UTC day of the approval (`HubListing.decided_at`), so a recently-added search lists it beside
+  catalog tools (`search_listed(everything=True)` with no words; catalog.md "`added`").
 - **The listing review** (`docs/hub-listing-decisions.md` round 2, 2026-09-24): `PATCH
   /hub/tools/{id} {"listed": true}` (`treg hub list`) is a request, a `HubListing` row, one per
   tool and not per version, so the listing stays while each new version is reviewed (below; migration 0050; the old

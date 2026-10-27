@@ -2,17 +2,20 @@
 
 from __future__ import annotations
 
+import json
 import re
+from collections.abc import Mapping
+from dataclasses import dataclass, field
 from functools import lru_cache
 from typing import Literal
 
-from pydantic import Field, PositiveInt, field_validator
+from pydantic import AliasChoices, Field, PositiveInt, field_validator, model_validator
 from urllib.parse import urlsplit
 
 from pydantic_settings import BaseSettings, SettingsConfigDict
 
 # Every hostname the hosted service has answered to. treg moved
-# treg.superdesign.dev → treg.to (2026-08); installed CLIs, skill.md files, .mcp.json configs and
+# treg.superdesign.dev → treg.to; installed CLIs, skill.md files, .mcp.json configs and
 # MCP OAuth grants exist against BOTH names, so both stay valid everywhere a host or audience is
 # recognized by mcp.py's transport allow-lists, mcp_oauth's token audiences and api.py's login callback,
 # regardless of which one `public_url` currently points at. That symmetry is what makes
@@ -25,6 +28,57 @@ PUBLIC_HOST_ALIASES: tuple[str, ...] = ("treg.superdesign.dev", "treg.to")
 # Deliberately one-way — only ever the pre-move name, never treg.to — so a browser that cached the
 # old→new 301 can never meet a new→old redirect and loop, even while a rollback is in effect.
 LEGACY_PUBLIC_HOSTS: tuple[str, ...] = ("treg.superdesign.dev",)
+
+
+PRIMARY_SLOT = "primary"
+_SLOT_LABEL = re.compile(r"[a-z0-9][a-z0-9_-]{0,31}")
+
+
+@dataclass(frozen=True)
+class PlatformSlot:
+    """One treg-owned account behind a provider. `slot` is the operator's label for it (the
+    deployment's own `platform_key_<provider>` is `primary`), never a credential: it is what durable
+    rows, buckets and telemetry name. A label survives reordering the accounts and regenerating an
+    account's key; removing one retires everything created on it."""
+
+    slot: str
+    # setting name -> value; empty for the primary, whose are the fields. Credentials: never in repr.
+    values: Mapping[str, str] = field(repr=False)
+
+    def value(self, setting: str) -> str:
+        return self.values.get(setting, "")
+
+
+@lru_cache
+def _parse_platform_pools(raw: str) -> dict[str, dict[str, dict[str, str]]]:
+    """`TREG_PLATFORM_ACCOUNTS` parsed: {provider: {label: account settings}}. Every account names
+    its provider's `platform_key_<provider>` and only non-empty `platform_*` settings."""
+    if not raw.strip():
+        return {}
+    try:
+        parsed = json.loads(raw)
+    except ValueError:
+        raise ValueError("platform_accounts must be a JSON object") from None
+    if not isinstance(parsed, dict):
+        raise ValueError("platform_accounts must be a JSON object")
+    if len({provider.lower() for provider in parsed}) != len(parsed):
+        raise ValueError("platform_accounts names a provider twice (provider names are case-insensitive)")
+    pools: dict[str, dict[str, dict[str, str]]] = {}
+    for provider, accounts in parsed.items():
+        primary = platform_setting_name(provider)
+        if not isinstance(accounts, dict) or not all(
+                isinstance(label, str) and _SLOT_LABEL.fullmatch(label) and label != PRIMARY_SLOT
+                and isinstance(a, dict) and a.get(primary)
+                and all(isinstance(k, str) and k.startswith("platform_")
+                        and isinstance(v, str) and v.strip() for k, v in a.items())
+                for label, a in accounts.items()):
+            raise ValueError(
+                f"platform_accounts[{provider!r}] must map account labels (lowercase, not "
+                f"{PRIMARY_SLOT!r}) to objects that each name {primary} and only non-empty "
+                "platform_* settings")
+        pools[provider.lower()] = {label: {k: v.strip() for k, v in a.items()}
+                                   for label, a in accounts.items()}
+    return pools
 
 
 def platform_setting_name(provider: str) -> str:
@@ -53,8 +107,15 @@ def _blocked_email_domains(raw: str) -> frozenset[str]:
     )
 
 
+# How treg introduces itself to a provider: on every call on its shared key (the relay's rewrite 5)
+# and as the default of the clients it calls providers with, never a library's own default.
+TREG_USER_AGENT = "treg/1.0 (+https://treg.to)"
+
+
 class Settings(BaseSettings):
-    model_config = SettingsConfigDict(env_file=".env", env_prefix="TREG_", extra="ignore")
+    # Most of these values are credentials: a validation error names the field, never the value.
+    model_config = SettingsConfigDict(env_file=".env", env_prefix="TREG_", extra="ignore",
+                                      hide_input_in_errors=True)
 
     review_sample_rate: float = Field(default=0, ge=0, le=1)
     feedback_hint_rate: float = Field(default=0, ge=0, le=1)
@@ -64,7 +125,37 @@ class Settings(BaseSettings):
     # The shared key-value store (Redis protocol). Empty = an in-process fallback; see infra/kv.py.
     kv_url: str = ""
 
-    # SQLite locally, Postgres on Render — same code path, just swap the URL.
+    # Published root-call pause, rate and concurrency admission.
+    org_flow_control_enabled: bool = False
+    org_flow_control_refresh_s: float = Field(default=2.0, ge=0.2, le=10)
+
+    @model_validator(mode="after")
+    def _org_flow_control_configuration(self):
+        if self.org_flow_control_enabled:
+            try:
+                url = urlsplit(self.kv_url)
+                valid = (url.scheme in {"redis", "rediss"} and bool(url.hostname)
+                         or url.scheme == "unix" and bool(url.path))
+            except ValueError:
+                valid = False
+            if not valid:
+                raise ValueError("enabled org flow control requires a valid Redis kv_url")
+        return self
+
+    # Optional same-org admission in front of a balance session (settlement, reserve, release).
+    # A lease expiry or an unavailable store still runs the database path. A reserve or release
+    # with no positive org id refuses before checkout; that refusal is not an HTTP 429.
+    money_admission_enabled: bool = False
+    money_admission_org_ids: list[PositiveInt] = Field(default_factory=list)
+    money_admission_wait_s: float = Field(default=5.0, gt=0, le=120)
+    money_admission_lease_s: float = Field(default=15.0, ge=3, le=300)
+    # The old Org retry floor was also used by money; retain that env spelling only here.
+    money_admission_retry_after_s: int = Field(
+        default=1, ge=1, le=60, validation_alias=AliasChoices(
+            "TREG_MONEY_ADMISSION_RETRY_AFTER_S", "TREG_ORG_CONCURRENCY_RETRY_AFTER_S",
+            "money_admission_retry_after_s"))
+
+    # SQLite locally, Postgres in production - same code path, just swap the URL.
     database_url: str = "sqlite+aiosqlite:///./treg.db"
     # Optional SQLite / PostgreSQL datasource for explicitly opted-in, lag-tolerant reads.
     # Empty keeps read_session_maker on the existing primary pool.
@@ -74,7 +165,7 @@ class Settings(BaseSettings):
     @classmethod
     def _async_pg_driver(cls, v: str) -> str:
         # Some hosts inject a bare `postgres://`/`postgresql://` URL, but
-        # our async engine (create_async_engine) needs the asyncpg driver. Rewrite the scheme so the
+        # our async engine (create_async_engine) needs the asyncpg driver. Rewrite the scheme so
         # a deployment can auto-wire the DB with no manual URL editing. No-op for sqlite / already-drivered URLs.
         if v.startswith("postgres://"):
             v = "postgresql://" + v[len("postgres://") :]
@@ -99,7 +190,6 @@ class Settings(BaseSettings):
     # Empty in dev means an ephemeral key is minted at startup (secrets won't survive a restart).
     secret_key: str = ""
 
-    # The single bootstrap caller token for the MVP. Per-user/org tokens come in Step 3.
     api_token: str = "dev-token"
 
     # DEMO Stripe webhook signing secret (env TREG_DEMO_STRIPE_WEBHOOK_SECRET) for the landing page's live
@@ -109,7 +199,7 @@ class Settings(BaseSettings):
     # The Stripe sandbox restricted key (env TREG_DEMO_STRIPE_KEY) behind the landing sandbox's ONE
     # live wire: a sandbox call to the exact seeded stripe tool relays for real with THIS key
     # injected — the key never exists in any sandbox org (see sandbox.is_live_tool / api.call_tool).
-    # Empty = every sandbox call synthesizes, exactly as before the live wire existed.
+    # Empty = every sandbox call synthesizes.
     demo_stripe_key: str = ""
 
     # Cross-tenant super-admin bearer (env TREG_ADMIN_TOKEN). Presenting it authorizes every
@@ -126,8 +216,7 @@ class Settings(BaseSettings):
 
     # `treg run --server` allow-list. The server only executes an entrypoint that is a catalog-known CLI
     # (stripe/gh/vercel/…) OR listed here (comma-separated) — so a member can't name `bash`/`python` and
-    # run arbitrary code as the server user. Extend it as new CLIs are approved. (Full filesystem/network
-    # isolation — the stronger fix — needs a container deploy and is a planned follow-up.)
+    # run arbitrary code as the server user. Extend it as new CLIs are approved.
     run_allowed_bins: str = ""
 
     # Server-run resource limits (the DoS half of the server-run sandbox). Every `--server` run's child
@@ -140,7 +229,6 @@ class Settings(BaseSettings):
     run_cpu_seconds: int = 300          # CPU time a single server run may burn (backstop to the wall timeout)
     run_fsize_mb: int = 100             # largest single file a server run may write (disk-fill guard)
 
-    # ---- prepaid balance (domain/money) -----------------------------------------------------------
     # Platform markup on a call served by a PLATFORM key, applied to the estimate at reserve time and
     # to the observed cost at settle time. 0.0 = we charge exactly what the provider charges us.
     # It lives in config (rather than being hardcoded) so turning margin on is a deploy setting, not
@@ -151,9 +239,9 @@ class Settings(BaseSettings):
     promo_grant_micro: int = 1_000_000
     # Upstream HTTP timeout for a relayed call (the shared httpx client). Also the base of the hold
     # reaper's cutoff: a hold older than call_timeout_s + hold_grace_s belongs to a call that can no
-    # longer be settling, so the reaper returns it (see ledger.reap_stale_holds).
-    # 180, not 30: real catalog upstreams routinely run long — BrightData sync scrapes ~20-35s
-    # (a 30s ceiling 502'd one live), and merchant routes have been observed at 9s→105s.
+    # longer be settling, so the reaper returns it (see money.reap_stale_holds).
+    # 180, not 30: real catalog upstreams routinely run long - BrightData sync scrapes ~20-35s, and
+    # merchant routes have been observed at 9s→105s.
     call_timeout_s: int = 180
     hold_grace_s: int = 60
     # Spooled settlement evidence (application/call/settle.py `_spool_response`): a catalog
@@ -166,8 +254,11 @@ class Settings(BaseSettings):
     spool_max_bytes: int = Field(default=64 * 1024 * 1024, ge=1)
     spool_budget_bytes: int = Field(default=512 * 1024 * 1024, ge=1)
     spool_parse_concurrency: int = Field(default=2, ge=1, le=16)
+    # Fair share of a provider's concurrency on treg's own keys (domain/capacity/fair_share.py):
+    # how long a call waits in line for a place before a routed job moves on and a direct call is
+    # refused, not charged. 0 turns the gate off (TREG_FAIR_SHARE_WAIT_S=0).
+    fair_share_wait_s: float = Field(default=2.0, ge=0, le=30)
 
-    # ---- referral program (referrals.py) --------------------------------------------------------
     # Flat bounties, not a percentage of top-ups. At 0% platform margin a percentage would be a
     # permanent share of pass-through GMV, and — unlike a flat figure — it rewards farming in
     # proportion to effort. Nobody builds a fake-account farm for $10; plenty would for 15% of an
@@ -180,7 +271,7 @@ class Settings(BaseSettings):
     # bounties themselves: below it, buying the bonus with your own card is profitable.
     referral_min_topup_micro: int = 10_000_000  # $10
     # Days between qualifying and the credit landing. This is the ONLY clawback window that exists:
-    # referral credit is promotional, burns first (ledger._KIND_ORDER) and is typically spent within
+    # referral credit is promotional, burns first (money._KIND_ORDER) and is typically spent within
     # days, so once granted it cannot be recovered. Short on purpose — a referral program that pays
     # in 60 days does not feel like a reward, and the exposure at these amounts is tiny.
     referral_hold_days: int = 7
@@ -189,13 +280,13 @@ class Settings(BaseSettings):
     # commercial conversation, the same posture as raising a daily cap.
     referral_cap: int = 20
 
-    # ---- tier-4 platform keys (api.py credential ladder) ---------------------------------------
-    # treg's OWN provider keys, spent on a caller's behalf and metered against their prepaid balance.
-    # Read by `proxy.relay` through a `platform_setting` binding (never copied into an org's secrets,
-    # never reachable from a local run). Naming is load-bearing: the binding names the ATTRIBUTE, so
-    # `platform_key_for("tikhub")` → `platform_key_tikhub` → env `TREG_PLATFORM_KEY_TIKHUB`.
-    # dataforseo's value is the base64 of "login:password" (HTTP Basic) — the same bytes a pasted
-    # secret ends up as; the other two are the raw key.
+    # Tier-4 platform keys: treg's OWN provider keys, spent on a caller's behalf and metered against
+    # their prepaid balance. Read by `infra.upstream.relay.relay` through a `platform_setting`
+    # binding (never copied into an org's secrets, never reachable from a local run). Naming is
+    # load-bearing: the binding names the ATTRIBUTE, so `platform_key_for("tikhub")` →
+    # `platform_key_tikhub` → env `TREG_PLATFORM_KEY_TIKHUB`. dataforseo's value is the base64 of
+    # "login:password" (HTTP Basic) - the same bytes a pasted secret ends up as; the other two are
+    # the raw key.
     platform_key_tikhub: str = ""
     platform_key_dataforseo: str = ""
     platform_key_scrapecreators: str = ""
@@ -214,6 +305,8 @@ class Settings(BaseSettings):
     platform_key_openmart: str = ""  # Bearer; monthly subscription credits, no auto-top-up
     platform_key_harvestapi: str = ""  # X-API-Key; prepaid USD wallet
     platform_key_fetchinio: str = ""  # X-API-Key; subscription + PAYG credit balance
+    platform_key_sixtyfour: str = ""  # x-api-key; monthly credits, free balance check
+    platform_key_blitzapi: str = ""  # x-api-key; monthly record allowance, free key-info balance
     platform_key_anyapi: str = ""  # X-API-Key; prepaid USD wallet, exact charge settles from costUsd
     platform_key_dropleads: str = ""  # X-API-Key; PAYG credits priced in fx.yaml
     platform_key_quickenrich: str = ""  # Bearer; monthly subscription credits, not auto-top-up
@@ -238,16 +331,17 @@ class Settings(BaseSettings):
     platform_key_coresignal: str = ""
     platform_key_thecompaniesapi: str = ""  # raw token — injected as "Basic {secret}" un-encoded
     platform_key_apollo: str = ""   # raw key (X-Api-Key); billed at the Basic-plan $/credit rate in fx.yaml
-    # ---- Market data (2026-08-15). Two PAID plans billed per call, three FREE-tier keys serving
-    # capped trial pools at $0 (fx.yaml kind: treg_trial — api._enforce_trial_allowance is the brake).
+    # Market data. Two PAID plans billed per call, three FREE-tier keys serving capped trial pools
+    # at $0 (fx.yaml kind: treg_trial - application/call/reserve.py `_enforce_trial_allowance` is the
+    # brake).
     platform_key_coingecko: str = ""    # PRO key (x-cg-pro-api-key); Basic $29/mo, $0.00029/credit
     platform_key_marketstack: str = ""  # access_key; Basic $9.99/mo, $0.000999/call vs the 10k/mo cap
     platform_key_finnhub: str = ""      # FREE-tier key — trial pool, 50 calls/team/day
     platform_key_twelvedata: str = ""   # FREE Basic key (800/day TOTAL) — trial pool, 20 calls/team/day
     platform_key_tiingo: str = ""       # FREE Starter key (1,000/day total) — trial pool, 20 calls/team/day
     platform_key_financialdatasets: str = ""  # X-API-KEY; prepaid Credits with vendor auto-reload
-    # ---- Enrichment expansion (2026-08-20). Slots only — fund the accounts and set the keys before
-    # naming any of these in TREG_PLATFORM_PROVIDERS.
+    # Enrichment slots: fund the accounts and set the keys before naming any of these in
+    # TREG_PLATFORM_PROVIDERS.
     platform_key_companyenrich: str = ""  # Bearer key
     platform_key_oceanio: str = ""        # X-Api-Token; fx.yaml usd is null so tier 4 stays refused until priced
     platform_key_predictleads: str = ""   # base64 of "api_key:api_token" (HTTP Basic, like dataforseo)
@@ -260,8 +354,10 @@ class Settings(BaseSettings):
     platform_key_tomba_secret: str = ""   # the API secret (ts_…); X-Tomba-Secret — BOTH must be set
     platform_key_trestleiq: str = ""       # raw key; exact lowercase x-api-key header
     platform_key_theirstack: str = ""      # Bearer key; API credits: 1 per job, 3 per company returned
+    platform_key_hlrlookup: str = ""         # JSON body api_key; prepaid lookup credits, 1 per mobile lookup
+    platform_key_hlrlookup_secret: str = ""  # JSON body api_secret paired with it — BOTH must be set
     # (tomba's data routes need the header pair; TOMBA.platform_extra_setting names this second slot)
-    platform_key_influencersclub: str = ""  # Bearer key (dashboard JWT); creator discovery + enrichment, fx.yaml $0.598/credit (our $299/500 plan)
+    platform_key_influencersclub: str = ""  # Bearer key (dashboard JWT); creator discovery + enrichment, fx.yaml $0.598/credit
     platform_key_crustdata: str = ""  # Bearer key; every call also needs the pinned x-api-version header
     platform_key_aviato: str = ""     # Bearer key; $10 auto-top-up buys 1,000 credits
     platform_key_enrichlayer: str = ""  # Bearer; pay-as-you-go credits
@@ -270,12 +366,14 @@ class Settings(BaseSettings):
     platform_key_search1api: str = ""  # Bearer; prepaid credits, free GET /usage balance check
     platform_key_octen: str = ""      # x-api-key; PAYG search and extraction usage settles per response
     platform_key_linkup: str = ""     # Bearer; prepaid USD balance, request-priced Search/Fetch/Research
+    platform_key_parallel: str = ""   # x-api-key; USD balance, Search/Extract settle from usage SKUs
     platform_key_you: str = ""        # X-API-Key; prepaid USD balance across You.com web APIs
     platform_key_valyu: str = ""      # X-API-Key; subscription credits shared across Valyu APIs
     platform_key_serper: str = ""     # X-API-KEY; prepaid Google search credits, exact charge in response.credits
     platform_key_litescrape: str = ""  # Bearer; prepaid calls, free key status endpoint
     platform_key_keenable: str = ""   # X-API-Key; $4/1,000-request package, 10 requests/s per organization
     platform_key_olostep: str = ""    # Bearer; prepaid credits, platform price $0.002/credit
+    platform_key_crawl4ai: str = ""
     platform_key_firecrawl: str = ""  # Bearer; Standard plan credits, priced at the public base-plan rate
     platform_key_scrapegraphai: str = ""  # SGAI-APIKEY; credit balance and bounded v2 web tools
     platform_key_spidercloud: str = ""   # Bearer; PAYG USD balance, only priced routes may use shared key
@@ -293,12 +391,14 @@ class Settings(BaseSettings):
     jev_treg_token: str = ""
     ai_gateway_api_key: str = ""
     platform_key_openrouter: str = ""  # Bearer key for asynchronous routed generation
+    # Capacity sweep only (ops/deploy.md); not another platform-provider slot.
+    platform_openrouter_management_key: str = ""
     platform_key_replicate: str = ""  # Bearer token for official asynchronous models
     platform_key_reapi: str = ""      # Bearer key; prepaid credits at $0.001, Seedance 2.5 + image models
     platform_key_google_ai: str = ""  # x-goog-api-key; token-billed Gemini API project (image output $120/M tokens)
     platform_key_piapi: str = ""      # X-API-Key; prepaid USD balance, Seedance 2.5 less-restriction + image models
     platform_key_tinyfish: str = ""   # X-API-Key; free Search/Fetch plus Agent billed per terminal step
-    # Overflow aggregators (docs/PROVIDER-CAPACITY-PLAN.md §4.3): treg-owned accounts that serve the
+    # Overflow aggregators: treg-owned accounts that serve the
     # SAME vendor endpoint when our direct account is out. Env only, never a Secret row, never logged.
     # Not platform_key_* on purpose: they are a credential RUNG (platform-overflow), not a provider.
     overflow_key_orthogonal: str = ""
@@ -311,15 +411,19 @@ class Settings(BaseSettings):
     # The KILL SWITCH, and the reason a key alone isn't enough: a provider serves tier 4 only if it is
     # named here AND its key is set. Empty (the default) = tier 4 is entirely off, so a deploy that
     # happens to hold a key can't start spending it by accident. `TREG_PLATFORM_PROVIDERS=""` in the
-    # Render dashboard turns the whole feature off without a redeploy.
+    # deployment's environment turns the whole feature off without a redeploy.
     platform_providers: str = ""
+    # More treg-owned accounts behind a provider, by label (rules: `_parse_platform_pools`):
+    # {"tomba": {"b": {"platform_key_tomba": "...", "platform_key_tomba_secret": "..."}}}.
+    # `platform_key_<provider>` above stays the `primary` account and the only one every reader
+    # outside the call path uses; the call path spreads platform calls across all of them.
+    platform_accounts: str = ""
     # Whether DISCOVERY steers to routed rows: `treg.<capability>` first in search, and a routed
     # parent pulled in whenever one of its children matched. `off` leaves every routed endpoint
-    # callable and priced — only the steering stops, and search looks as it did before routing
-    # shipped. Same runtime-switch shape as `platform_providers`: flip it in the dashboard, no
-    # redeploy. It exists because "does the router answer well" and "should every agent be led to
-    # it by default" are separate questions, and the second one is answered by traffic, not by
-    # argument.
+    # callable and priced - only the steering stops. Same runtime-switch shape as
+    # `platform_providers`: flip it in the dashboard, no redeploy. It exists because "does the
+    # router answer well" and "should every agent be led to it by default" are separate questions,
+    # and the second one is answered by traffic, not by argument.
     routed_discovery: str = "on"
     # The discovery EXPERIMENT (application.search_experiment): a relevance judge (TypeSafe's Jev)
     # scores a widened lexical recall and the result is compared with the shipped ranker on
@@ -330,6 +434,20 @@ class Settings(BaseSettings):
     # /catalog/find) to most callers and the same two pure holdouts. Any value here is also the
     # kill switch: a bad judge is one env change from off.
     search_experiment: str = "off"
+    # The shadow provider (application.shadow, `treg-worker shadow collect`): a candidate asked the
+    # same question as served calls, after the fact and never on the request path, to measure how
+    # often it answers and agrees. The JSON names the candidate's base URL and, per capability, an
+    # adapter in the routing YAML's shape (domain.catalog.shadow). Empty = off; it is also the kill
+    # switch. The key is the candidate's own credential, never a team's.
+    shadow_provider: str = ""
+    shadow_provider_key: str = ""
+    shadow_salt: str = ""
+    # Candidate calls at once, per second, and the per-call time limit.
+    shadow_concurrency: int = 16
+    shadow_per_second: float = 20.0
+    shadow_timeout_s: float = 3.0
+    # Pair rows older than this are deleted by each run.
+    shadow_retention_days: int = 7
     # Per-caller share (each) of the two pure arms in `interleave` and `v2` mode; the rest is
     # interleaved, or served v2.
     search_experiment_holdout_percent: int = 10
@@ -349,7 +467,6 @@ class Settings(BaseSettings):
     typesafe_model: str = "jev-latest"
     typesafe_url: str = "https://api.typesafe.ai/v1/systemone"
     # Past this the search answers from the baseline alone; the row records `judge_error=timeout`.
-    # Measured at 30 candidates: about 1.2-1.5 s per answer on a quiet day, so 1.5 sits on the edge.
     typesafe_timeout_s: float = 2.5
     # "Find tools for a job" (application.catalog_find): the same judge served to PEOPLE on the
     # dashboard's Catalog page and the public /search page. Its recall is wider than the MCP
@@ -393,12 +510,8 @@ class Settings(BaseSettings):
     # including 0 for no limit — the limit is the team's protection against a runaway agent
     # draining a balance that auto-top-up keeps refilling, and that is the team's call to make.
     # Enforced FAIL-CLOSED when one applies (unlike the soft per-user call cap): a query error
-    # refuses the call rather than letting an unbounded amount out.
-    #
-    # History: 100 -> 500 on 2026-08-29 (ordinary benchmark work tripped it with balance to spare),
-    # then 500 -> none in 2026-09. In two weeks the platform-wide figure fired only on two prepaid
-    # teams mid-workload (thousands of refused calls against a funded balance) and never on abuse;
-    # the prepaid balance and the auto-top-up monthly cap already bound what a team can spend.
+    # refuses the call rather than letting an unbounded amount out. The prepaid balance and the
+    # auto-top-up monthly cap already bound what a team can spend.
     platform_daily_cap_usd: float = 0.0
     # OAuth providers whose UPSTREAM bill lands on treg's developer app rather than the connected
     # user (X moved to pay-per-use in Feb 2026: the app owner is billed per resource read / per post
@@ -410,21 +523,33 @@ class Settings(BaseSettings):
     # already theirs.
     oauth_billed_providers: str = ""
 
-    # ---- Stripe top-ups (billing.py) -----------------------------------------------------------
     # OUR billing account's keys. Deliberately NOT the `demo_stripe_*` pair above: that one belongs to
     # the landing page's sandbox feed and its webhook secret signs a different endpoint. Empty secret
     # key = top-ups are off (the /billing/* endpoints 503); empty webhook secret = the webhook 404s,
     # so an unconfigured deploy exposes no unauthenticated POST surface (same posture as the demo).
     stripe_secret_key: str = ""
     stripe_webhook_secret: str = ""
+    # Enterprise SSO uses WorkOS only as a federation bridge; treg remains the account,
+    # membership, session, and authorization authority. Empty keys disable setup and login.
+    workos_api_key: str = ""
+    workos_client_id: str = ""
+    workos_webhook_secret: str = ""
+    enterprise_sso_bundle_only: bool = True
+    # Reusable recurring Stripe Prices, created in the matching test/live account. An unset
+    # Price keeps that plan out of Checkout; no per-checkout products are created.
+    enterprise_sso_only_price_id: str = ""
+    enterprise_sso_bundle_price_id: str = ""
+    # Optional deployment-specific checkout floors. Keep vendor costs and commercial policy out
+    # of the portable defaults; hosted deployments set these alongside their Stripe Prices.
+    enterprise_sso_only_min_price_usd: int = 0
+    enterprise_sso_bundle_min_price_usd: int = 0
     # Top-up amounts, in whole USD (the ONLY place dollars appear — billing.py converts to micro-USD
     # for the ledger and to integer cents for Stripe at the boundaries, and nothing in between sees a
     # float). The $10 minimum is fee math, not policy: at 2.9% + $0.30 a $5 top-up loses 9% to fees,
     # and the referral offer's qualifying amount is $10 already.
     topup_min_usd: int = 10
     topup_default_usd: int = 10
-    # Four presets plus "Other" (any whole amount ≥ min). Deliberately few and skewed big: with eight
-    # cards from $5 up nobody ever picked $100+, and repeat payers stayed flat ($10 → $10).
+    # Four presets plus "Other" (any whole amount ≥ min). Deliberately few and skewed big.
     topup_presets: list[int] = [10, 50, 100, 200]
     # Bonus credit on a MANUAL top-up, as {min_usd: percent}: the highest key ≤ the amount applies.
     # It is promotional credit (a separate block that burns first and is never refundable), never
@@ -440,9 +565,13 @@ class Settings(BaseSettings):
     autotopup_default_amount_usd: int = 20
     # Hard guardrails on the off-session charge — the difference between "convenient" and "a runaway
     # agent bills a card all night". Cap is per calendar month, cooldown is between attempts, and
-    # max_attempts counts CONSECUTIVE failures before auto-top-up disables itself.
-    autotopup_monthly_cap_usd: int = 100
+    # max_attempts counts CONSECUTIVE failures before auto-top-up disables itself. The monthly cap's
+    # default is `billing.TOPUP_MAX_USD` (see money.md).
+    # The wait after a FAILED charge. After a successful one the wait is one hour divided by the
+    # team's `autotopup_max_per_hour` (default below), so a team that spends more than its refill
+    # per hour is not left empty for the rest of the hour.
     autotopup_cooldown_s: int = 3600
+    autotopup_default_per_hour: int = 5
     autotopup_max_attempts: int = 3
 
     # Call-time SSRF guard on the proxy: resolve the upstream host and refuse an internal target. On by
@@ -451,8 +580,7 @@ class Settings(BaseSettings):
 
     # The archive's rollout switch (see treg/archive.py): "off" (default) | "shadow" (record +
     # learn from metered platform responses, serve nothing) | "serve" (shadow + answer eligible
-    # fresh hits from the store). Any other value degrades to "off" — a typo must disable, never
-    # enable. Staged deliberately so production can sit in "shadow" while phase 0 measures.
+    # fresh hits from the store).
     archive_mode: str = "off"
     archive_body_write: Literal["db", "both", "r2"] = "db"
     archive_change_observation_enabled: bool = True
@@ -470,6 +598,20 @@ class Settings(BaseSettings):
     archive_r2_read_timeout_s: float = Field(default=2.0, gt=0, le=120)
     archive_r2_terminal_attempts: int = Field(default=3, ge=1, le=5)
 
+    # Pictures (team and user avatars, /showcase leaderboard icons and screenshots): two S3-API
+    # buckets, separate from the archive's. Uploads land in the private STAGING bucket; publishing
+    # copies a file to the PUBLIC bucket, which `media_base_url` serves (a custom domain such as
+    # https://media.example.com). Off until endpoint, keys and both buckets are set: then uploads are
+    # refused and pages show initials. With no `media_base_url`, treg serves the public bucket
+    # itself at /media-files/. The endpoint must be https, except a local MinIO on localhost.
+    media_store_endpoint: str = ""
+    media_store_access_key_id: str = Field(default="", repr=False)
+    media_store_secret_access_key: str = Field(default="", repr=False)
+    media_staging_bucket: str = ""
+    media_public_bucket: str = ""
+    media_base_url: str = ""
+    media_store_timeout_s: float = Field(default=10.0, gt=0, le=60)
+
     # Comma-separated: exact endpoint IDs, "capability:<prefix>" families (capability:people.),
     # or "*" for every endpoint the policy allows (the default; an operator narrows it to ids or
     # families to stage a rollout). Empty means no serving, even in serve mode - the rollback
@@ -486,10 +628,10 @@ class Settings(BaseSettings):
     # Bodies above this size are hash-counted but never stored (skipped whole, not truncated):
     # the archive is for API JSON answers, not downloads. Statistics still record size_bytes.
     archive_max_body_bytes: int = 2_000_000
-    # What happens to an endpoint WITHOUT a judged `cache:` field (the founder's 2026-08-29
-    # decision): "transient" keeps every answer body as short-lived cache; "forbidden" is the old
-    # keep-nothing posture. A judged forbidden (a licence that was read and says no) is always
-    # respected, and actions are never stored, whatever this says.
+    # What happens to an endpoint WITHOUT a judged `cache:` field: "transient" keeps every answer
+    # body as short-lived cache; "forbidden" is the keep-nothing posture. A judged forbidden (a
+    # licence that was read and says no) is always respected, and actions are never stored, whatever
+    # this says.
     archive_default_policy: str = "transient"
     # The refresh worker (serve mode only): how often it scans for due keys, and how many
     # refresh calls ONE provider may spend per UTC day. A refresh is treg's own vendor spend with
@@ -498,23 +640,22 @@ class Settings(BaseSettings):
     archive_refresh_daily_cap: int = 0
     # The pruner (profit-shaped: a stored body is inventory, and inventory that cannot sell goes
     # first). Runs whenever the archive records (shadow or serve); 0 batch disables it.
-    archive_prune_interval_s: int = 3600       # one pass per hour
+    archive_prune_interval_s: int = 3600
     archive_prune_batch: int = 500             # bodies stripped per pass, the load bound
     archive_prune_keep_versions: int = 2       # newest N bodies kept on servable keys
     archive_prune_min_age_days: int = 7        # servable bodies younger than this are never touched
 
-    # The tool hub (docs/HUB-DECISIONS.md): tools a maker publishes, made of other tools. Off by
-    # default so every merge along the way changes nothing users see; production flips it once
-    # the whole hub has landed on main.
+    # The tool hub (docs/context/architecture/hub.md): tools a maker publishes, made of other tools.
     hub_enabled: bool = False
-    # With the hub on, a comma-separated list of team slugs that may use it; EMPTY means every
-    # team. The middle stage between "off" and "open": the owner's own team tries the live hub on
-    # production first (decided 2026-09-24). Pages that have no caller (the share page, the
-    # agent-facing files) follow the plain flag: they describe the hub, they do not run it.
+    # Web Arena is shown only after reviewed tests exist for all live tasks.
+    web_arena_enabled: bool = False
+    web_arena_jev_user_daily_cap: int = 20
+    web_arena_jev_ops_daily_cap: int = 1000
+    web_arena_fact_model: str = "openai/gpt-4o-mini"
+    # With the hub on, a comma-separated list of team slugs that may use it; EMPTY means every team.
     hub_teams: str = ""
-    # A comma-separated list of people (sign-in emails) who may use the hub in ANY team they work in,
-    # beside `hub_teams` (owner, 2026-09-26): colleagues try it from their own accounts, with no
-    # shared team. Either list lets a reader in; both empty means every team.
+    # Sign-in emails who may use the hub in ANY team they work in, beside `hub_teams`. Either list
+    # lets a reader in; both empty means every team.
     hub_users: str = ""
     # `/table/<tool id>`: the same call as `/call/`, answered as rows and columns (for the Google
     # Sheets add-on). Off by default; with it on, `table_teams` / `table_users` limit it the same
@@ -539,6 +680,17 @@ class Settings(BaseSettings):
     # treg's own public base URL — used to build the OAuth callback (must be whitelisted in the
     # provider's OAuth app). Self-hosting? Set TREG_PUBLIC_URL to your deployment's URL.
     public_url: str = "https://treg.to"
+    public_host_aliases: tuple[str, ...] = ()
+
+    @field_validator("public_host_aliases")
+    @classmethod
+    def _public_host_aliases_shape(cls, hosts: tuple[str, ...]) -> tuple[str, ...]:
+        normalized = tuple(dict.fromkeys(h.lower().rstrip(".") for h in hosts))
+        if any(not re.fullmatch(r"[a-z0-9](?:[a-z0-9.-]*[a-z0-9])?", h)
+               or ".." in h for h in normalized):
+            raise ValueError("public_host_aliases must contain hostnames without schemes, paths or ports")
+        return normalized
+
     # Proof to OpenAI's plugin directory that we control this domain. The portal generates a token
     # and fetches it from /.well-known/openai-apps-challenge; that endpoint must return THAT token
     # and nothing else — not JSON, not a list. Empty (the default) leaves the route 404, which is the
@@ -549,6 +701,7 @@ class Settings(BaseSettings):
     # <public_url>/auth/github/callback and set these; empty disables the GitHub button.
     github_client_id: str = ""
     github_client_secret: str = ""
+
     # Signs the session cookie (HMAC). Falls back to secret_key if unset. Set a real value in prod.
     session_secret: str = ""
     # Overridable for tests; real GitHub by default.
@@ -569,6 +722,16 @@ class Settings(BaseSettings):
     # ingestion key (safe to expose to the browser); host defaults to EU cloud.
     posthog_key: str = ""
     posthog_host: str = "https://eu.i.posthog.com"
+    # Call events (call_events.py, docs/context/architecture/call-events.md): one structured,
+    # pseudonymous event per catalog call, POSTed in batches to an HTTP stream (a Cloudflare
+    # Pipelines stream writing an Iceberg table). OFF unless the URL and the HMAC secret are both
+    # set; the token is sent as a bearer when the stream requires one. The secret keys every hash
+    # in an event, so a table holder without it cannot test a guessed email against the table.
+    call_events_url: str = ""
+    call_events_token: str = Field(default="", repr=False)
+    call_events_hmac_secret: str = Field(default="", repr=False)
+    # Comma-separated team ids whose calls are evaluation traffic (`is_eval` on their events).
+    call_events_eval_orgs: str = ""
     # The code identity stamped on every analytics event as `build`. Empty means "use the commit the
     # host exposes, else the installed package version" (analytics.build_id), so an operator only
     # sets TREG_BUILD when the platform does not publish a commit variable.
@@ -578,6 +741,28 @@ class Settings(BaseSettings):
     # signs user_hash for identity verification and must never reach the browser.
     intercom_app_id: str = ""
     intercom_secret: str = ""
+    # Where the client address comes from (client_ip.py). A header only the edge can set wins
+    # (`cf-connecting-ip` behind Cloudflare); else the entry this many hops from the RIGHT of
+    # X-Forwarded-For, the one the nearest trusted proxy appended (0 = clients connect directly,
+    # use the socket peer). The first X-Forwarded-For entry is client-written and never trusted.
+    client_ip_header: str = ""
+    trusted_proxy_hops: int = Field(default=1, ge=0, le=5)
+    # Comma-separated `treg.extensions` entry-point names that must be installed (policy.py), so a
+    # deployment that relies on a private policy extension refuses to start without it. Empty =
+    # load whatever is installed, which for a plain install is nothing.
+    required_extensions: str = ""
+    # Cloudflare Turnstile on the email sign-in form. Both keys empty = OFF, so self-hosted
+    # instances load no widget and call no Cloudflare. The site key is public (sent to the
+    # browser through /captcha.js); the secret only ever reaches siteverify. `observe` records each
+    # outcome and changes nothing; `enforce` refuses a code to a missing or invalid token and
+    # withholds signup credit from a new account when Cloudflare could not answer.
+    turnstile_site_key: str = ""
+    turnstile_secret: str = ""
+    # Comma-separated frontend hostnames a token must have been solved on. Empty = the host of
+    # public_url. List every host the dashboard is served from (aliases included), never localhost
+    # in production.
+    turnstile_hostnames: str = ""
+    turnstile_mode: Literal["observe", "enforce"] = "observe"
     # Registry OAuth apps for the non-Google providers (oauth_providers.py). Empty = that provider
     # is listed as unconfigured rather than failing part-way through a consent.
     # treg's own Google Ads developer token, from OUR approved manager account. Ads needs it on
@@ -609,6 +794,15 @@ class Settings(BaseSettings):
     # read their campaign data, and the two must not share a credential or a consent screen. Empty
     # = the whole feature is OFF. See docs/context/architecture/ads-conversions.md.
     ads_conv_refresh_token: str = ""
+    # Enhanced Conversions for Leads. OFF: the outbox only ever holds click-attributed teams and the
+    # upload carries click ids alone. ON: every human-owned team's signup,
+    # first call and first payment is queued, and each upload event also carries the SHA-256 of the
+    # team creator's normalised email as a `userData` identifier, so Google can match a conversion
+    # to a signed-in viewer who watched or clicked an ad on ANOTHER device (a YouTube pre-roll on a
+    # phone, the signup on a laptop) — the journey a click id can never connect. Turn on only after
+    # the Ads account has accepted the Customer Data Terms and enabled Enhanced conversions for
+    # leads; until then Google rejects the identifiers and the rows would dead-letter.
+    ads_conv_user_data: bool = False
 
     linkedin_client_id: str = ""
     linkedin_client_secret: str = ""
@@ -633,6 +827,15 @@ class Settings(BaseSettings):
     # Comma-separated registry review keys that do not yet have production access. Remove one key
     # when its review is approved; set an explicit empty value when all reviews are complete.
     oauth_review_pending: str = "instagram-login,page-messages"
+    # Comma-separated provider service ids this deployment has paused (TREG_PAUSED_PROVIDERS), e.g.
+    # one whose upstream access this deployment's app has lost. A paused provider leaves catalog
+    # search and the connect listing, and its calls and connects are refused with a typed 503
+    # `provider_paused` before any hold or upstream request. Existing connections are kept as they
+    # are and work again once the id is removed. Empty (the default) pauses nothing.
+    paused_providers: str = ""
+    # Optional JSON object {service: message} (TREG_PAUSED_PROVIDER_MESSAGES) replacing the default
+    # paused message for a service. Malformed JSON fails at boot rather than showing nothing.
+    paused_provider_messages: str = ""
     # Advertising OAuth platforms — unset by default, so these providers list as "not configured"
     # until this deployment registers its own developer app on each network.
     microsoft_ads_client_id: str = ""
@@ -679,6 +882,25 @@ class Settings(BaseSettings):
             email, sep, digest = part.partition("=")
             if not sep or "@" not in email or not re.fullmatch(r"[0-9a-fA-F]{64}", digest.strip()):
                 raise ValueError("fixed_login_codes entries must be email=<64-hex sha256>")
+        return v
+
+    @field_validator("paused_provider_messages")
+    @classmethod
+    def _paused_provider_messages_shape(cls, v: str) -> str:
+        if v.strip():
+            try:
+                parsed = json.loads(v)
+            except ValueError:
+                raise ValueError("paused_provider_messages must be a JSON object") from None
+            if not isinstance(parsed, dict) or not all(
+                    isinstance(k, str) and isinstance(m, str) and m.strip() for k, m in parsed.items()):
+                raise ValueError("paused_provider_messages must map service ids to non-empty strings")
+        return v
+
+    @field_validator("platform_accounts")
+    @classmethod
+    def _platform_accounts_shape(cls, v: str) -> str:
+        _parse_platform_pools(v)  # raises ValueError on a malformed value
         return v
 
     @property
@@ -753,6 +975,40 @@ class Settings(BaseSettings):
         """
         return (provider or "").lower() in self.platform_provider_set
 
+    def platform_slots(self, provider: str) -> tuple[PlatformSlot, ...]:
+        """Every treg-owned account behind `provider`, the primary first; empty without a primary
+        key. Says nothing about the allow-list: `platform_key_for` stays the serving switch."""
+        setting = platform_setting_name(provider)
+        primary = getattr(self, setting, "") or ""
+        if not primary:
+            return ()
+        return (PlatformSlot(PRIMARY_SLOT, {}),
+                *self.platform_extra_accounts().get((provider or "").lower(), ()))
+
+    def platform_extra_accounts(self) -> dict[str, tuple[PlatformSlot, ...]]:
+        """`TREG_PLATFORM_ACCOUNTS` by provider, whether or not the primary key is set."""
+        return {provider: tuple(PlatformSlot(label, values) for label, values in sorted(accounts.items()))
+                for provider, accounts in _parse_platform_pools(self.platform_accounts).items()}
+
+    def platform_credential(self, setting: str, account: str | None) -> str:
+        """The value a `platform_setting` binding injects. Without an account, the deployment's
+        own field: the primary account. With one (`<provider>/<label>`), that account's value, or
+        "" when it is not configured: another account's credential would act on objects that exist
+        only on the named one."""
+        if account is None:
+            return getattr(self, setting, "") or ""
+        provider, _, label = account.partition("/")
+        values = _parse_platform_pools(self.platform_accounts).get(provider, {}).get(label, {})
+        return values.get(setting, "")
+
+    def platform_credential_values(self, setting: str) -> tuple[str, ...]:
+        """Every value `setting` holds across treg's accounts: what error-body masking hides."""
+        own = (getattr(self, setting, "") or "").strip()
+        pooled = (values.get(setting, "")
+                  for accounts in _parse_platform_pools(self.platform_accounts).values()
+                  for values in accounts.values())
+        return tuple(dict.fromkeys(v for v in (own, *pooled) if v))
+
     def platform_key_for(self, provider: str) -> str | None:
         """treg's own key for `provider`, or None if tier 4 must not serve it. BOTH conditions have to
         hold — the provider is allow-listed AND a key is configured — so neither half alone can start
@@ -787,6 +1043,22 @@ class Settings(BaseSettings):
         )
 
     @property
+    def paused_providers_set(self) -> frozenset[str]:
+        """Provider service ids this deployment has paused."""
+        return frozenset(
+            key.strip().lower() for key in self.paused_providers.split(",") if key.strip()
+        )
+
+    def paused_provider_message(self, service: str, display_name: str) -> str:
+        """What a caller or a user is told about a paused provider."""
+        if self.paused_provider_messages.strip():
+            custom = json.loads(self.paused_provider_messages).get(service)
+            if custom:
+                return custom.strip()
+        return (f"{display_name} is temporarily paused on treg. Your existing connection is saved "
+                "and starts to work again when it is resumed. No action is needed from you.")
+
+    @property
     def expose_dev_code(self) -> bool:
         """Dev login codes may be returned in the response ONLY on a local sqlite database — never on a
         real (Postgres) deploy. So even a stray TREG_EMAIL_DEV_MODE=true in production can't leak codes."""
@@ -794,8 +1066,7 @@ class Settings(BaseSettings):
 
     # Transactional email via Resend (OTP sign-in codes + team invitations). Empty key = no real
     # send (dev mode still returns the code; prod without a key silently skips the send). From must
-    # be a Resend-verified domain — treg.to is verified (DKIM + SPF); treg.superdesign.dev remains
-    # verified as a fallback.
+    # be a Resend-verified domain.
     resend_api_key: str = ""
     email_from: str = "tools-registry <no-reply@treg.to>"
 

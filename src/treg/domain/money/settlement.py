@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import json
 import math
+import re
 from typing import Any
 
 from ..asynctasks import json_path as _path
@@ -133,10 +134,10 @@ def derive_basis(
     if cost.get("table") or cost.get("settle") == "usage":
         fallback = _micro(float(cost["fallback"]["value"]), unit_micro)
         if cost.get("settle") == "usage":
-            # Reserve what the rate card says THIS request costs, not the matrix ceiling: the
-            # ceiling made a $0.05 call demand a $6 balance. The provider's reported cost settles
-            # and may exceed the reserve; the ledger takes the difference from the balance, and the
-            # next reserve is the gate. reconcile lists every overrun (`async_task_settlement`).
+            # Reserve what the rate card says THIS request costs, not the matrix ceiling. The
+            # provider's reported cost settles and may exceed the reserve; the ledger takes the
+            # difference from the balance, and the next reserve is the gate. reconcile lists every
+            # overrun (`async_task_settlement`).
             amount = {"kind": "usage", **dict(cost["usage"])}
             if amount.get("unit") == "usd":
                 amount["unit_micro"] = 1_000_000
@@ -153,8 +154,10 @@ def derive_basis(
         return {"when": "terminal" if terminal else "response", "amount": amount,
                 "fallback_micro": fallback,
                 "reserve_micro": reserve}
+    # A fixed per-call price on an async task is owed for the finished answer: the hold waits for
+    # it, and a task that never finishes is released like any other.
     return {
-        "when": "response",
+        "when": "terminal" if terminal and cost.get("type") == "per_call" else "response",
         "amount": {"kind": "observed"},
         "fallback_micro": max(0, int(response_estimate_micro)),
         "reserve_micro": max(0, int(response_estimate_micro)),
@@ -162,6 +165,9 @@ def derive_basis(
 
 
 def _usage_number(value: object) -> float | None:
+    # A plain decimal string ("0.500") counts too.
+    if isinstance(value, str) and re.fullmatch(r"\d+(?:\.\d+)?", value.strip()):
+        value = float(value)
     if isinstance(value, (int, float)) and not isinstance(value, bool) and math.isfinite(value) \
             and value >= 0:
         return float(value)
@@ -239,7 +245,9 @@ def settle(basis: dict, evidence: dict[str, Any]) -> int:
         # rate-card estimate), not the ceiling. The worker marks the row for review.
         return max(0, int(basis.get("reserve_micro") or 0))
     if kind == "observed":
-        observed = evidence.get("observed_micro")
-        if isinstance(observed, int) and not isinstance(observed, bool) and observed >= 0:
-            return observed
+        # The provider's report on the answer itself, else its report on the submission (an
+        # async task that is billed when submitted, frozen by `defer_submission`).
+        for observed in (evidence.get("observed_micro"), basis.get("submission_charge_micro")):
+            if isinstance(observed, int) and not isinstance(observed, bool) and observed >= 0:
+                return observed
     return max(0, int(basis.get("fallback_micro") or 0))

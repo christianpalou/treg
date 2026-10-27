@@ -45,10 +45,10 @@ from pathlib import Path
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent / "src"))
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
-from scripts.find_bench import _frac, _provider_display, cached_apis, judge_cost, warm_semantic  # noqa: E402
-from treg.application import catalog_find, catalog_search  # noqa: E402
-from treg.config import get_settings  # noqa: E402
-from treg.domain.catalog import store  # noqa: E402
+from scripts.find_bench import _frac, _provider_display, cached_apis, judge_cost, warm_semantic
+from treg.application import catalog_find, catalog_search
+from treg.config import get_settings
+from treg.domain.catalog import store
 
 PAGES = ("v2", "baseline", "judged")
 
@@ -98,7 +98,7 @@ async def answer(case: Case, cat: store.Catalog, limit: int) -> Answer:
     r = await catalog_find.recall_with_meaning(case.q, cat, _provider_display)
     found = await catalog_find.answer_v2(case.q, r.cands, cat, _provider_display,
                                          timeout_s=float(get_settings().typesafe_timeout_s),
-                                         not_task=catalog_find.KEYWORD, keyword_rows=False)
+                                         not_task=catalog_find.KEYWORD, keyword_rows=False, focus=r.focus)
     served = catalog_search.serve(found, cat, limit, hub=[], steer=True)
     if served is None:
         rows, jobs = list(case.baseline_ids[:limit]), []
@@ -173,7 +173,7 @@ def _diff(run: dict, baseline: dict) -> None:
             continue
         if (old["verdict"], old.get("job_hit")) != (row["verdict"], row.get("job_hit")):
             flips.append((cid, row, old))
-    for cid, row, old in sorted(flips, key=lambda t: t[1]["q"]):
+    for _cid, row, old in sorted(flips, key=lambda t: t[1]["q"]):
         what = ("FIXED" if row.get("job_hit") and not old.get("job_hit") else
                 "BROKE" if old.get("job_hit") and not row.get("job_hit") else "MOVED")
         print(f"  {what} {row['q'][:60]!r:<64} {old['verdict']:<9} -> {row['verdict']}")
@@ -212,6 +212,8 @@ def bench(cases: list[Case], *, limit: int = 8, cache: Path | None = None, concu
 
 
 def main(argv: list[str] | None = None) -> None:
+    from treg import bootstrap
+    bootstrap.configure_provider_labels()   # provider display names, as the server wires them
     ap = argparse.ArgumentParser(description=__doc__.split("\n")[0])
     ap.add_argument("--cases", type=Path, required=True, help="JSONL of agent searches with what they called")
     ap.add_argument("--limit", type=int, default=8, help="the page size scored (MCP's default is 8)")

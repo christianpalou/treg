@@ -53,6 +53,7 @@ async def _modern_rpc(client: AsyncClient, method: str, params=None, token: str 
         "Authorization": f"Bearer {token}",
         "MCP-Protocol-Version": "2026-07-28",
         "MCP-Method": method,
+        **({"MCP-Name": body_params["name"]} if "name" in body_params else {}),
     })
 
 
@@ -122,6 +123,32 @@ async def test_the_server_lists_the_shared_tools(clients):
     # The hub tools are listed only where the hub is on for the caller (test_hub_tools_are_listed_*).
     assert names == {"catalog_search", "catalog_get", "call", "call_media", "resources_list",
                      "balance", "my_tools", "catalog_request", "feedback", "review"}
+
+
+async def test_openai_clients_get_no_review_tool_or_review_instruction(clients):
+    """OpenAI's plugin review reads an agent-initiated `review` as analytics collection, so its
+    clients (ChatGPT and the reviewer: openai-mcp/, Codex: codex-mcp-client/) get no review tool and
+    no review sentence. Every other client keeps both."""
+    token = clients.headers["X-Treg-Token"]
+
+    async def surface(ua: str):
+        headers = {**MCP_HEADERS, "Authorization": f"Bearer {token}", "User-Agent": ua}
+        async with mcp_session(clients) as c:
+            init = await c.post("http://localhost/mcp/", headers=headers, json={
+                "jsonrpc": "2.0", "id": 1, "method": "initialize",
+                "params": {"protocolVersion": "2025-06-18", "capabilities": {},
+                           "clientInfo": {"name": "t", "version": "1"}}})
+            listed = await c.post("http://localhost/mcp/", headers=headers,
+                                  json={"jsonrpc": "2.0", "id": 2, "method": "tools/list"})
+        return (init.json()["result"].get("instructions") or "",
+                {t["name"] for t in listed.json()["result"]["tools"]})
+
+    for ua in ("openai-mcp/1.0.0", "codex-mcp-client/0.160.1"):
+        instructions, names = await surface(ua)
+        assert "review" not in names and "catalog_search" in names, ua
+        assert "review(" not in instructions and "catalog_search" in instructions, ua
+    instructions, names = await surface("claude-code/2.1.291 (cli)")
+    assert "review" in names and "review(" in instructions
 
 
 async def _tool_names(clients, token):
@@ -379,6 +406,9 @@ async def test_one_team_cannot_read_another_teams_tools(clients):
     assert names_a, f"org A saw no tools at all — the assertion below would pass for free: {seen_a}"
     assert "a-only-tool" in names_a
     assert "a-only-tool" not in names_b, f"org B saw org A's tool: {seen_b}"
+    # Each team also learns its own label for shared provider accounts, and only its own.
+    assert seen_a.get("team_label", "").startswith("team-") and seen_b.get("team_label", "").startswith("team-")
+    assert seen_a["team_label"] != seen_b["team_label"]
 
 
 async def test_call_refuses_an_endpoint_that_does_not_exist(clients):
@@ -436,10 +466,12 @@ async def test_every_tool_declares_what_it_can_do(clients):
         a = ann[name]
         assert a.read_only_hint is False
         assert a.destructive_hint is True and a.open_world_hint is True
-    # catalog_request writes (a row on treg itself) but touches nothing upstream and spends nothing.
-    a = ann["catalog_request"]
-    assert a.read_only_hint is False
-    assert a.destructive_hint is False and a.open_world_hint is False
+    # These write nothing upstream and spend nothing, but their text reaches the treg team (and a
+    # review's reason may be quoted on a public catalog page), so they are open world.
+    for name in ("catalog_request", "feedback", "review"):
+        a = ann[name]
+        assert a.read_only_hint is False, name
+        assert a.destructive_hint is False and a.open_world_hint is True, name
 
 
 async def test_the_domain_challenge_is_404_until_configured(clients):
@@ -701,6 +733,36 @@ async def test_a_notification_and_ping_pass_without_a_token(clients):
         r = await c.post("http://localhost/mcp/", headers=MCP_HEADERS,
                          json={"jsonrpc": "2.0", "id": 1, "method": "ping"})
         assert r.status_code == 200, r.text
+
+
+async def test_a_non_POST_is_challenged_like_a_POST_then_refused_not_streamed(clients):
+    """Issue #1064: a GET probe used to open an SSE stream that never answered."""
+    from treg.domain.identity import mcp_oauth
+    dead = mcp_oauth.make_access_token(user_id=7, org_id=3, audience=mcp_oauth.mcp_resource_url(),
+                                       scope="treg:call", ttl=-60)
+    live = mcp_oauth.make_access_token(user_id=7, org_id=3, audience=mcp_oauth.mcp_resource_url(),
+                                       scope="treg:call")
+    sse = {"Accept": "text/event-stream"}
+    async with mcp_session(clients) as c:
+        missing = await c.get("http://localhost/mcp/", headers=sse)
+        expired = await c.get("http://localhost/mcp/",
+                              headers={**sse, "Authorization": f"Bearer {dead}"})
+        credentialed = [await c.get("http://localhost/mcp/",
+                                    headers={**sse, "Authorization": f"Bearer {token}"})
+                        for token in (live, "treg_per_org_token")]
+        delete = await c.delete("http://localhost/mcp/")
+        head = await c.head("http://localhost/mcp/", headers={"Authorization": f"Bearer {live}"})
+    assert missing.status_code == 401, missing.text
+    assert "resource_metadata=" in missing.headers["www-authenticate"]
+    assert 'error="invalid_token"' not in missing.headers["www-authenticate"]
+    assert expired.status_code == 401, expired.text
+    assert 'error="invalid_token"' in expired.headers["www-authenticate"]
+    for r in credentialed:
+        assert r.status_code == 405, r.text
+        assert r.headers["allow"] == "POST"
+        assert r.headers["content-type"] == "application/json"
+    assert delete.status_code == 401
+    assert head.status_code == 405 and head.headers["allow"] == "POST"
 
 
 async def test_auth_body_replay_waits_for_the_real_disconnect_on_a_long_response() -> None:
@@ -1166,6 +1228,66 @@ async def test_catalog_query_arrays_use_the_endpoints_declared_wire_encoding(mon
     assert captured["params"] == [("ad_reached_countries", '["US"]')]
 
 
+async def test_call_sends_form_urlencoded_body_when_endpoint_specifies_bodytype_form(monkeypatch):
+    """Endpoints with `input.bodyType: form` must send the body as application/x-www-form-urlencoded,
+    not JSON. JustOneAPI's weixin-search-article endpoints failed with HTTP 415 "Unsupported media
+    type" because treg sent JSON bodies to an upstream that required form-urlencoded."""
+    from treg.domain.catalog import store as cs
+    from treg import mcp as _mcp
+
+    cat = cs.load()
+    ep = cat.by_id.get("justoneapi.x.weixin-search-article-v1")
+    assert ep is not None, "test endpoint must exist in catalog"
+    assert (ep.get("input") or {}).get("bodyType") == "form", "test relies on bodyType: form"
+
+    captured = {}
+
+    class _Client:
+        headers: dict = {}
+
+        async def request(self, method, path, **kwargs):
+            import httpx
+            captured.update(method=method, path=path, **kwargs)
+            return httpx.Response(200, json={"code": 0, "data": []}, request=httpx.Request(method, path))
+
+    from contextlib import asynccontextmanager
+
+    @asynccontextmanager
+    async def _api(_token):
+        yield _Client()
+
+    async def _org(_client):
+        return 1, "team", None
+
+    monkeypatch.setattr(_mcp, "_api", _api)
+    monkeypatch.setattr(_mcp, "_resolve_org", _org)
+    ctx = type("Ctx", (), {"headers": {"authorization": "Bearer test"}})()
+    await _mcp.call("justoneapi.x.weixin-search-article-v1", params={
+        "keyword": "人工智能",
+        "publishTimeType": "ALL",
+        "sortType": "COMPREHENSIVE",
+        "currentPage": "1",
+        "offset": "0",
+    }, ctx=ctx)
+
+    # The body must be form-urlencoded, not JSON
+    assert "content" in captured, "body must be sent as raw content, not kw['json']"
+    assert "json" not in captured, "must not send as JSON when bodyType is form"
+
+    # Verify the Content-Type header
+    headers = captured.get("headers", {})
+    ct = headers.get("content-type", headers.get("Content-Type", ""))
+    assert ct == "application/x-www-form-urlencoded", f"wrong Content-Type: {ct}"
+
+    # Verify the body is properly form-encoded
+    from urllib.parse import parse_qs
+    body = captured["content"].decode()
+    parsed = parse_qs(body)
+    assert parsed.get("keyword") == ["人工智能"]
+    assert parsed.get("publishTimeType") == ["ALL"]
+    assert parsed.get("currentPage") == ["1"]
+
+
 async def test_an_unset_query_param_is_omitted_rather_than_sent_as_None(clients):
     """`None` means "no value", and `?limit=None` is not that — it is a string an upstream parses."""
     assert (await clients.post("/tools", json={"name": "echo", "base_url": "http://upstream"})).status_code == 200
@@ -1189,8 +1311,9 @@ async def test_search_survives_missing_a_few_words_of_an_agent_sentence(clients)
     from treg.domain.catalog import store as cs
     cat = cs.load()
     # the two logged SearchMiss queries, verbatim
-    # Enrichlayer and TheirStack each add a relevant job-search result ahead of older tail matches.
-    rows, total = cs.search("company job postings hiring open jobs linkedin", cat, 9)
+    # Enrichlayer, a Crawl4AI recipe and TheirStack add relevant job-search results ahead of the
+    # older tail matches.
+    rows, total = cs.search("company job postings hiring open jobs linkedin", cat, 10)
     assert total > 0
     assert {"apollo.companies.jobs", "apify.linkedin.search.jobs", "enrichlayer.jobs.search",
             "theirstack.companies.jobs"} <= {ep["id"] for ep, _ in rows}
@@ -1216,7 +1339,7 @@ async def test_search_survives_missing_a_few_words_of_an_agent_sentence(clients)
     # function words are dropped before the miss allowance is computed, so they cannot crowd out
     # the words that select ("on", "this" are not evidence about any endpoint)
     rows, _ = cs.search("trending repositories on github this week", cat, 3)
-    assert rows and rows[0][0]["id"] == "scrapecreators.x.v1-github-trending-repositories"
+    assert rows and rows[0][0]["capability"] == "github.trending.repositories"
     # single letters can never select: "K&L" must not let k + l decide admission, and the company
     # job ("enrich by name") must lead instead of 67 rows of noise (logged miss, 2026-08-20)
     rows, total = cs.search("K&L Gates company lookup", cat, 8)
@@ -1338,8 +1461,11 @@ async def test_the_SEARCH_TOOL_itself_ranks_on_evidence_not_just_the_helper(clie
     call sites and every ranking test would still have passed, because they call the helper
     directly. This one goes through the MCP tool with real rows in the database."""
     from treg.domain.catalog import stats as endpoint_stats
+    from treg.application import catalog_stats
     from treg.infra.db import session_maker
     from treg.models import CallRecord
+    from treg.timeutil import utcnow_naive
+    from datetime import timedelta
 
     broken = "apify.tiktok-ads.library.search"  # earlier in file order: rerank must move it
     good = "tikhub.x.tiktok-ads-search-ads"
@@ -1352,6 +1478,7 @@ async def test_the_SEARCH_TOOL_itself_ranks_on_evidence_not_just_the_helper(clie
                               status_code=405, endpoint_id=broken, duration_ms=100))
         await db.commit()
     assert endpoint_stats.MIN_SAMPLES <= 5
+    assert (await catalog_stats.refresh(session_maker, now=utcnow_naive() + timedelta(minutes=2)))["caught_up"]
 
     token = (await clients.post("/users", json={"email": "ranker@superdesign.dev"})).json()["token"]
     async with mcp_session(clients) as c:
@@ -1366,7 +1493,7 @@ async def test_the_SEARCH_TOOL_itself_ranks_on_evidence_not_just_the_helper(clie
 
 
 
-from test_marketplace_call import platform_on  # noqa: F401,E402 — tier 4 on for the check run
+from test_marketplace_call import platform_on  # noqa: E402 — tier 4 on for the check run
 
 
 # ---------------------------------------------------------------------------------------------
@@ -1430,7 +1557,7 @@ async def _overflow_rescued(monkeypatch, price_cents: float = 0.3):
     return seen
 
 
-async def test_a_call_served_by_the_overflow_relay_says_so_and_prices_it(clients, overflow_on, monkeypatch):  # noqa: F811 - fixture imported above
+async def test_a_call_served_by_the_overflow_relay_says_so_and_prices_it(clients, overflow_on, monkeypatch):
     token = clients.headers["X-Treg-Token"]
     seen = await _overflow_rescued(monkeypatch)
     async with mcp_session(clients) as c:
@@ -1444,7 +1571,7 @@ async def test_a_call_served_by_the_overflow_relay_says_so_and_prices_it(clients
     assert "real price" in hint and len(seen) == 1
 
 
-async def test_a_direct_call_carries_no_served_via(clients, platform_on):  # noqa: F811 - fixture imported above
+async def test_a_direct_call_carries_no_served_via(clients, platform_on):
     token = clients.headers["X-Treg-Token"]
     async with mcp_session(clients) as c:
         out = await _call_tool(c, "call", {"endpoint_id": "tikhub.tiktok.video.comments",
@@ -1453,7 +1580,7 @@ async def test_a_direct_call_carries_no_served_via(clients, platform_on):  # noq
     assert "served_via" not in out and "overflow" not in (out.get("hint") or "")
 
 
-async def test_the_directory_surface_discloses_the_relay_the_same_way(clients, overflow_on, monkeypatch):  # noqa: F811 - fixture imported above
+async def test_the_directory_surface_discloses_the_relay_the_same_way(clients, overflow_on, monkeypatch):
     """`/mcp/v2/` builds the same result through `_call_impl`; reviewed against both on purpose."""
     from test_mcp_directory import _call_tool as _directory_call, directory_session
 
@@ -1468,7 +1595,7 @@ async def test_the_directory_surface_discloses_the_relay_the_same_way(clients, o
     assert "overflow relay (orthogonal)" in (out.get("hint") or "")
 
 
-async def test_catalog_get_shows_what_a_FREE_endpoint_bills_through_the_relay(clients, overflow_on):  # noqa: F811 - fixture imported above
+async def test_catalog_get_shows_what_a_FREE_endpoint_bills_through_the_relay(clients, overflow_on):
     """The price an agent quotes before calling must include the one it may actually pay."""
     from test_capacity_overflow import APOLLO_SEARCH_EP, APOLLO_SEARCH_PATH
     from test_mcp_directory import _call_tool as _directory_call, directory_session
@@ -1486,3 +1613,102 @@ async def test_catalog_get_shows_what_a_FREE_endpoint_bills_through_the_relay(cl
         assert out["overflow_price_unit"] == "call"
         assert out["endpoint"]["overflow_price_usd"] == 0.002
         assert any("overflow relay (orthogonal)" in h for h in out["hints"])
+
+
+async def test_a_lone_surrogate_in_an_upstream_body_still_returns_the_paid_answer(clients, monkeypatch):
+    """A JavaScript scraper that cuts a LinkedIn post mid-pair sends `"\\ud835"`. The SDK's pydantic
+    dump refused it, so the agent got "Error serializing to JSON" and lost the body, call_id and cost
+    of a call it was charged for. Only the unpaired half becomes U+FFFD; the paired letter survives."""
+    from treg.application.call import service as call_service
+    from treg.application.call.types import UpstreamResponse
+    from treg.config import get_settings
+
+    monkeypatch.setenv("TREG_PLATFORM_KEY_HARVESTAPI", "PLATFORM-HARVESTAPI")
+    monkeypatch.setenv("TREG_PLATFORM_PROVIDERS", "harvestapi")
+    get_settings.cache_clear()
+
+    async def relay(*args, **kwargs):
+        async def stream():
+            yield b'{"elements":[{"content":"\\ud835\\udc01old \\ud835 cut"}]}'
+
+        async def close():
+            return None
+
+        return UpstreamResponse(200, ((b"content-type", b"application/json"),), stream(), close)
+
+    monkeypatch.setattr(call_service, "relay", relay)
+    token = clients.headers["X-Treg-Token"]
+    try:
+        async with mcp_session(clients) as c:
+            await _rpc(c, "initialize", {"protocolVersion": "2025-06-18", "capabilities": {},
+                                         "clientInfo": {"name": "t", "version": "1"}}, token)
+            r = await _rpc(c, "tools/call", {"name": "call", "arguments": {
+                "endpoint_id": "harvestapi.linkedin.post.search", "params": {"search": "film"}}}, token)
+    finally:
+        get_settings.cache_clear()
+    result = r.json()["result"]
+    assert result["isError"] is False, result
+    out = result["structuredContent"]
+    assert out["status"] == 200
+    assert out["body"] == {"elements": [{"content": "\U0001d401old � cut"}]}
+    assert out["call_id"] and out["cost_usd"] > 0
+
+
+async def test_catalog_get_gives_the_caller_its_own_team_values(clients, monkeypatch):
+    """MCP catalog_get on a row with team_label fields returns `your_values` for the calling team,
+    and names that team on the internal read, so a person in several teams still gets them."""
+    from treg.application.call import resolve as call_resolution
+    from treg.domain.catalog import store as catalog_store
+    cat = catalog_store.load()
+    ep = dict(cat.by_id["crawl4ai.watch.list"])
+    monkeypatch.setitem(cat.by_id, "crawl4ai.watch.list", ep)
+    token = (await clients.post("/users", json={"email": "watcher@superdesign.dev"})).json()["token"]
+    clients.headers["X-Treg-Token"] = token
+    org_id = (await clients.get("/orgs")).json()[0]["org_id"]
+    async with mcp_session(clients) as c:
+        out = await _call_tool(c, "catalog_get", {"endpoint_id": "crawl4ai.watch.list"}, token=token)
+    assert out["endpoint"]["your_values"] == {"queryParams.agent": call_resolution.team_label(org_id)}
+
+
+async def test_tool_called_names_the_mcp_host(clients, monkeypatch, posthog_events):
+    """An MCP call's `tool_called` names its host: the inbound User-Agent always, and `clientInfo.name`
+    when the request carries it (2026-07-28+; an older client reports it at `initialize` alone, which
+    the stateless transport does not keep)."""
+    from treg.application.call import service as call_service
+    from treg.application.call.types import UpstreamResponse
+    from treg.config import get_settings
+
+    monkeypatch.setenv("TREG_PLATFORM_KEY_HARVESTAPI", "PLATFORM-HARVESTAPI")
+    monkeypatch.setenv("TREG_PLATFORM_PROVIDERS", "harvestapi")
+    get_settings.cache_clear()
+    monkeypatch.setattr(get_settings(), "posthog_key", "phc_test_suite", raising=False)
+
+    async def relay(*args, **kwargs):
+        async def stream():
+            yield b'{"elements":[]}'
+
+        async def close():
+            return None
+
+        return UpstreamResponse(200, ((b"content-type", b"application/json"),), stream(), close)
+
+    monkeypatch.setattr(call_service, "relay", relay)
+    token = clients.headers["X-Treg-Token"]
+    args = {"name": "call", "arguments": {
+        "endpoint_id": "harvestapi.linkedin.post.search", "params": {"search": "film"}}}
+    try:
+        async with mcp_session(clients) as c:
+            c.headers["User-Agent"] = "claude-code/2.1.0 (cli)"
+            await _rpc(c, "initialize", {"protocolVersion": "2025-06-18", "capabilities": {},
+                                         "clientInfo": {"name": "claude-code", "version": "2.1.0"}}, token)
+            legacy = await _rpc(c, "tools/call", args, token)
+            modern = await _modern_rpc(c, "tools/call", args, token)
+        events = await posthog_events()
+    finally:
+        get_settings.cache_clear()
+    assert legacy.json()["result"]["isError"] is False, legacy.json()
+    assert modern.json()["result"]["isError"] is False, modern.json()
+    old, new = [e["properties"] for e in events]
+    assert old["client"] == "mcp" and old["user_agent"].startswith("python-httpx/")
+    assert old["mcp_user_agent"] == "claude-code/2.1.0 (cli)" and old["mcp_client"] is None
+    assert new["mcp_user_agent"] == "claude-code/2.1.0 (cli)" and new["mcp_client"] == "test"

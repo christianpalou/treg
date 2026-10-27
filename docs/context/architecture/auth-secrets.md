@@ -57,6 +57,11 @@ Linkup uses a pasted Bearer key at `https://api.linkup.so`. Its free internal
 exposing the account balance as a catalog tool. `TREG_PLATFORM_KEY_LINKUP` supplies the optional
 shared binding; a team's own key wins and remains unmetered by treg.
 
+Crawl4AI uses a pasted Bearer key (`sk_live_…`) at `https://api.crawl4ai.com`. The free
+`GET /v1/billing/balance` validates a connected key (a bogus key answers 401) and supplies capacity
+evidence; it trails the per-call `x-c4-balance` header by about a minute. `TREG_PLATFORM_KEY_CRAWL4AI`
+supplies the optional shared binding; a team's own key wins and remains unmetered by treg.
+
 Spider uses a pasted Bearer key at `https://api.spider.cloud`. The free internal
 `GET /data/credits` probe validates connected keys and supplies capacity evidence.
 `TREG_PLATFORM_KEY_SPIDERCLOUD` supplies the optional shared binding; the own-key-first ladder
@@ -89,6 +94,15 @@ invalid-number sandbox fixture. The typed `probe_cost_micro=15000` marks the fir
 the connect dialog renders the warning from that field, and provisioning deliberately omits it from
 the tool health check so later health runs cannot spend the team's provider wallet.
 `TREG_PLATFORM_KEY_TRESTLEIQ` supplies the optional shared binding; a team's own key still wins.
+
+`HLRLOOKUP` reuses the Adyntel pattern: `api_key` and `api_secret` are both `location: json`
+bindings, and the relay has no HLR Lookup branch. HLR Lookup does not sign or hash the raw body, so
+JSON re-serialization is safe. The free `POST /apiv2/balance` probe answers 401 when either half of
+the pair is wrong, but 400 to a key sent alone, valid or not. The first connect step therefore
+stores a team key unchecked (declared `probe_deferred_statuses=(400,)`), and adding the secret does
+not re-probe the pair: a wrong team pair surfaces as the provider's unbilled 401 on the first call.
+Tier 4 reads `TREG_PLATFORM_KEY_HLRLOOKUP` and `TREG_PLATFORM_KEY_HLRLOOKUP_SECRET`
+(`platform_extra_setting`), so a team's own pair never rides with treg's secret.
 
 `LIMADATA` uses a pasted raw `x-api-key` header. Its free connection probe sends an invalid empty
 web-search body: the assigned key returns HTTP 400 and a bogus key returns 401. The real local
@@ -270,12 +284,32 @@ hit it live). Now the method rides in the blob and `refresh()` honors it; a lega
 field gets body auth, then ONE retry with Basic on a 4xx, and stamps whichever worked — existing
 broken connections self-heal on their next call, no migration.
 
+The blob also snapshots `client_secret` and `token_uri`, and a team member can rewrite the blob. So
+for treg's own apps `ensure_fresh` does not trust either: when the `Secret` row's `provider` is a
+registry provider and the blob's `client_id` is the one this deployment configures for that provider
+profile, `oauth_providers.platform_refresh_blob` substitutes the current env secret **and** the
+profile's own `token_uri`, and neither is written back (the stored blob keeps its own values). Any other
+blob, including one that merely names treg's `client_id`, refreshes with only what it stores. Rotating a
+treg app secret is therefore an env change plus a deploy on every service that refreshes; the old
+secret can be deleted at the provider as soon as that deploy is live.
+
+**Meta App Secret Proof.** treg's Meta app requires App Secret Proof, so Graph refuses any server
+call whose user or Page token is not paired with `appsecret_proof` = HMAC-SHA256(app secret, token)
+(400, code 100). Profiles that ride that app declare `appsecret_proof=True` (`facebook`, `meta-ads`,
+Instagram's `facebook-page`), and `oauth_providers.appsecret_proof` computes one only when the
+token's blob names the `client_id` this deployment configures for that profile and the request goes
+to the profile's own API or discovery host. Every request that sends such a token carries it: the
+relay and the health probe (`connection_appsecret_proof`, over the token the binding injects, so a
+Page call is proved with the Page token) and the account picker, Page-token lookup and resource
+setup in `application/connect.py`. Token exchange and refresh send the app secret itself and need no
+proof. A team's own Meta app never gets one computed with treg's secret.
+
 **Connect flow (mint the first token):** `consent_url(pending)` builds the provider consent URL
 (default `access_type=offline` + `prompt=consent` so a refresh token comes back); `exchange_code(pending,
 code, client)` trades the auth code for tokens and returns a self-refreshable blob. Both honor
 per-provider quirks carried on the `PendingOAuth` (snapshotted from the registry entry, below): a provider's
 `auth_params` **replaces** the Google defaults entirely (LinkedIn/X/TikTok/Meta reject `access_type`);
-PKCE (`pkce_challenge()` — X requires a verifier); `token_endpoint_auth_method` = `client_secret_basic`
+PKCE (`pkce_challenge()` — X requires a verifier; TikTok's `pkce_loopback_hex` sends a hex SHA-256 challenge, stored in `auth_params`, only when `public_url` is localhost, because TikTok treats a localhost redirect as a desktop app); `token_endpoint_auth_method` = `client_secret_basic`
 (X puts the secret in HTTP Basic, not the body); the `client_id_param`/`scope_separator` dialect; and
 `long_lived_exchange` (`_extend_meta_token()` swaps Meta's ~1-hour code-exchange token for its ~60-day
 one, non-fatal on failure). Driven by the `/oauth/*` endpoints ([interface/api.md](../interface/api.md)).
@@ -295,6 +329,11 @@ Search query: a valid key receives an unbilled 400 validation response, while an
 receives 401. `TREG_PLATFORM_KEY_OCTEN` supplies the optional shared binding through the
 typed setting; a team's own key remains first and unmetered. No account balance endpoint is
 documented for this credential.
+
+Parallel is an API-key provider with an `x-api-key` binding. Its connection probe reads the free
+`GET /v1/monitors/stats`: a valid key receives 200 and an invalid key 401. Its balance route takes
+an Account API OAuth token, not this key, so it is not the probe. `TREG_PLATFORM_KEY_PARALLEL`
+supplies the optional shared binding; a team's own key remains first and unmetered.
 
 Connecting a provider persists its API `base_url` and indexed `host` on the team's tool. Changing
 the registry's base URL affects new connections and direct catalog calls, but an existing named
@@ -331,12 +370,19 @@ request. For Instagram, that request subscribes the Page to the app's
 `messages,messaging_postbacks` fields. The setup is scope-gated, so read/post-only connections do
 not attempt it. Provider discovery and setup HTTP calls run after the read database session closes;
 the result is written in a new short transaction. Resource listings and
-connection views never include the Page token; existing Instagram connections must reconnect or
-reselect their account once to populate it. The token and object id are separate concerns: Instagram
+connection views never include the Page token; existing connections must reselect their account
+once to populate it. The token and object id are separate concerns: Instagram
 profile/media operations still target the Instagram account id, while Facebook-login inbox sync is
 the Page messaging surface—`/{page_id}/conversations?platform=instagram` for listing and
 `/{page_id}/messages` for replies. Calling the conversations edge with the Instagram account id
 produces Meta error `(#3)` despite a valid Page token.
+Facebook Pages uses the same lookup without the setup request: every Page edge rejects the user
+token (code 190 / subcode 2069032), so selecting a Page stores that Page's token as
+`page_access_token`, and one Facebook connection acts on one Page. Until a resource is selected,
+`_provider_bindings` binds the root `access_token`, so the probe and the picker work before the
+derived token exists. A reconnect replaces the whole blob, so the callback unselects the resource
+and, after its commit, derives the token again from the new grant. When the new grant no longer
+reaches that resource, the connection stays on the root token and reports `setup_required`.
 Google Search Console's hand-written tool example calls out its distinct direct-tool convention:
 substitute `{site_url}` with a value encoded exactly once (`sc-domain%3Aexample.com`), and never encode
 again a property identifier returned by the sites list.
@@ -460,6 +506,9 @@ module symbols:
   examples (marker `stamped: resource`, so re-picking replaces instead of piling up).
 - Post-connect helpers the dashboard/CLI drive: resource **discovery** (`supports_discovery`,
   `discover_*` — which site/property/account this connection acts on), row **enrichment**.
+  `list_connection_resources` turns YouTube's `quotaExceeded` discovery response into the stable
+  `youtube_quota_exceeded` error code, so the channel picker can explain the temporary limit without
+  showing Google's raw error text.
   Discovery can walk a SECOND listing (`discover_extra_path` + `discover_extra_list_paths`): Meta's
   Business Manager owns assets on the user's behalf, so an agency member sees `[]` from
   `/me/accounts` for exactly the Pages/Instagram accounts they manage all day — the Business walk
@@ -516,6 +565,19 @@ silent death (the LinkedIn shape). `_view()` now carries `provider`/`refreshable
 so the caller sees both axes. `_probe()` merges a binding's query onto the URL with `copy_add_param` rather
 than passing `params=` (httpx would otherwise **replace** a probe path's own query string, e.g. YouTube's
 `?part=snippet&mine=true`, and fail a healthy credential).
+
+A provider in `TREG_PAUSED_PROVIDERS` is skipped whole: no refresh, no probe, no verdict, and no
+expiry alert. A paused upstream would fail every check, and the connection must be intact when the
+pause is lifted. No job deletes or disables a connection after failed checks; removal is a user's
+disconnect only.
+
+## treg's own accounts
+
+A provider's tier-4 key is `TREG_PLATFORM_KEY_<PROVIDER>`; a paired half has its own setting
+(`TREG_PLATFORM_KEY_TOMBA_SECRET`). `TREG_PLATFORM_ACCOUNTS` adds more accounts behind a provider as
+JSON from provider to labelled account settings, and a malformed value refuses to start. These
+values live only in the environment: a binding names a setting and, with several accounts, an
+account label, never a value ([proxy model](proxy-model.md)).
 
 ## Storage / security posture (MVP)
 TLS-only in transit (paste/upload over https, like GitHub/Vercel secrets); Fernet at rest. Per-membership

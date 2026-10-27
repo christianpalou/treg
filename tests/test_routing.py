@@ -6,6 +6,7 @@ from __future__ import annotations
 import asyncio
 from copy import deepcopy
 import json
+from datetime import timedelta
 from types import SimpleNamespace
 
 import httpx
@@ -19,6 +20,7 @@ from treg.application.call import overflow as call_overflow
 from treg.application.call import resolve as call_resolve
 from treg.application.call import route as call_route
 from treg.application.call import service as call_service
+from treg.application import catalog_stats
 from treg.application.call.types import ResolutionFailed, UpstreamResponse
 from treg.config import get_settings
 from treg.infra.db import session_maker
@@ -28,6 +30,7 @@ from treg.domain.catalog.routing.contracts import canonical_identity
 from treg.domain.catalog.routing.plan import Candidate, cost_at, rank
 from treg.infra.catalog_observations import CachedEndpointObservationReader
 from treg.models import CallRecord, Hold, LedgerEntry, OverflowRoute
+from treg.timeutil import utcnow_naive
 
 from test_marketplace_call import _balance, firecrawl_platform_on, platform_on  # noqa: F401
 
@@ -35,7 +38,7 @@ ROUTED = "treg.people.email.find"
 
 
 @pytest.fixture
-def enrichment_on(monkeypatch, platform_on):  # noqa: F811
+def enrichment_on(monkeypatch, platform_on):
     for p in ("HUNTER", "TOMBA", "LEADMAGIC", "LEADSFORGE", "FINDYMAIL", "AVIATO", "FIBER_AI"):
         monkeypatch.setenv(f"TREG_PLATFORM_KEY_{p}", f"PLATFORM-{p}-KEY")
     monkeypatch.setenv("TREG_PLATFORM_KEY_TOMBA_SECRET", "PLATFORM-TOMBA-SECRET")
@@ -59,7 +62,7 @@ def enrichment_with_miss_declarers_on(monkeypatch, enrichment_on):
 
 
 @pytest.fixture
-def enrichment_with_quickenrich_on(monkeypatch, platform_on):  # noqa: F811
+def enrichment_with_quickenrich_on(monkeypatch, platform_on):
     """Like enrichment_on but includes QuickEnrich - the cheapest provider for phone/email lookups."""
     for p in ("HUNTER", "TOMBA", "LEADMAGIC", "LEADSFORGE", "FINDYMAIL", "AVIATO", "FIBER_AI", "QUICKENRICH"):
         monkeypatch.setenv(f"TREG_PLATFORM_KEY_{p}", f"PLATFORM-{p}-KEY")
@@ -133,6 +136,9 @@ def test_every_shipped_adapter_round_trips_its_fixture():
     ep = cat.by_id[ROUTED]
     assert ep["kind"] == "routed" and ep["provider"] == "treg" and len(ep["routed_children"]) >= 8
     assert cat.platform_eligible(ep) and ep["cost_range_usd"][0] < ep["cost_range_usd"][1]
+    # children bill misses, so no single quote: a $0 floor read as "free"
+    people = cat.by_id["treg.people.search"]
+    assert people["miss_billed_by"] and cat.advertised_usd(cat.cost_view(people["cost"], "treg")) is None
     # a hand-verified round trip on the plan's worked example
     ad = cat.adapters["leadsforge.people.email.find"]
     q, b = ad.to_upstream({"first_name": "Patrick", "last_name": "Collison", "domain": "stripe.com", "full_name": "Patrick Collison"})
@@ -162,6 +168,29 @@ def test_every_adapter_const_passes_its_child_body_allowlist():
     assert failures == {}, failures
 
 
+def test_every_routed_adapter_sends_its_rows_platform_request_pins():
+    """A shared-key pin (`platform_request`) is enforced, not injected: a routed child whose adapter
+    does not send the pinned value is a 400 on treg's key, and the router reads a 400 as the
+    caller's fault and fails the whole routed call instead of trying the next child."""
+    cat = catalog_store.load()
+    missing = {}
+    for endpoint_id, adapter in cat.adapters.items():
+        pins = {path: value for path, value in (cat.by_id[endpoint_id].get("platform_request") or {}).items()
+                if path.startswith(("body.", "queryParams."))}
+        if not adapter.route or not pins:
+            continue
+        sent: dict = {}
+        for path, value in adapter.const.items():
+            P.set_path(sent, path, value)
+        # a query string carries text: the relay reads a query pin back as the pinned value's type
+        wrong = {path: P.get_path(sent, path) for path, value in pins.items()
+                 if (str(P.get_path(sent, path)) != str(value) if path.startswith("queryParams.")
+                     else P.get_path(sent, path) != value)}
+        if wrong:
+            missing[endpoint_id] = wrong
+    assert missing == {}, missing
+
+
 def test_firecrawl_web_adapters_are_verified_routed_children():
     cat = catalog_store.load()
     for parent, child in (
@@ -185,6 +214,32 @@ def test_you_web_adapters_are_verified_routed_children():
         assert adapter.verified, (child, adapter.verify_note)
         assert not adapter.verify_note, child
         assert child in cat.by_id[parent]["routed_children"], (parent, child)
+
+
+def test_parallel_adapters_are_routed_and_an_excerpt_only_page_is_a_hit():
+    cat = catalog_store.load()
+    for parent, child in (
+        ("treg.web.search", "parallel.web.search"),
+        ("treg.web.extract", "parallel.web.extract"),
+        ("treg.people.search", "parallel.people.search"),
+        ("treg.companies.search", "parallel.companies.search"),
+    ):
+        assert cat.adapters[child].verified, (child, cat.adapters[child].verify_note)
+        assert child in cat.by_id[parent]["routed_children"], (parent, child)
+    # A direct Extract without full_content still returns billed excerpts; only an empty page or
+    # an unreadable URL (results [], errors[]) is the free miss.
+    extract = cat.adapters["parallel.web.extract"]
+    assert not extract.is_miss({"results": [{"url": "u", "excerpts": ["text"], "full_content": None}]})
+    assert not extract.is_miss({"results": [{"url": "u", "excerpts": [], "full_content": "text"}]})
+    assert extract.is_miss({"results": [{"url": "u", "excerpts": [], "full_content": None}]})
+    assert extract.is_miss({"results": [], "errors": [{"url": "u", "error_type": "connect_error"}]})
+    # A multi-URL call is never judged by its first page: a later page may have text.
+    assert not extract.is_miss({"results": [{"url": "a", "excerpts": [], "full_content": None},
+                                            {"url": "b", "excerpts": ["text"], "full_content": "text"}]})
+    # With several pages, an explicitly empty usage[] is the miss; an absent one is unobserved.
+    empty = {"url": "a", "excerpts": [], "full_content": None}
+    assert extract.is_miss({"results": [empty, empty], "usage": []})
+    assert not extract.is_miss({"results": [empty, empty]})
 
 
 def test_search_adapter_does_not_treat_an_answer_without_results_as_a_miss():
@@ -379,6 +434,7 @@ async def test_routed_plan_keeps_per_success_hit_fallback_from_the_cache(
             ))
         await db.commit()
     monkeypatch.setattr(stats, "MIN_HIT_SAMPLES", 3)
+    assert (await catalog_stats.refresh(session_maker, now=utcnow_naive() + timedelta(minutes=2)))["caught_up"]
     reader = A.app.state.endpoint_observation_reader
     assert await reader.get_many([endpoint_id]) == {}
     await reader.wait_for_idle()
@@ -417,7 +473,7 @@ async def test_routed_plan_keeps_an_exhausted_provider_when_its_overflow_route_i
     monkeypatch.setenv("TREG_OVERFLOW_KEY_MONID", "MONID-KEY")
     get_settings.cache_clear()
     monkeypatch.setattr(call_route.capacity_view, "is_exhausted",
-                        lambda provider, endpoint_id=None: provider == "akta")
+                        lambda provider, endpoint_id=None, slot=None, **_: provider == "akta")
     route = SimpleNamespace(aggregator="monid", agg_price_micro=10_000)
     monkeypatch.setattr(call_route.overflow_routes_view, "for_endpoint",
                         lambda endpoint_id: [route] if endpoint_id == "akta.companies.news" else [])
@@ -449,7 +505,7 @@ async def test_routed_plan_keeps_an_exhausted_provider_when_its_overflow_route_i
 
 
 async def test_routed_call_reaches_an_enabled_overflow_before_the_next_provider(
-    clients: AsyncClient, platform_on, monkeypatch,  # noqa: F811
+    clients: AsyncClient, platform_on, monkeypatch,
 ):
     monkeypatch.setenv("TREG_PLATFORM_PROVIDERS", "akta,predictleads")
     monkeypatch.setenv("TREG_PLATFORM_KEY_AKTA", "AKTA-KEY")
@@ -467,7 +523,7 @@ async def test_routed_call_reaches_an_enabled_overflow_before_the_next_provider(
         await db.commit()
     call_route.overflow_routes_view.invalidate()
     monkeypatch.setattr(call_route.capacity_view, "is_exhausted",
-                        lambda provider, endpoint_id=None: provider == "akta")
+                        lambda provider, endpoint_id=None, slot=None, **_: provider == "akta")
 
     async def overflow_send(client, req):
         return httpx.Response(200, json={
@@ -523,6 +579,21 @@ async def test_routed_call_runs_the_cheapest_child_and_returns_output_raw_and_pr
     rows = (await clients.get("/calls")).json()
     kinds = {(x["tool_name"], x.get("credential_tier")) for x in rows}
     assert (ROUTED, "routed") in kinds and ("tomba.people.email.find", "platform") in kinds
+
+
+async def test_a_lone_surrogate_in_the_winning_body_is_relayed_as_its_escape(clients: AsyncClient, enrichment_on, monkeypatch):
+    """Re-encoding the winner's parsed body with ensure_ascii=False raised on a lone surrogate after
+    the child had answered: the caller got a 500 for a hit. The escape is the upstream's own text."""
+    seen = []
+    monkeypatch.setattr(call_service, "relay", _relay_by_provider(
+        {"tomba": [(200, {"data": {"email": "pat@stripe.com", "score": 99, "first_name": "Pat \ud835",
+                                    "last_name": "C", "verification": {"status": "valid"}}})]}, seen))
+    before = await _balance(clients)
+    r = await clients.post(f"/call/{ROUTED}", json={"full_name": "Pat C", "domain": "stripe.com"})
+    assert r.status_code == 200, r.text
+    assert b'"first_name":"Pat \\ud835"' in r.content
+    assert r.json()["output"]["first_name"] == "Pat \ud835"
+    assert before - await _balance(clients) == int(r.headers["X-Treg-Cost-Micro"]) == 8_900
 
 
 async def test_an_unverified_hit_carries_verify_advice(clients: AsyncClient, enrichment_on, monkeypatch):
@@ -767,6 +838,18 @@ async def test_catalog_get_on_the_routed_endpoint_shows_the_plan(clients: AsyncC
     assert {c["endpoint_id"] for c in plan} <= set(d["endpoint"]["routed_children"] if "routed_children" in d["endpoint"] else [c["endpoint_id"] for c in plan])
 
 
+async def test_the_routed_quote_ranks_the_children_the_router_skips_last(clients: AsyncClient, enrichment_on, monkeypatch):
+    """The quote and the call agree: a child treg's key cannot serve (here `platform_blocked`)
+    stays in the plan for its `accepts`, after every child the router would call, saying why."""
+    from treg.domain.catalog import store as catalog_store
+    monkeypatch.setitem(catalog_store.load().by_id["tomba.people.email.find"], "platform_blocked", "test")
+    plan = (await clients.get(f"/catalog/endpoints/{ROUTED}")).json()["routing"]["plan"]
+    skipped = [c.get("skipped") is not None for c in plan]
+    assert skipped == sorted(skipped) and any(skipped) and not skipped[0]
+    tomba = next(c for c in plan if c["endpoint_id"] == "tomba.people.email.find")
+    assert tomba["skipped"] == "not platform-eligible and no own key" and tomba["accepts"]
+
+
 async def test_idempotent_replay_of_a_routed_call_never_calls_a_provider_twice(clients: AsyncClient, enrichment_on, monkeypatch):
     seen = []
     monkeypatch.setattr(call_service, "relay", _relay_by_provider(
@@ -908,6 +991,7 @@ async def test_hit_verdict_is_recorded_and_becomes_a_hit_rate(clients: AsyncClie
     # refreshes in the background, so warm it the way test_endpoint_stats does
     from treg import api as A
     monkeypatch.setattr(call_route, "_endpoint_observation_reader", A.app.state.endpoint_observation_reader)
+    assert (await catalog_stats.refresh(session_maker, now=utcnow_naive() + timedelta(minutes=2)))["caught_up"]
     await clients.get(f"/catalog/endpoints/{ROUTED}")
     await A.app.state.endpoint_observation_reader.wait_for_idle()
     r = await clients.get(f"/catalog/endpoints/{ROUTED}")
@@ -1023,6 +1107,31 @@ def test_rank_prefers_the_candidate_that_uses_more_of_the_identity():
     assert rank([apollo, hunter], given={"full_name", "domain"}, derive=derive)[0] is hunter
 
 
+@pytest.mark.parametrize("capability", ["people.phone.find", "people.email.find"])
+def test_a_one_subject_lookup_ranks_cheapest_per_hit_first_whatever_keys_a_child_reads(capability):
+    """A caller holding a LinkedIn URL, a name and a domain sent phone finds to a name+domain child
+    at ~$0.25 ahead of LinkedIn children at a fraction of a cent that hit on the same people:
+    specificity ranked ahead of price. On a one-subject lookup every variant names the same
+    person, so price per hit leads and the plan is in ascending price order."""
+    from treg.domain.catalog.routing.plan import candidates_for
+    cat = catalog_store.load()
+    contract = cat.contracts[capability]
+    assert contract.one_subject
+    sent = {"linkedin_url": "https://www.linkedin.com/in/patrickcollison", "full_name": "Patrick Collison",
+            "domain": "stripe.com"}
+    ident, _ = canonical_identity(contract, sent)
+    eps = [e for e in cat.endpoints if e.get("capability") == capability]
+    raw, _ = candidates_for(contract, eps, cat.adapters, ident)
+    cands = [Candidate(endpoint=e, adapter=ad, variant=v, tier="platform",
+                       price_micro=cost_at(cat.cost_view(e.get("cost"), e["provider"]), ident, ad),
+                       hit_rate=None, ok_rate=None, p50_ms=None, last_ok_days=None) for e, ad, v in raw]
+    ranked = rank(cands, given=set(sent), derive=contract.derive, one_subject=contract.one_subject)
+    prices = [c.price_micro for c in ranked]
+    assert prices == sorted(prices), [(c.endpoint["id"], c.price_micro) for c in ranked]
+    # a search keeps specificity first: the flag is what changes the order, not the price data
+    assert not cat.contracts["people.search"].one_subject
+
+
 def test_a_provider_that_cannot_express_a_supplied_filter_ranks_last_among_equals():
     """Live 2026-08-29: `{q, title, location: London, country: GB}` went to the cheapest candidate,
     which had no place for either geo filter, and returned people in Bengaluru and San Francisco —
@@ -1047,6 +1156,10 @@ def test_a_provider_that_cannot_express_a_supplied_filter_ranks_last_among_equal
     assert "country" in ignored_filters(cat.adapters["aviato.people.search"], contract, ident)
     assert ignored_filters(cat.adapters["icypeas.people.search"], contract, ident) == (), \
         "icypeas is the only people.search adapter that maps geo — the rule must float it to the top"
+    # `limit` is a page size, not a looser question: a role finder without one must not rank below
+    # a search that bills its empty pages
+    assert ignored_filters(cat.adapters["leadmagic.x.role-finder"], contract,
+                           {"company_domain": "acme.com", "title": "CEO", "limit": 10}) == ()
     # the full_name variant has exactly two candidates and neither mapped `country` — so a GT search
     # went to New York and was billed (voice-ai-outbound, 2026-09-03). aviato's simple search takes
     # country NAMES (live 2026-09-04: `Guatemala` → 84,145 rows, `GT` → 0), hence country_name().
@@ -1127,7 +1240,8 @@ async def test_routed_discovery_is_a_runtime_switch(clients: AsyncClient, enrich
         body = (await clients.get(path)).text
         assert "Routed endpoints" not in body, f"{path} must not teach what search hides"
         assert "<!--routed" not in body, f"{path} leaked a marker"
-        assert "provider_capacity_unavailable" in body, f"{path} lost the unrelated overflow guidance"
+        if path == "/skill.md":  # the failure table lives in the skill; llms.txt links to it
+            assert "provider_capacity_unavailable" in body, f"{path} lost the unrelated overflow guidance"
 
     # …but the endpoint is untouched: still callable, still priced, still found by id
     r = await clients.get("/catalog/endpoints/treg.people.email.find")
@@ -1303,8 +1417,7 @@ def test_a_per_success_endpoint_with_no_adapter_settles_on_the_providers_own_suc
     ok = b'{"code": 0, "data": {"users": [{"name": "Ada"}]}}'
     assert A._observed_cost_micro(mk, ok) is None, "a real hit still settles at the estimate"
 
-    # a nested rule form (dataforseo's task envelope) reads the same way — picking one that also
-    # has no adapter, since an adapter's own predicate takes precedence when there is one
+    # a nested rule form (dataforseo's task envelope) reads the same way
     dfs = [e for e in cat.by_id.values()
            if (e.get("expect") or {}).get("json_path") == "tasks.0.status_code"
            and cat.adapters.get(e["id"]) is None
@@ -1313,6 +1426,19 @@ def test_a_per_success_endpoint_with_no_adapter_settles_on_the_providers_own_suc
         m2 = _mk(dfs[0]["provider"], endpoint_id=dfs[0]["id"], cost_type="per_success")
         assert A._observed_cost_micro(m2, b'{"tasks": [{"status_code": 40501}]}') == 0
         assert A._observed_cost_micro(m2, b'{"tasks": [{"status_code": 20000}]}') is None
+
+async def test_a_gone_endpoint_is_the_providers_fault_not_the_callers(clients: AsyncClient, enrichment_on, monkeypatch):
+    """410 Gone (a discontinued route), 405 and 501 say the PROVIDER cannot serve this, whatever the
+    caller sent: the waterfall goes on as after a 5xx, to paid-per-call providers too. Before this a
+    410 read as the caller's fault and ended the call when no free-on-failure provider was left
+    (live 2026-10-04: aviato discontinued its LinkedIn post routes and linkedin.user.posts failed)."""
+    seen = []
+    gone = (410, {"error": "Gone", "message": "This endpoint has been discontinued and is no longer available."})
+    monkeypatch.setattr(call_service, "relay", _relay_by_provider({"*": [gone] * 10}, seen))
+    r = await clients.post(f"/call/{ROUTED}", json={"full_name": "Patrick Collison", "domain": "stripe.com"})
+    assert r.json()["detail"]["error"] != "route_caller_fault", r.text
+    assert r.status_code == 502 and len(seen) >= 2, r.text
+
 
 async def test_a_declared_miss_status_is_a_miss_not_a_caller_fault(clients: AsyncClient, enrichment_on, monkeypatch):
     """aviato answers HTTP 404 `Not Found` for a person it has no record of. The endpoint's YAML says
@@ -1718,3 +1844,304 @@ async def test_company_blind_search_provider_is_dropped_not_billed(clients: Asyn
     r = await clients.post("/call/treg.people.search", json={"title": "CEO"})
     assert [s[0] for s in seen] == ["lusha"] and r.json()["_treg"]["served_by"] == "lusha.people.search", r.text
     get_settings.cache_clear()
+
+
+# ---- ai-search.perplexity.answer: dataforseo first by default, both say their source
+def _example(eid: str) -> dict:
+    from pathlib import Path
+    return json.loads((Path(catalog_store.__file__).parents[2] / "catalog" / "examples" / f"{eid}.json").read_text())
+
+
+@pytest.mark.parametrize("prefer, first, kind", [
+    (None, "dataforseo", "model_api"),          # the contract's default order
+    ("cloro", "cloro", "website"),              # a caller's own preference replaces it
+])
+async def test_perplexity_answer_routes_by_the_contract_default_and_says_its_source(
+        clients, monkeypatch, prefer, first, kind):
+    """Cost per hit alone ranked cloro first (cheaper, but slower and less reliable than
+    dataforseo). The two read different things (website vs model API), so the answer says which."""
+    monkeypatch.setenv("TREG_PLATFORM_KEY_DATAFORSEO", "login:password")
+    monkeypatch.setenv("TREG_PLATFORM_KEY_CLORO", "PLATFORM-CLORO")
+    monkeypatch.setenv("TREG_PLATFORM_PROVIDERS", "dataforseo,cloro")
+    get_settings.cache_clear()
+    seen = []
+    monkeypatch.setattr(call_service, "relay", _relay_by_provider({
+        "dataforseo": [(200, _example("dataforseo.x.ai-optimization-perplexity-llm-responses-live"))],
+        "cloro": [(200, _example("cloro.ai-search.perplexity.answer"))],
+    }, seen))
+    response = await clients.post(
+        "/call/treg.ai-search.perplexity.answer", json={"prompt": "best CRM for a small business", "country": "US"},
+        headers={"X-Treg-Route-Prefer": prefer} if prefer else {})
+    assert response.status_code == 200, response.text
+    data = response.json()
+    assert seen[0][0] == first and data["_treg"]["provider"] == first
+    assert data["output"]["source_kind"] == kind and data["output"]["answer"] and data["output"]["sources"]
+    if first == "dataforseo":
+        assert seen[0][3] == [{"user_prompt": "best CRM for a small business", "web_search_country_iso_code": "US",
+                               "model_name": "sonar"}]
+    else:
+        assert seen[0][3] == {"prompt": "best CRM for a small business", "country": "US"}
+    get_settings.cache_clear()
+
+
+async def test_people_enrich_not_found_from_dropleads_and_aiark_is_a_miss_not_a_502(clients, monkeypatch):
+    """Dropleads "Person not found" 400s and AI Ark "data not found" 404s were read as provider
+    faults, so a person nobody had came back as 502 route_failed. Both are now declared misses; a rate limit or another 400 stays an error."""
+    monkeypatch.setenv("TREG_PLATFORM_KEY_DROPLEADS", "PLATFORM-DROPLEADS")
+    monkeypatch.setenv("TREG_PLATFORM_KEY_AIARK", "PLATFORM-AIARK")
+    monkeypatch.setenv("TREG_PLATFORM_PROVIDERS", "dropleads,aiark")
+    get_settings.cache_clear()
+    seen = []
+    monkeypatch.setattr(call_service, "relay", _relay_by_provider({
+        "dropleads": [(400, {"success": False, "error": "Person not found. Try providing more information like LinkedIn URL or company name."})],
+        "ai-ark": [(404, {"status": 404, "error": "data not found", "path": ""})],
+    }, seen))
+    r = await clients.post("/call/treg.people.enrich", json={"email": "nobody@example.com"},
+                           headers={"X-Treg-Route-Prefer": "dropleads,aiark"})
+    assert r.status_code == 200, r.text
+    assert r.json()["_treg"]["outcome"] == "miss"
+    assert [t["outcome"] for t in r.json()["_treg"]["tried"]] == ["miss", "miss"]
+    assert len(seen) == 2
+    get_settings.cache_clear()
+
+
+# ---- web.extract / web.search: crawl4ai first by default -------------------------------------------
+@pytest.mark.parametrize("job, body, answer, first_seen", [
+    ("treg.web.extract", {"url": "https://example.com"},
+     {"ok": True, "markdown": "# Example Domain", "content_hash": "x", "engine": "archive"},
+     {"url": "https://example.com", "format": "md"}),
+    ("treg.web.search", {"q": "rust web crawler"},
+     {"results": [{"title": "spider", "url": "https://github.com/spider-rs/spider", "snippet": "s", "source": "gs"}], "n": 1},
+     None),
+])
+async def test_crawl4ai_answers_scrape_and_search_first_by_default(clients, monkeypatch, job, body, answer, first_seen):
+    monkeypatch.setenv("TREG_PLATFORM_KEY_CRAWL4AI", "PLATFORM-C4AI")
+    monkeypatch.setenv("TREG_PLATFORM_KEY_FIRECRAWL", "PLATFORM-FIRECRAWL")
+    monkeypatch.setenv("TREG_PLATFORM_PROVIDERS", "crawl4ai,firecrawl")
+    get_settings.cache_clear()
+    seen = []
+    monkeypatch.setattr(call_service, "relay", _relay_by_provider({"crawl4ai": [(200, answer)], "*": []}, seen))
+    r = await clients.post(f"/call/{job}", json=body)
+    assert r.status_code == 200, r.text
+    assert r.json()["_treg"]["provider"] == "crawl4ai" and [s[0] for s in seen] == ["crawl4ai"]
+    if first_seen is not None:
+        assert seen[0][3] == first_seen
+    else:
+        assert seen[0][2] == {"q": "rust web crawler"}
+    get_settings.cache_clear()
+
+
+async def test_a_declared_not_found_ends_the_job_and_an_empty_page_is_a_miss(clients, monkeypatch):
+    """A scraped page that does not exist: the first provider's declared "the site answered 404"
+    (`not_found:`) ends the call with that 404, charging nothing, instead of asking providers that
+    answer the same page with an empty "success". An empty page is a miss, so the job goes on."""
+    monkeypatch.setenv("TREG_PLATFORM_KEY_CRAWL4AI", "PLATFORM-C4AI")
+    monkeypatch.setenv("TREG_PLATFORM_KEY_FIRECRAWL", "PLATFORM-FIRECRAWL")
+    monkeypatch.setenv("TREG_PLATFORM_PROVIDERS", "crawl4ai,firecrawl")
+    get_settings.cache_clear()
+    seen = []
+    monkeypatch.setattr(call_service, "relay", _relay_by_provider(
+        {"crawl4ai": [(404, {"ok": False, "reason": "origin-error:404"})], "*": [(200, {"data": {"markdown": ""}})]}, seen))
+    before = await _balance(clients)
+    r = await clients.post("/call/treg.web.extract", json={"url": "https://example.com/gone"})
+    assert r.status_code == 404 and r.json()["detail"]["error"] == "route_not_found", r.text
+    assert [s[0] for s in seen] == ["crawl4ai"], "no other provider is asked"
+    assert [t["outcome"] for t in r.json()["detail"]["tried"]] == ["not_found"]
+    assert await _balance(clients) == before
+    # a 404 that is not the site's own answer keeps its old meaning: the job goes on
+    seen.clear()
+    monkeypatch.setattr(call_service, "relay", _relay_by_provider(
+        {"crawl4ai": [(404, {"ok": False, "reason": "something-else"})], "*": [(200, {"data": {"markdown": ""}})]}, seen))
+    r = await clients.post("/call/treg.web.extract", json={"url": "https://example.com/gone"})
+    assert [s[0] for s in seen] == ["crawl4ai", "*"]
+    assert r.status_code == 502 and r.json()["detail"]["tried"][-1]["outcome"] == "miss", "an empty page is a miss, not a hit"
+    get_settings.cache_clear()
+
+
+async def test_google_organic_asks_crawl4ai_first_and_falls_back_when_it_is_empty(clients, monkeypatch):
+    """The routed Google organic job sends crawl4ai the query, country, language and the depth rounded
+    up to whole Google pages; an empty answer is a miss and the next provider answers."""
+    monkeypatch.setenv("TREG_PLATFORM_KEY_CRAWL4AI", "PLATFORM-C4AI")
+    monkeypatch.setenv("TREG_PLATFORM_KEY_ANYAPI", "PLATFORM-ANYAPI")
+    monkeypatch.setenv("TREG_PLATFORM_PROVIDERS", "crawl4ai,anyapi")
+    get_settings.cache_clear()
+    seen = []
+    monkeypatch.setattr(call_service, "relay", _relay_by_provider({
+        "crawl4ai": [(200, {"results": [], "empty_reason": "rescue_no_results"})],
+        "*": [(200, {"output": {"data": {"results": [{"title": "t", "link": "https://example.com"}]}}})]}, seen))
+    r = await clients.post("/call/treg.google.serp.organic", json={"q": "pizza", "country": "PL", "language": "pl", "limit": 25})
+    assert r.status_code == 200, r.text
+    assert seen[0][0] == "crawl4ai" and seen[0][2] == {"q": "pizza", "country": "pl", "language": "pl", "num": "30"}
+    assert [t["outcome"] for t in r.json()["_treg"]["tried"]] == ["miss", "hit"]
+    assert r.json()["_treg"]["provider"] == "anyapi"
+    get_settings.cache_clear()
+
+
+# ---- web.extract.structured: a new routed job, crawl4ai first ----------------------------------------
+_SCHEMA = {"type": "object", "properties": {"title": {"type": "string"}}, "required": ["title"]}
+
+
+@pytest.fixture
+def _structured_keys(monkeypatch):
+    for k, v in (("CRAWL4AI", "PLATFORM-C4AI"), ("LINKUP", "PLATFORM-LINKUP"), ("SEARCH1API", "PLATFORM-S1")):
+        monkeypatch.setenv(f"TREG_PLATFORM_KEY_{k}", v)
+    monkeypatch.setenv("TREG_PLATFORM_PROVIDERS", "crawl4ai,linkup,search1api")
+    get_settings.cache_clear()
+    yield
+    get_settings.cache_clear()
+
+
+async def test_structured_extract_goes_to_crawl4ai_first(clients, monkeypatch, _structured_keys):
+    seen = []
+    monkeypatch.setattr(call_service, "relay", _relay_by_provider(
+        {"crawl4ai": [(200, {"ok": True, "data": {"title": "Example Domain"}})], "*": []}, seen))
+    r = await clients.post("/call/treg.web.extract.structured",
+                           json={"url": "https://example.com", "schema": _SCHEMA, "instruction": "the page title"})
+    assert r.status_code == 200, r.text
+    assert r.json()["output"]["data"] == {"title": "Example Domain"} and [s[0] for s in seen] == ["crawl4ai"]
+    assert seen[0][3] == {"url": "https://example.com", "schema": _SCHEMA, "instruction": "the page title"}
+
+
+async def test_an_instruction_without_a_schema_only_fits_crawl4ai(clients, monkeypatch, _structured_keys):
+    seen = []
+    monkeypatch.setattr(call_service, "relay", _relay_by_provider(
+        {"crawl4ai": [(200, {"ok": True, "data": [{"title": "a"}]})], "*": []}, seen))
+    r = await clients.post("/call/treg.web.extract.structured",
+                           json={"url": "https://example.com", "instruction": "the story titles"})
+    assert r.status_code == 200, r.text
+    assert [s[0] for s in seen] == ["crawl4ai"]
+
+
+async def test_when_crawl4ai_fails_linkup_answers_with_the_same_schema(clients, monkeypatch, _structured_keys):
+    seen = []
+    monkeypatch.setattr(call_service, "relay", _relay_by_provider({
+        "crawl4ai": [(502, {"error": "fetch_failed"})],
+        "linkup": [(200, {"data": {"title": "Example Domain"}, "markdown": "x"})],
+        "*": [],
+    }, seen))
+    r = await clients.post("/call/treg.web.extract.structured", json={"url": "https://example.com", "schema": _SCHEMA},
+                           headers={"X-Treg-Route-Prefer": "crawl4ai,linkup"})
+    assert r.status_code == 200, r.text
+    assert [s[0] for s in seen] == ["crawl4ai", "linkup"] and r.json()["_treg"]["provider"] == "linkup"
+    assert seen[1][3]["schema"] == _SCHEMA and seen[1][3]["mode"] == "standard"
+
+
+def test_every_iso_country_reaches_dataforseo_as_its_own_location():
+    """`country` on a routed SEO capability once reached DataForSEO as the United States for every
+    country outside a short hand-written table: a Thai or Russian volume question was answered with
+    US volumes and billed as a hit, and nothing in the answer said so. DataForSEO's country codes
+    are Google Ads geo target ids (2000 + the ISO 3166-1 numeric code), so the whole ISO table maps."""
+    cat = catalog_store.load()
+    contract = cat.contracts["google.keywords.volume"]
+    dfs = cat.adapters["dataforseo.google.keywords.volume"]
+    anchors = {"us": 2840, "uk": 2826, "th": 2764}
+    for code, location in anchors.items():
+        ident, _ = canonical_identity(contract, {"keywords": ["kahve"], "country": code.upper()})
+        _, body = dfs.to_upstream(ident)
+        assert body[0]["location_code"] == location, (code, body)
+    countries = json.loads((catalog_store.CATALOG_DIR / "countries.json").read_text())
+    assert all(P.dfs_location(c) for c in countries), "every country treg knows has a DataForSEO location"
+    assert P.dfs_location("Thailand") == 2764, "a country name is the same country"
+
+
+def test_a_country_dataforseo_cannot_be_asked_about_is_reported_not_answered_for_the_us():
+    """A value that names no country must not quietly become the United States: the location is
+    left out and the filter is reported as ignored, the same way a provider with no geo field is."""
+    from treg.domain.catalog.routing.plan import ignored_filters
+    cat = catalog_store.load()
+    contract = cat.contracts["google.serp.organic"]
+    dfs = cat.adapters["dataforseo.google.serp.organic"]
+    ident, _ = canonical_identity(contract, {"q": "coffee", "country": "xx"})
+    assert P.dfs_location("xx") is None
+    assert "location_code" not in dfs.to_upstream(ident)[1][0]
+    assert ignored_filters(dfs, contract, ident) == ("country",)
+    good, _ = canonical_identity(contract, {"q": "coffee", "country": "th"})
+    assert ignored_filters(dfs, contract, good) == ()
+
+
+def test_a_contract_default_the_caller_did_not_send_is_not_an_ignored_filter():
+    """`google.keywords.volume` defaults `language: en`. SE Ranking has no language field, so the
+    default alone ranked it behind a child fifty times its price on every call, while the catalog
+    quote (which ranks without the default) named SE Ranking first. Only a filter the caller sent
+    can make an answer looser than the question."""
+    from treg.domain.catalog.routing.plan import ignored_filters
+    cat = catalog_store.load()
+    contract = cat.contracts["google.keywords.volume"]
+    seranking = cat.adapters["seranking.google.keywords.volume"]
+    ident, _ = canonical_identity(contract, {"keywords": ["tea"]})
+    assert ident["language"] == "en", "the default still reaches the providers that take it"
+    assert ignored_filters(seranking, contract, ident, given={"keywords"}) == ()
+    sent, _ = canonical_identity(contract, {"keywords": ["tea"], "language": "de"})
+    assert ignored_filters(seranking, contract, sent, given={"keywords", "language"}) == ("language",)
+
+    def cand(eid, price, ignored):
+        return Candidate(endpoint={"id": eid, "provider": eid.split(".")[0], "cost": {"type": "per_call"}},
+                         adapter=None, variant=("keywords",), tier="platform", price_micro=price, hit_rate=None,
+                         ok_rate=None, p50_ms=None, last_ok_days=None, ignored=ignored)
+    plan = [cand("seranking.google.keywords.volume", 1_790,
+                 ignored_filters(seranking, contract, ident, given={"keywords"})),
+            cand("dataforseo.google.keywords.volume", 90_000,
+                 ignored_filters(cat.adapters["dataforseo.google.keywords.volume"], contract, ident, given={"keywords"}))]
+    quote = [cand(c.endpoint["id"], c.price_micro, ()) for c in plan]
+    assert [c.endpoint["id"] for c in rank(plan, given={"keywords"})] == \
+        [c.endpoint["id"] for c in rank(quote)] == ["seranking.google.keywords.volume", "dataforseo.google.keywords.volume"]
+
+
+async def test_a_missed_child_releases_its_hold_before_the_next_child_reserves(
+    clients: AsyncClient, enrichment_on, monkeypatch,
+):
+    """A balance that covers one child at a time, not two. A free miss used to keep its hold open
+    until the routed call closed, so the next child's reserve answered a false 402 mid-waterfall."""
+    org_id = (await clients.get("/orgs")).json()[0]["org_id"]
+    async with session_maker() as db:
+        await ledger.reserve(db, org_id, "leave room for one child", await _balance(clients) - 25_000)
+    miss_tomba = (200, {"data": {"email": None, "score": None, "verification": {"status": None}}})
+    seen = []
+    monkeypatch.setattr(call_service, "relay", _relay_by_provider({
+        "tomba": [miss_tomba],
+        "findymail": [(200, {"contact": {"name": "Patrick Collison", "email": "patrick@stripe.com"}})],
+    }, seen))
+    before = await _balance(clients)
+    r = await clients.post(f"/call/{ROUTED}", json={"full_name": "Patrick Collison", "domain": "stripe.com"},
+                           headers={"X-Treg-Route-Prefer": "tomba,findymail"})
+    assert r.status_code == 200, r.text
+    assert [t["outcome"] for t in r.json()["_treg"]["tried"]] == ["miss", "hit"]
+    assert before - await _balance(clients) == int(r.headers["X-Treg-Cost-Micro"]) == 19_800
+    async with session_maker() as db:
+        holds = (await db.execute(select(Hold))).scalars().all()
+    assert len(holds) == 1 and holds[0].amount_micro > 25_000, "only the drain is open; every child closed once"
+    async with session_maker() as db:
+        entries = (await db.execute(select(LedgerEntry))).scalars().all()
+    call_id = r.headers["X-Treg-Call-Id"]
+    assert sorted((e.call_id, e.kind) for e in entries if (e.call_id or "").startswith(call_id)) == [
+        (f"{call_id}:r0", "release"), (f"{call_id}:r0", "reserve"),
+        (f"{call_id}:r1", "reserve"), (f"{call_id}:r1", "settle")]
+
+
+async def test_a_provider_that_caps_a_filter_is_skipped_above_the_cap(clients: AsyncClient, monkeypatch):
+    """`max: {limit: N}` on an adapter: a request asking for more than N skips that provider with a
+    named drop instead of answering less than was asked; at or under N it stays a candidate."""
+    monkeypatch.setenv("TREG_PLATFORM_PROVIDERS", "akta,predictleads")
+    monkeypatch.setenv("TREG_PLATFORM_KEY_AKTA", "AKTA-KEY")
+    monkeypatch.setenv("TREG_PLATFORM_KEY_PREDICTLEADS", "PREDICTLEADS-KEY")
+    get_settings.cache_clear()
+    cat = catalog_store.load()
+    import dataclasses
+    monkeypatch.setitem(cat.adapters, "akta.companies.news",
+                        dataclasses.replace(cat.adapters["akta.companies.news"], filter_max={"limit": 3}))
+
+    class _Org:
+        id = 1
+        platform_overflow_disabled = False
+
+    class _Caller:
+        org_id = 1
+        org = _Org()
+
+    ep = cat.by_id["treg.companies.news"]
+    options = call_route.RouteOptions.from_headers(lambda key: None)
+    over = await call_route.build_plan(ep, {"domain": "canva.com", "limit": 5}, _Caller(), options)
+    assert all(c.endpoint["id"] != "akta.companies.news" for c in over.candidates)
+    assert {"endpoint_id": "akta.companies.news", "why": "needs limit <= 3"} in over.dropped
+    under = await call_route.build_plan(ep, {"domain": "canva.com", "limit": 3}, _Caller(), options)
+    assert any(c.endpoint["id"] == "akta.companies.news" for c in under.candidates)

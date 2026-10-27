@@ -2,10 +2,10 @@
 
 import re
 import sys
-from datetime import datetime, timedelta, timezone
+from datetime import date, datetime, timedelta, timezone
 from urllib.parse import urlsplit
 
-from fastapi import APIRouter, Depends, Header, HTTPException, Query, Request, Response
+from fastapi import APIRouter, Cookie, Depends, Header, HTTPException, Query, Request, Response
 from pydantic import BaseModel
 from sqlalchemy import case, func
 from sqlalchemy.exc import IntegrityError
@@ -13,8 +13,13 @@ from sqlalchemy.ext.asyncio import AsyncSession
 from sqlmodel import select
 
 from .. import analytics, crypto, email as email_sender, health, localrun
+from .. import oauth_providers
 from .. import providers as _providers
+from ..application import key_spend
+from ..application import enterprise_sso
+from ..application import images
 from ..application.onboard import demo as demo_seed
+from ..application import archive_erasure
 from ..application import signup as signup_use_cases
 from ..caller_metadata import TAG_DEFAULT, _MAX_BUDGET_DIMS, _META_KEY_RE, _client_of, _norm_client
 from ..config import get_settings
@@ -44,12 +49,14 @@ from ..domain.identity.access import (
 )
 from ..domain.identity import api_keys as managed_keys
 from ..domain.identity import session as identity_session
-from ..infra.db import get_session
+from ..infra.db import get_report_session, get_session
 from ..models import (
     ROLE_RANK,
+    ApiKey,
     Bundle,
     CallRecord,
     DenyRule,
+    EnterpriseSSO,
     Invite,
     Membership,
     Org,
@@ -62,19 +69,18 @@ from ..models import (
 )
 from ..timeutil import as_naive as _as_naive
 from ..timeutil import utcnow_naive as _utcnow_naive
+from .auth_helpers import _is_https, require_managed_cli
+from .signup_cookies import REFERRAL_COOKIE
 
 
 _day_start_utc = usage_policy._day_start_utc
 count_today = usage_policy.count_today
 _deny_match = access_policy._deny_match
 _org_deny_rules = access_policy._org_deny_rules
-from .auth_helpers import _is_https, require_managed_cli
-from .signup_cookies import REFERRAL_COOKIE
 
 
 INVITE_TTL_DAYS = 7  # invite codes are one-time AND expire after this many days
 
-# list_cli_deny keeps its original lazy relative import after moving one package level deeper.
 sys.modules.setdefault("treg.routers.providers", _providers)
 
 
@@ -231,37 +237,38 @@ async def _enforce_deny(
 async def _usage_rollup(db: AsyncSession, org_id: int, since: datetime) -> dict:
     """Aggregate usage since `since` into by-user (with a per-kind split), by-tool, by-day, and totals.
     CallRecord carries `kind` ("call"/"local_run"); every RunRecord is a "server_run". Pure GROUP BY —
-    no request/response bodies are read (we don't store them). See docs/USAGE-METERING-PLAN.md."""
+    no request/response bodies are read (we don't store them). See docs/USAGE-METERING-PLAN.md.
+
+    ONE pass over the window's call rows answers by-user, by-kind and by-tool together: they read the
+    same rows, and separate GROUP BYs read them once each. The per-day count is the second pass, and
+    the cheap one: it needs only `(org_id, created_at)`, which its index already holds."""
     KINDS = ("call", "local_run", "server_run")
     totals = {k: 0 for k in KINDS}
     users: dict[str, dict] = {}
+    tools: dict[str, int] = {}
 
-    def _bump(email: str, kind: str, n: int) -> None:
+    def _bump(email: str, kind: str, tool: str, n: int) -> None:
         u = users.setdefault(email, {"user_email": email, **{k: 0 for k in KINDS}})
         u[kind] += n
         totals[kind] += n
+        tools[tool] = tools.get(tool, 0) + n
 
-    for email, kind, n in (await db.execute(select(CallRecord.user_email, CallRecord.kind, func.count()).where(
-            CallRecord.org_id == org_id, CallRecord.created_at >= since
-    ).group_by(CallRecord.user_email, CallRecord.kind))).all():
-        _bump(email, kind if kind in KINDS else "call", n)  # guard an unexpected kind into "call"
-    for email, n in (await db.execute(select(RunRecord.user_email, func.count()).where(
-            RunRecord.org_id == org_id, RunRecord.created_at >= since).group_by(RunRecord.user_email))).all():
-        _bump(email, "server_run", n)
+    for email, kind, tool, n in (await db.execute(
+            select(CallRecord.user_email, CallRecord.kind, CallRecord.tool_name, func.count()).where(
+                CallRecord.org_id == org_id, CallRecord.created_at >= since
+            ).group_by(CallRecord.user_email, CallRecord.kind, CallRecord.tool_name))).all():
+        _bump(email, kind if kind in KINDS else "call", tool, n)  # guard an unexpected kind into "call"
+    for email, tool, n in (await db.execute(
+            select(RunRecord.user_email, RunRecord.bundle_name, func.count()).where(
+                RunRecord.org_id == org_id, RunRecord.created_at >= since
+            ).group_by(RunRecord.user_email, RunRecord.bundle_name))).all():
+        _bump(email, "server_run", tool, n)
 
     by_user = sorted(
         ({**u, "total": sum(u[k] for k in KINDS)} for u in users.values()),
         key=lambda r: -r["total"])
     totals["total"] = sum(totals[k] for k in KINDS)
-
-    tools: dict[str, int] = {}
-    for name, n in (await db.execute(select(CallRecord.tool_name, func.count()).where(
-            CallRecord.org_id == org_id, CallRecord.created_at >= since).group_by(CallRecord.tool_name))).all():
-        tools[name] = tools.get(name, 0) + n
-    for name, n in (await db.execute(select(RunRecord.bundle_name, func.count()).where(
-            RunRecord.org_id == org_id, RunRecord.created_at >= since).group_by(RunRecord.bundle_name))).all():
-        tools[name] = tools.get(name, 0) + n
-    by_tool = sorted(({"name": k, "total": v} for k, v in tools.items()), key=lambda r: -r["total"])
+    by_tool = sorted(({"name": k, "total": v} for k, v in tools.items()), key=lambda r: (-r["total"], r["name"]))
 
     days: dict[str, int] = {}  # func.date() → 'YYYY-MM-DD' on sqlite, a date on Postgres; str() both
     for tbl in (CallRecord, RunRecord):
@@ -283,7 +290,8 @@ class OrgPatchIn(BaseModel):
 
 class OrgSettingsIn(BaseModel):
     daily_cap_micro: int | None = None
-    platform_overflow: bool | None = None  # False = opt out of the overflow relay (ops/capacity.md)
+    platform_overflow: bool | None = None  # False = opt out of the overflow relay
+    archive: bool | None = None  # False = opt out of the archive (archive.md, "Opting out")
     budget_dims: list[str] | None = None
     primary_dim: str | None = None
 
@@ -377,7 +385,6 @@ def _signup_http_error(exc: signup_use_cases.SignupError) -> HTTPException:
     return HTTPException(status_code=status_code, detail=detail)
 
 
-# The app alias preserves the handlers' @app decorators and the ordered attachment convention.
 app = APIRouter()
 signup_router = app
 
@@ -404,7 +411,11 @@ async def register_user(body: UserIn, request: Request, response: Response) -> d
 async def create_org(
     body: OrgIn, request: Request, response: Response,
     user: User = Depends(require_identity),
+    treg_session: str = Cookie(default=""),
+    x_treg_token: str = Header(default=""),
 ) -> dict:
+    if not x_treg_token and (identity_session.read_session_claims(treg_session) or {}).get("sso_org_id") is not None:
+        raise HTTPException(403, "sign in normally to create another team")
     require_managed_cli(request, team_change=True)
     try:
         result = await signup_use_cases.create_org(
@@ -431,14 +442,22 @@ async def list_orgs(
     user: User = Depends(require_identity),
     x_treg_token: str = Header(default=""),
     x_treg_org: str = Header(default=""),
+    treg_session: str = Cookie(default=""),
     db: AsyncSession = Depends(get_session),
 ) -> list[dict]:
-    return await teams.list_user_orgs(
+    orgs = await teams.list_user_orgs(
         user_id=user.id,
         x_treg_token=x_treg_token,
         x_treg_org=x_treg_org,
         db=db,
     )
+    sso_org_id = ((identity_session.read_identity_claims(x_treg_token) or {}).get("sso_org_id")
+                  if x_treg_token else (identity_session.read_session_claims(treg_session) or {}).get("sso_org_id"))
+    if sso_org_id is not None:
+        orgs = [org for org in orgs if org["org_id"] == sso_org_id]
+    for o in orgs:  # the team's picture as a URL (None = initials); the key stays internal
+        o["avatar_url"] = images.public_url(o.pop("avatar_key", None))
+    return orgs
 
 
 app = APIRouter()
@@ -466,8 +485,7 @@ async def create_invite(
         ))).scalar_one_or_none()
         if m is not None:
             raise HTTPException(status_code=409, detail="that email is already a member of this org")
-    # Supersede any prior pending invite for this email so there's exactly one live code per invitee
-    # (re-inviting used to stack duplicate pending rows that all point at the same seat).
+    # Supersede any prior pending invite for this email so there's exactly one live code per invitee.
     for prior in (await db.execute(select(Invite).where(
         Invite.org_id == org_id, Invite.email == email, Invite.status == "pending"
     ))).scalars().all():
@@ -562,9 +580,9 @@ async def accept_invite(
     invite.status = "accepted"
     try:
         await db.commit()  # a concurrent double-accept trips uq_membership_user_org — 409, not 500
-    except IntegrityError:
+    except IntegrityError as exc:
         await db.rollback()
-        raise HTTPException(status_code=409, detail="already a member of this org")
+        raise HTTPException(status_code=409, detail="already a member of this org") from exc
     org = await db.get(Org, invite.org_id)
     response.headers["Cache-Control"] = "no-store"
     return {"org": org.slug, "org_id": org.id, "name": org.name, "role": invite.role, "token": token}
@@ -581,7 +599,7 @@ async def my_invites(
                          .order_by(Invite.created_at.desc(), Invite.id.desc()))  # stable newest-first order
     ).scalars().all()
     now = _utcnow_naive()
-    orgs = {  # batch the org lookup (was one db.get per invite)
+    orgs = {  # batch the org lookup, not one db.get per invite
         o.id: o for o in (await db.execute(
             select(Org).where(Org.id.in_([inv.org_id for inv in rows]))
         )).scalars().all()
@@ -666,9 +684,9 @@ async def accept_my_invite(
     invite.status = "accepted"
     try:
         await db.commit()  # a concurrent double-accept trips uq_membership_user_org — 409, not 500
-    except IntegrityError:
+    except IntegrityError as exc:
         await db.rollback()
-        raise HTTPException(status_code=409, detail="already a member of this org")
+        raise HTTPException(status_code=409, detail="already a member of this org") from exc
     org = await db.get(Org, invite.org_id)
     response.headers["Cache-Control"] = "no-store"
     return {"org": org.slug, "org_id": org.id, "name": org.name, "role": invite.role, "token": token}
@@ -717,7 +735,7 @@ async def list_members(
 ) -> list[dict]:
     _require_admin_of(org_id, caller)
     memberships = (await db.execute(select(Membership).where(Membership.org_id == org_id))).scalars().all()
-    users = {  # batch the user lookup (was one db.get per member)
+    users = {  # batch the user lookup, not one db.get per member
         u.id: u for u in (await db.execute(
             select(User).where(User.id.in_([m.user_id for m in memberships]))
         )).scalars().all()
@@ -737,7 +755,8 @@ async def list_members(
                         "is_agent": _is_agent_email(user.email),
                         "name": (_agent_name(caller.org, user.email)
                                  if _is_agent_email(user.email) else None),
-                        "created_by": m.created_by})
+                        "created_by": m.created_by,
+                        "avatar_url": images.public_url(user.avatar_key)})
     return out
 
 
@@ -822,6 +841,7 @@ async def remove_member(
         raise HTTPException(status_code=404, detail="not a member of this org")
     if membership.role == "owner":  # only an owner manages owners; an admin cannot remove one
         raise HTTPException(status_code=403, detail="owners cannot be removed")
+    await enterprise_sso.block_removed_member(db, org_id, user_id, caller.user.id)
     await teams.delete_membership(db, membership, actor_email=caller.email)
     await db.commit()
     return {"removed": user_id}
@@ -855,6 +875,8 @@ async def set_member_role(
             raise _owned_team_limit_error() from exc
     if membership.role == "owner" and body.role != "owner" and await _count_owners(org_id, db) <= 1:
         raise HTTPException(status_code=409, detail="cannot demote the last owner — promote another owner first")
+    await enterprise_sso.record_role_change(db, org_id, actor=caller.user.id,
+        subject=user_id, from_role=membership.role, to_role=body.role)
     membership.role = body.role
     await db.commit()
     return {"user_id": user_id, "role": body.role, "org_id": org_id}
@@ -892,15 +914,29 @@ async def delete_org(
     if confirm != org.slug:
         raise HTTPException(status_code=422, detail=(
             f"to delete this team, confirm with its slug: ?confirm={org.slug}"))
+    from ..models import EnterpriseSSO
+    sso = await db.get(EnterpriseSSO, org_id)
+    if sso is not None and sso.stripe_subscription_id and sso.subscription_status not in {"canceled", "incomplete_expired"}:
+        raise HTTPException(status_code=409, detail="cancel the SSO subscription in Billing before deleting this team")
+    if sso is not None and sso.workos_org_id and sso.workos_cleanup_completed_at is None:
+        raise HTTPException(status_code=409, detail="wait for SSO setup cleanup before deleting this team")
+    # The team's archived answers go with it (archive.md, "Opting out"). The opt-out is set and
+    # committed first, so nothing new of the team's is recorded from here on; the object phase
+    # then runs on its own short sessions after this one has let go of its connection, and a
+    # failure there keeps the team (opted out), so the owner simply tries again.
+    if org.archive_opt_out_at is None:
+        org.archive_opt_out_at = _utcnow_naive()
+    await db.commit()
+    await archive_erasure.erase_org(org_id)
     await teams.cascade_delete_org(org, db)
     await db.commit()
     return {"deleted_org": org_id}
 
 
-# ---- machine identities: the publishable demo token, and agents ----------------------------
-# Both are Users on an UNROUTABLE domain, which is what makes them machines rather than people: no
-# login door can ever resolve one (guarded in `_find_or_create_user`) and neither may act as a USER
-# (guarded in `require_identity`). Everything else they inherit from Membership for free.
+# Machine identities (the publishable demo token, and agents) are both Users on an UNROUTABLE
+# domain, which is what makes them machines rather than people: no login door can ever resolve one
+# (guarded in `_find_or_create_user`) and neither may act as a USER (guarded in `require_identity`).
+# Everything else they inherit from Membership for free.
 # NOTE: "agent" here is an IDENTITY — a coding agent / automation that calls treg. It is NOT the
 # skill-directory table in `agents.py` (which answers "where does each coding agent keep its skills").
 # The words collide, the concepts don't; kept apart deliberately.
@@ -991,7 +1027,6 @@ async def delete_public_token(
     return {"public_token_revoked": True, "org": org.slug}
 
 
-# ---- agents: a member identity for a machine caller ----------------------------------------
 # An agent is JUST a Membership whose user lives on AGENT_DOMAIN, which is why this needs no new
 # table and no migration: it inherits every per-member control already in place — `daily_call_cap`
 # (enforced by `_enforce_daily_cap`), `tool_access` (`_require_tool_access`, on the proxy AND both run
@@ -1083,16 +1118,19 @@ async def create_agent(
         # rows without ever passing the parser.
         pins = dict(_validate_tag_pair(k, v) for k, v in pins.items())
     membership.pinned_tags = pins or None
+    enterprise = await db.get(EnterpriseSSO, org_id)
     try:
-        token, _ = await managed_keys.rotate_agent_key(
+        token, key = await managed_keys.rotate_agent_key(
             db, membership, user, actor_email=caller.email,
+            sso_org_id=org_id if enterprise is not None and enterprise.enforced else None,
         )
         await db.commit()
-    except (managed_keys.RotationConflict, IntegrityError):
+    except (managed_keys.RotationConflict, IntegrityError) as exc:
         await db.rollback()
-        raise HTTPException(status_code=409, detail="another rotation already replaced this agent key")
+        raise HTTPException(status_code=409, detail="another rotation already replaced this agent key") from exc
     response.headers["Cache-Control"] = "no-store"
     return {"token": token, "name": name, "email": email, "org": caller.org.slug, "user_id": user.id,
+            "api_key_id": key.id,
             "role": membership.role, "daily_call_cap": membership.daily_call_cap,
             "tool_access": membership.tool_access, "project_access": membership.project_access,
             "local_run_enabled": membership.local_run_enabled,
@@ -1112,8 +1150,8 @@ async def list_agents(
     )).scalars().all()}
     used = await _used_today_by_user(db, org_id)
     agent_emails = [u.email for u in users.values() if _is_agent_email(u.email)]
-    # "connected" = the agent has EVER called in as itself (checkin or any real call) — what the
-    # token card polls to flip to ✓ the moment the setup instruction's final step runs.
+    # The roster shows lifetime identity history. The setup card polls the separate connection
+    # endpoint for its newly issued key, so a rotation cannot inherit an old key's check-in.
     seen = set((await db.execute(
         select(CallRecord.user_email).where(
             CallRecord.org_id == org_id, CallRecord.user_email.in_(agent_emails)).distinct()
@@ -1132,6 +1170,32 @@ async def list_agents(
                     "created_by": m.created_by, "promoted_from": m.promoted_from,
                     "connected": user.email in seen})
     return out
+
+
+@app.get("/orgs/{org_id}/agents/{user_id}/connection")
+async def agent_connection(
+    org_id: int, user_id: int, response: Response, api_key_id: int = Query(gt=0),
+    caller: Caller = Depends(require_member), db: AsyncSession = Depends(get_session),
+) -> dict:
+    """Whether this agent's issued key has checked in or made a call. No roster or usage scan."""
+    _require_admin_of(org_id, caller)
+    email = (await db.execute(
+        select(User.email).join(Membership, Membership.user_id == User.id)
+        .join(ApiKey, ApiKey.membership_id == Membership.id)
+        .where(Membership.org_id == org_id, User.id == user_id,
+               ApiKey.id == api_key_id, ApiKey.org_id == org_id,
+               ApiKey.kind == managed_keys.AGENT_KIND, ApiKey.state == managed_keys.ACTIVE)
+    )).scalar_one_or_none()
+    if email is None or not _is_agent_email(email):
+        raise HTTPException(status_code=404, detail="unknown active agent key")
+    # (org_id, api_key_id, id) already has an index. EXISTS stops at the first matching row and
+    # never loads evidence bodies, counts usage, or groups the observed-agent history.
+    connected = (await db.execute(select(select(CallRecord.id).where(
+        CallRecord.org_id == org_id, CallRecord.api_key_id == api_key_id,
+        CallRecord.user_email == email,
+    ).exists()))).scalar_one()
+    response.headers["Cache-Control"] = "no-store"
+    return {"connected": connected}
 
 
 @app.post("/agents/checkin")
@@ -1156,7 +1220,7 @@ async def agent_checkin(
 
 @app.get("/orgs/{org_id}/agents/observed")
 async def list_observed_agents(
-    org_id: int, caller: Caller = Depends(require_member), db: AsyncSession = Depends(get_session)
+    org_id: int, caller: Caller = Depends(require_member), db: AsyncSession = Depends(get_report_session)
 ) -> list[dict]:
     """The agents ALREADY running under members' own tokens, discovered from traffic: one row per
     (member, runtime) seen in the last 30 days, e.g. "sam@… / claude-code". The zero-setup half
@@ -1232,7 +1296,7 @@ org_usage_router = app
 @app.get("/orgs/{org_id}/usage")
 async def org_usage(
     org_id: int, days: int = 30,
-    caller: Caller = Depends(require_member), db: AsyncSession = Depends(get_session),
+    caller: Caller = Depends(require_member), db: AsyncSession = Depends(get_report_session),
 ) -> dict:
     """Usage rollups for an org over the last `days` (admin/owner): by user (with a call/local/server
     split), by tool, by day, and totals — counts only, no request/response bodies. Powers the dashboard
@@ -1241,6 +1305,47 @@ async def org_usage(
     days = max(1, min(days, 365))
     since = _day_start_utc() - timedelta(days=days - 1)  # inclusive of today + the prior days-1
     return {"days": days, "since": since.isoformat(), **await _usage_rollup(db, org_id, since)}
+
+
+@app.get("/orgs/{org_id}/usage/spend")
+async def usage_spend(
+    org_id: int,
+    from_: str | None = Query(default=None, alias="from"), to: str | None = None,
+    group: str = "day", key: int | None = None, provider: str | None = None, stack: str = "key",
+    caller: Caller = Depends(require_member), db: AsyncSession = Depends(get_session),
+) -> dict:
+    """The team's billed spend between two UTC days (`from`..`to`, YYYY-MM-DD; default the last 30
+    days), bucketed by day, week or month and stacked by API key or, within one provider, by tool
+    (admin/owner). Read only from the daily spend rollup, never the ledger or the audit table, so
+    the range starts no earlier than the rollup's `history_from`. `ready` is false, with no
+    numbers, until the rollup has caught up once."""
+    _require_admin_of(org_id, caller)
+    if group not in key_spend.GROUPS:
+        raise HTTPException(status_code=422, detail="group is day, week or month")
+    if stack not in ("key", "tool"):
+        raise HTTPException(status_code=422, detail="stack is key or tool")
+    if stack == "tool" and not provider:
+        raise HTTPException(status_code=422, detail="stack by tool needs a provider")
+    today = _day_start_utc().date()
+    try:
+        last = min(date.fromisoformat(to) if to else today, today)
+        first = date.fromisoformat(from_) if from_ else key_spend.first_day(last, key_spend.WINDOW_DAYS)
+    except ValueError as exc:
+        raise HTTPException(status_code=422, detail="from and to are dates: YYYY-MM-DD") from exc
+    if first > last:
+        raise HTTPException(status_code=422, detail="from must not be after to")
+    state = await key_spend.history(db)
+    if not state["ready"]:
+        return {"ready": False, "history_from": state["history_from"]}
+    first = max(first, date.fromisoformat(state["history_from"]))
+    if first > last:   # a range wholly before the history: an empty chart of its last day
+        first = last
+    report = await key_spend.spend_report(db, org_id, first, last, group=group, key_id=key,
+                                          provider=provider or None, stack=stack)
+    for option in report["options"]["providers"]:
+        known = oauth_providers.get(option["id"])
+        option["name"] = known.display_name if known else option["id"]
+    return {"ready": True, "history_from": state["history_from"], **report}
 
 
 app = APIRouter()
@@ -1269,7 +1374,7 @@ async def list_tag_keys(
 @app.get("/orgs/{org_id}/usage/by-tag")
 async def usage_by_tag(
     org_id: int, key: str | None = None, days: int = 30,
-    caller: Caller = Depends(require_member), db: AsyncSession = Depends(get_session),
+    caller: Caller = Depends(require_member), db: AsyncSession = Depends(get_report_session),
 ) -> dict:
     """What each value of one tag consumed — the numbers a reselling builder invoices from.
 
@@ -1289,9 +1394,7 @@ async def usage_by_tag(
 
     by_value = await ledger.spend_by_tag(db, org_id, dim, since)
     org_total = (await ledger.spend_since(db, org_id, since))["spend_micro"]
-    # Counts come from the tag rows too. `CallRecord` holds only the primary dimension, so counting
-    # there reported 0 for every non-primary key while the money column was correct — a report that
-    # disagrees with itself is worse than one that admits its grain.
+    # Counts come from the tag rows too: `CallRecord` holds only the primary dimension.
     counts = await ledger.calls_by_tag(db, org_id, dim, since)
     rows = [{"value": val, "charged_micro": micro, "charged_usd": ledger.usd(micro),
              "calls": int(counts.get(val, 0))}
@@ -1329,10 +1432,10 @@ async def rename_org(
                                allow_reserved=bool(caller.user.is_superadmin))
         await db.commit()
     except ValueError as e:
-        raise HTTPException(status_code=409 if "taken" in str(e) else 400, detail=str(e))
-    except IntegrityError:
+        raise HTTPException(status_code=409 if "taken" in str(e) else 400, detail=str(e)) from e
+    except IntegrityError as exc:
         await db.rollback()
-        raise HTTPException(status_code=409, detail="slug is taken")
+        raise HTTPException(status_code=409, detail="slug is taken") from exc
     analytics.capture(caller.email, "org_renamed", {
         "org_id": org.id, "slug_changed": org.slug != old_slug})
     return {"org_id": org.id, "org": org.slug, "previous_slug": org.previous_slug, "name": org.name}
@@ -1351,6 +1454,9 @@ async def get_org_settings(
             "daily_cap_set_by_team": int(org.daily_cap_micro or 0) or None,
             "platform_default_micro": get_settings().platform_daily_cap_micro,  # 0 = none
             "platform_overflow": not org.platform_overflow_disabled,
+            # The archive opt-out (archive.md, "Opting out"): the moment the team objected, or None.
+            "archive": org.archive_opt_out_at is None,
+            "archive_opt_out_at": org.archive_opt_out_at.isoformat() if org.archive_opt_out_at else None,
             "budget_dims": _budget_dims_of(org), "primary_dim": _primary_dim_of(caller)}
 
 
@@ -1374,6 +1480,11 @@ async def set_org_settings(
         org.daily_cap_micro = body.daily_cap_micro
     if "platform_overflow" in sent and body.platform_overflow is not None:
         org.platform_overflow_disabled = not body.platform_overflow
+    if "archive" in sent and body.archive is not None:
+        if not body.archive and org.archive_opt_out_at is None:
+            org.archive_opt_out_at = _utcnow_naive()   # the moment of objection is the record
+        elif body.archive:
+            org.archive_opt_out_at = None
     if "budget_dims" in sent and body.budget_dims is not None:
         dims = [d.strip().lower() for d in body.budget_dims if d and d.strip()]
         if len(dims) > _MAX_BUDGET_DIMS:
@@ -1446,9 +1557,8 @@ async def set_tag_budget(
         _validate_tag_pair(dim, val)  # same rule as the call path — this value becomes a storage key
     declared = _budget_dims_of(caller.org)
     if dim not in declared:
-        # Setting a limit IS the declaration. Requiring a separate PATCH first made the common path a
-        # hidden two-step: the tag shows up in usage reports, so a person reasonably expects to be
-        # able to cap it, and got a 422 telling them to go configure something else first.
+        # Setting a limit IS the declaration: the tag shows up in usage reports, so a person
+        # reasonably expects to be able to cap it without configuring something else first.
         #
         # The BOUND still holds, because it is what keeps the call path cheap — each declared
         # dimension is another indexed lookup on every proxied call and another row per value. Past

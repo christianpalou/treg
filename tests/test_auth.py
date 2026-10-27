@@ -11,7 +11,7 @@ import hmac
 import json
 import time
 from contextlib import asynccontextmanager
-from urllib.parse import urlsplit
+from urllib.parse import parse_qs, urlsplit
 
 import pytest
 from fastapi import FastAPI
@@ -181,6 +181,68 @@ async def test_bad_state_rejected(login):
     await c.get(f"/auth/{provider}", follow_redirects=False)
     cb = await c.get(f"/auth/{provider}/callback?code=abc&state=WRONG", follow_redirects=False)
     assert cb.status_code == 400
+
+
+async def test_configured_alias_keeps_social_login_on_its_own_origin(login, monkeypatch):
+    provider, client = login
+    monkeypatch.setenv("TREG_PUBLIC_HOST_ALIASES", '["alias.example"]')
+    get_settings.cache_clear()
+    client.base_url = "https://alias.example"
+    response = await client.get(f"/auth/{provider}")
+    query = parse_qs(urlsplit(response.headers["location"]).query)
+    assert query["redirect_uri"] == [f"https://alias.example/auth/{provider}/callback"]
+    state = client.cookies.get("treg_oauth_state")
+    callback = await client.get(f"/auth/{provider}/callback", params={"code": "abc", "state": state})
+    assert callback.status_code == 302 and callback.headers["location"] == "/app"
+    assert (await client.get("/auth/me")).status_code == 200
+
+
+async def test_cli_social_callback_returns_to_picker_without_issuing_token(login):
+    provider, client = login
+    started = (await client.post("/auth/cli/start")).json()
+    await client.get(f"/auth/{provider}", params={"cli": started["login_id"]})
+    state = client.cookies.get("treg_oauth_state")
+    callback = await client.get(f"/auth/{provider}/callback", params={"code": "abc", "state": state})
+    assert callback.status_code == 302
+    assert callback.headers["location"] == f"/login?cli={started['login_id']}"
+    assert client.cookies.get(sess.COOKIE)
+    assert (await client.get("/auth/cli/poll", params={"login_id": started["login_id"]})).json() == {
+        "status": "pending",
+    }
+    assert (await client.post("/auth/cli/approve", json=started)).status_code == 200
+    result = (await client.get("/auth/cli/poll", params={"login_id": started["login_id"]})).json()
+    assert sess.read_identity_claims(result["token"])["scope"] == sess.BOOTSTRAP_SCOPE
+
+
+async def test_cli_social_callback_storage_failure_uses_the_browser_error_page(login, monkeypatch, caplog):
+    from types import SimpleNamespace
+    from sqlalchemy.exc import OperationalError
+    from treg.application import auth
+
+    provider, client = login
+    started = (await client.post("/auth/cli/start")).json()
+    await client.get(f"/auth/{provider}", params={"cli": started["login_id"]})
+    state = client.cookies.get("treg_oauth_state")
+    consume = auth._consume_cli_state
+
+    def unavailable():
+        raise OperationalError("synthetic", {"state": "private-test-value"}, Exception("storage down"))
+
+    async def fail_consume(state):
+        with monkeypatch.context() as patch:
+            patch.setattr(auth, "database", SimpleNamespace(session_maker=unavailable))
+            return await consume(state)
+
+    monkeypatch.setattr(auth, "_consume_cli_state", fail_consume)
+    response = await client.get(f"/auth/{provider}/callback", params={"code": "abc", "state": state})
+    assert response.status_code == 502  # the existing callback_failed page/status
+    assert response.headers["content-type"].startswith("text/html")
+    assert "Login failed" in response.text and "Please try again" in response.text
+    assert "private-test-value" not in response.text and "private-test-value" not in caplog.text
+    assert not client.cookies.get(sess.COOKIE)
+    assert (await client.get("/auth/cli/poll", params={"login_id": started["login_id"]})).json() == {
+        "status": "pending",
+    }
 
 
 async def test_no_session_no_token_is_401(gc):
@@ -367,8 +429,15 @@ async def test_oauth_arena_return_cookie_encrypts_and_restores_query(gc):
                          if h.startswith("treg_arena_return="))
     assert "HttpOnly" in return_header and "SameSite=lax" in return_header
 
+
     state = gc.cookies.get("treg_oauth_state")
     response = await gc.get("/auth/github/callback", params={"code": "test", "state": state})
     assert response.status_code == 302
     assert response.headers["location"] == target
     assert gc.cookies.get("treg_arena_return") is None
+
+
+def test_arena_return_target_accepts_web_arena_only_on_local_path():
+    from treg.routers.auth import _arena_return_target
+    assert _arena_return_target("/web-arena") == "/web-arena"
+    assert _arena_return_target("https://other.example/web-arena") == ""

@@ -47,8 +47,53 @@ contract's enum and description with MCP. It validates the reference and trimmed
 posts to `/reviews`, prints a receipt, and emits structured errors without echoing rejected input.
 A transport failure explicitly leaves the outcome unconfirmed. `_show_hint_line`, beside the
 charge line, prints the server's invitation (`X-Treg-Hint: review|feedback`; the older
-`X-Treg-Review: requested` still means review) as one stderr line per kind. Call responses
+`X-Treg-Review: requested` still means review) as one stderr line per kind. When a successful
+call to one provider's endpoint carries `X-Treg-Routed-Tool` (set by `routers/call.py`
+`_routed_alternative`: the routed `treg.<capability>` tool for the same job), it prints one more
+line pointing to that tool; `--json` puts it in `_treg.routed_tool`, and MCP returns `routed_tool`
+with a `suggestion` sentence beside the result, leaving the invitation `hint` slot alone. Call responses
 retain the existing `_show` formatting on stdout, including pretty-printed JSON.
+
+## Bare `treg`: the home view
+
+Nearly every caller is an agent, so `treg` with no arguments answers with live state instead of a
+usage error that costs it a turn on `--help`. The top-level subparsers are not required and the
+parser's default `fn` is `cmd_home`, so `--org` and `--json` apply as everywhere else. `_home_state`
+reads `/auth/me` for the account, then resolves the team the way `balance` and `whoami` do: `/orgs`
+(`_org_rows`, picked by `_pick_org`: the effective org, else the active one), falling back to the
+team `/auth/me` names when `/orgs` refuses an agent key. `_active_org` (and `_active_org_id` on top
+of it) is that same order for every other command. Then `/orgs/{id}/balance?limit=1` and `/tools`,
+each under a short timeout. Each read stands alone (`_quietly`): one that fails or answers in an
+unexpected shape leaves out its own line, and the command always exits 0. The output is plain
+`key: value` lines (`bin`, `version`, `description`, `registry`, `account`, `team`, `balance`,
+`own_tools[N]`) ending in `help[N]`, runnable next commands with runtime values as `<placeholders>`
+(`_home_help`). A blocker leads the help: no treg registry at that URL (`treg config`), a registry
+5xx (run `treg` again), not signed in, a stale active team (`treg org ls` / `org use`), no team at
+all, or an empty balance (`treg topup`).
+`--json` prints the same state as one object with `balance_micro` and a `help` list.
+
+`catalog search` says how routed rows work once, as a `hint:` line below the table (only when a
+routed row printed); inside the table an indented sentence read like one more row. The last line,
+`next:`, names `treg catalog get <id>` with the first row as the example.
+Every `▸` row keeps its provider count (`ROUTED (26 providers)`): only a few children print, so the
+count is where an agent learns how many the routed id draws on.
+
+## Pasted-key connect
+
+`treg connections connect --provider <service>` (and the hidden `oauth connect`) first reads
+`GET /oauth/providers`. A provider whose `auth_kind` is `key` or `token` has no consent screen, so
+`_connect_pasted_key` reads the key with `getpass` at a terminal, or all of stdin with
+`--key-stdin`, which keeps it off the command line and out of shell history, and posts it to
+`POST /connections/token`; the server verifies it against the provider before storing it. A
+provider that signs with a pair (`needs_extra_credential`, e.g. Tomba's key + secret) reads both
+halves first (a second hidden prompt, or the second piped line) and then posts the other half to
+`POST /connections/{id}/extra-credential`, so a half-built connection is never the outcome. Without
+a terminal and without `--key-stdin` it exits with that instruction rather than reading stdin: an
+agent's idle pipe would otherwise hang the read, the same intent rule `upload` follows for
+credentials. A `name`, `--capability`, `--client-secret` or `--scopes` is refused locally, because a
+pasted key is one per team. An unreadable listing (an older server, an error, a proxy page) falls
+back to `POST /oauth/start`, which itself refuses a pasted-key provider and names this path; every
+other provider takes the consent flow there.
 
 ## Instagram grants
 
@@ -77,9 +122,14 @@ re-runs the server's `install.sh` to upgrade the CLI in place. A global **`--jso
 `main` like `--org`; both last one `main()` call, reset on entry and exit) makes the human-table commands (`org ls`, `agents ls`, `catalog` in all its forms)
 emit raw JSON instead — one stable contract for agents. On `call` (not `--await`) it prints one
 compact envelope, `{"result": <body>, "_treg": {http_status, call_id, charged_micro | reserved_micro,
-replay?, async?, hint?}}` (`_call_envelope`; text as a string, binary as base64), and suppresses the
-charge, hint and failure-diagnostic stderr lines: a script that merged the streams once discarded
-every result it had paid for. Exit status is unchanged (1 on HTTP >= 400).
+replay?, async?, hint?, treg_saturated?, retry_after_seconds?}}` (`_call_envelope`; text as a
+string, binary as base64), and suppresses the charge, hint and failure-diagnostic stderr lines: a
+script that merged the streams once discarded every result it had paid for. Exit status is
+unchanged (1 on HTTP >= 400).
+The failure-diagnostic line names whose answer a 4xx/5xx is from `X-Treg-Error`. treg's
+saturation 503 carries no `X-Treg-Error` (see [api](api.md)), so the CLI reads its typed
+`treg_saturated` body instead; a client that only checks the header blames the provider.
+Output and the CLI's own text files are UTF-8 on every console.
 **`TREG_CONFIG`** points the CLI at an alternate config file (CI/agents/tests; default
 `~/.treg/config.json`). `org use` validates the slug against `/orgs`, then gets that membership's
 active Default key before it saves either value. If that exchange fails, the previous team and token
@@ -126,10 +176,14 @@ for a per-org token, and picks the org for an identity token). `_effective_org` 
 exits non-zero on HTTP >= 400, and on >= 400 first prints one stderr line (`_show_failure_diagnostics`,
 2026-09-05): the HTTP status, whose answer it is (`X-Treg-Error: 1` = treg refused; absent = the
 provider answered and treg relayed it unchanged), the `X-Treg-Call-Id` to quote to support, and the
-`X-Treg-Cost-Micro` charge when the header is present. stdout stays the exact body — a runner that
-saved only stdout filed 115 relayed Moz quota 403s as a bare "cli_error" with no status or id. A
+`X-Treg-Cost-Micro` charge when the header is present. When `TREG_TOKEN` is set, treg's own 401
+(never a relayed one) adds that the variable overrides `treg login` and needs a current key: the
+body's `hint` cannot know that. stdout stays the exact body — a runner that saved only stdout
+filed 115 relayed Moz quota 403s as a bare "cli_error" with no status or id. A
 metered 2xx gets the matching line (`_show_charge_line`: `treg: charged $0.006667 · call id …`,
-replay-aware). An async submission instead says `reserved up to $… for async settlement`, because
+replay-aware), plus a provider-failure line for `X-Treg-Upstream-Failed` ([api](api.md)). `X-Treg-Capacity:
+exhausted` (treg's own account is out) replaces the failure line's "whose answer" with the shared
+notice, or follows the charge line on a 2xx. An async submission instead says `reserved up to $… for async settlement`, because
 its header is the open hold ceiling rather than the final charge. No cost header (own key,
 non-call response) → nothing extra.
 
@@ -215,8 +269,10 @@ Bare **`treg connections`** now lists (the subparser is `required=False` with a 
   code**; the poll result may carry `active_org` = the team picked in the browser, which `cmd_login` adopts
   directly, falling back to `_pick_active_org` only against an older server (where `/start` 404s → a
   locally-minted `login_id`, no code)),
-  `login --email you@x.com` (terminal-only email OTP: `POST /auth/email/start` →
-  prompts for the 6-digit code → `/auth/email/verify`, storing the identity token), or `login --token <t>`
+  `login --email you@x.com` (email OTP from the terminal: `POST /auth/email/start` →
+  prompts for the 6-digit code → `/auth/email/verify`, storing the identity token; a server that
+  requires a browser check answers 400 with `X-Treg-Captcha: required`, and the CLI says so and
+  continues with the browser handshake instead), or `login --token <t>`
   for agents/CI — which now **verifies the token via `/auth/me` before saving** (a rejected token exits
   loudly instead of the old misleading "Token saved"; a valid token whose user has no team yet prints a
   "create a team first" hint rather than a silent `Active org: None`). First login by
@@ -284,8 +340,9 @@ Bare **`treg connections`** now lists (the subparser is `required=False` with a 
   catalog (prompts for its key env var + API base_url) and prints a catalog-entry snippet to share; an
   unknown bin isn't server-allow-listed, so it runs locally until an admin allow-lists it. Brains in
   `providers.py` + `skills.py`; see [env-import](env-import.md).
-- **`call`** (`target`, optional `path`; `--method`, `--query K=V` repeatable, `--data`, `--file`,
-  `--content-type`, `--header 'K: V'` repeatable) → three shapes: named `call <tool> <path>`, agent-native
+- **`call`** (`target`, optional `path`; `--method`, `--query K=V` repeatable, `--data` (also
+  `@PATH`, `@-`; body rules in USAGE.md), `--file`, `--content-type`, `--header 'K: V'`
+  repeatable) → three shapes: named `call <tool> <path>`, agent-native
   single URL `call https://host/full/path` (path omitted), or a **catalog endpoint id**
   `call tikhub.tiktok.video.comments` — all hit `/call/<rest>`. **`--header`** adds an
   extra request header the binding can't know (e.g. Google Ads' per-call `login-customer-id`); an
@@ -317,7 +374,9 @@ Bare **`treg connections`** now lists (the subparser is `required=False` with a 
   lifetime) and its RUN IT template ends in `--await --timeout 900`. `--await [--timeout 900]`
   reads `X-Treg-Async`; without the header it is a no-op. Descriptor semantics come from `treg.domain.asynctasks` (stdlib-only, see
   the import-boundaries fragment), not a CLI-side copy. With the header it prints the task id and a resumable `treg call` command to
-  stderr, polls static catalog ids or allow-listed dynamic URLs through `/call/`, retries network/5xx
+  stderr, polls static catalog ids or allow-listed dynamic URLs through `/call/` every descriptor
+  `interval` and never past its `max_age`, prints a submission that is already finished
+  (`terminal_on_submission`) without polling, retries network/5xx
   failures with backoff up to five consecutive failures, and keeps waiting on unknown status values
   after one warning. Stdout contains only the terminal polling response bytes. Exit codes are 0 for
   success, 2 for a provider terminal failure, 3 for timeout/interruption/recoverable polling failure,
@@ -362,8 +421,7 @@ Bare **`treg connections`** now lists (the subparser is `required=False` with a 
     locally). `treg tool update <id> --local-run on|off` flips `cli.enabled`. **`--fs-jail`** (opt-in, macOS)
     confines the CLI's file writes to a private scratch (`fsjail.macos_profile` + `sandbox-exec`, forwarded
     via `TREG_RUN_FSJAIL`) so it can't drop the key in a member-readable file — see [local-run](../architecture/local-run.md).
-  - **`--server`** (Tier 0, `_run_server`) — run a runnable skill's CLI **on the registry server** (`POST
-    /run`, `--timeout` cap 600), secrets injected server-side, stdout/stderr + exit code streamed back.
+  - **`--server`** (`_run_server`) — sends `POST /run`, which is disabled globally and returns 503.
     **`cli runs`** (`cmd_runs`, `--limit`) shows the run audit log — now **BOTH tiers**: `GET /runs` merges
     server runs and local grants, each tagged `where` (`server`|`local`; a local success has a null exit
     code, since only failures report back).
@@ -371,7 +429,8 @@ Bare **`treg connections`** now lists (the subparser is `required=False` with a 
 - **`cli shell`** (`cmd_shell_start`/`cmd_shell_stop`) — **`cli shell start`** opens a subshell where the team's
   registered CLIs run with the credential injected transparently (a shim dir first on `PATH` routes each to
   `treg run`); **`cli shell stop`** (or `exit`) leaves. `--server-for a,b` routes named tools to the server
-  (key never on the machine, if `server_runnable`), `--ttl MIN` auto-closes. **`--proxy`** (opt-in, with
+  only when `server_runnable` is true; the server now reports false for all tools. `--ttl MIN`
+  auto-closes. **`--proxy`** (opt-in, with
   `--proxy-port` / `--renew-ca`) additionally catches HTTPS calls the AGENT makes on its own to a
   registered host — `_start_local_proxy` seeds the allow-list from the tool listing already fetched for
   the shims and hands `start_session` the environment + a stop callback. See [shell](shell.md) and
@@ -428,11 +487,20 @@ Bare **`treg connections`** now lists (the subparser is `required=False` with a 
   one thing worth reading *before* signing up. The CLI never parses the YAML itself (that needs pyyaml,
   a server extra); see [catalog](../architecture/catalog.md).
 - **`catalog search <query…> [--limit]`** (`_catalog_search`) — find an endpoint by what it DOES when you
-  don't know which shelf it sits on (`GET /catalog/search`). A compact ranked table: endpoint id,
+  don't know which shelf it sits on (`GET /catalog/search?engine=agent`: the search an agent's
+  `catalog_search` gets, judged where the judge runs, else the keyword page; the login token, when
+  there is one, says who is searching for the per-caller judge cap; an older server ignores
+  `engine` and answers by keyword). A `none` verdict prints "the catalog has no tool for" and the
+  request line, `closest` and a judge-less `keyword` page say so under the table. A compact ranked table: endpoint id,
   platform, provider, cost, `✓`/`·` verified, tier, clipped summary — footer hint `treg catalog get <id>`.
   Cost prints in **USD** (`_cost_usd`, 3 significant digits) rather than `_cost_label`'s source currency:
   the column is only worth reading if CNY and USD rows compare. The no-match message names
-  `treg catalog request "<query>"` — the empty search is the moment the filer exists.
+  `treg catalog request "<query>"` — the empty search is the moment the filer exists. An ADDED
+  column shows each tool's `added` day (`-` on a routed row). `--new [DAYS]` (30 when bare, capped
+  at 365 with one line saying so) keeps tools added in the last DAYS days and `--sort newest` lists
+  newest first; with either, the words are optional (`treg catalog search --new`). `--new` takes a
+  number, so search words go before it. An older server that ignores both options gets "this
+  server does not support --new yet", not plain results labelled as new. `catalog get` prints `added`.
 - **`catalog request <what's missing…>`** (`_catalog_request`) — file a "the catalog doesn't have X"
   report (`POST /tool-requests`, `source: cli`). Open endpoint, rate-limited server-side; a configured
   token rides along as attribution only, never a requirement.

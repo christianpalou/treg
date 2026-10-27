@@ -9,6 +9,7 @@ sources:
   - src/treg/domain/identity/session.py
   - src/treg/domain/identity/access.py
   - src/treg/domain/identity/api_keys.py
+  - src/treg/alembic/versions/0082_oauth_sso_provenance.py
   - src/treg/routers/api_keys.py
   - src/treg/routers/auth.py
   - src/treg/web/claude-connector.html
@@ -28,16 +29,25 @@ The same authorization server also serves one non-MCP client, "treg for Sheets" 
 its own resource (`<public_url>/table`) and scope, a grant that belongs to the person rather than one
 team, and a token accepted only on the table routes. See [table](table.md).
 
+When a team requires enterprise SSO, normal-login consent cannot create a grant for that team.
+SSO consent is scoped to its own team, including Sheets requests that select a team per call.
+`OAuthCode.sso_org_id` and `OAuthGrant.sso_org_id` retain that proof through code exchange and
+refresh; access tokens pass it through the internal identity bridge to `require_member`. A grant
+created before enforcement has no such proof and stops working on the enforced team at use and
+refresh. An SSO-scoped grant cannot be moved to another team.
+
 # MCP
 
 ## Feedback
 
-Both transports expose `feedback(category, message, call_ids?, endpoint_id?)`, using a four-value
-category enum and the shared HTTP intake. This is an additive, non-destructive write on treg,
-not an upstream call. It requires the existing transport identity and spends no balance.
-Both also expose `review(call_id, usefulness, reason?)` as a non-destructive, non-idempotent local
+The team `/mcp/` exposes `feedback(category, message, call_ids?, endpoint_id?)`, using a
+four-value category enum and the shared HTTP intake. This is an additive, non-destructive write on
+treg, not an upstream call. It requires the existing transport identity and spends no balance.
+It also exposes `review(call_id, usefulness, reason?)` as a non-destructive, non-idempotent local
 write relayed to `/reviews`, using the shared usefulness enum and description.
-See [feedback](feedback.md) for invitation sampling and hint priority. V2 retains its catalog-only calling boundary.
+See [feedback](feedback.md) for invitation sampling and hint priority. `/mcp/v2/` registers neither
+tool, so it never renders the review or feedback invitation `/call/` decided on
+(`_SurfacePolicy.invites`); `/call/` still decides and records it, as for OpenAI's clients.
 
 ## Managed bearer keys
 
@@ -53,6 +63,10 @@ and V2 audiences. They do not resolve through an `ApiKey` row and do not use a d
 This keeps OAuth refresh and audience isolation unchanged.
 
 ## Provider authorization remediation
+
+Both call adapters use the shared [Org concurrency guard](org-concurrency.md). Their structured
+results preserve HTTP `Retry-After` as `retry_after`, including the team media adapter, so MCP
+clients can retry a concurrency refusal without access to the internal HTTP response headers.
 
 Provider OAuth remains a human browser action. A catalog-call preflight can return a structured
 HTTP 428 body with the missing or expired grant, capability, scopes, exact CLI command, and safe
@@ -100,11 +114,10 @@ of shared behavior.
 
 | Area | Must stay shared | Intentional difference |
 |---|---|---|
-| catalog search | loading, ranking, price view, near misses, and the same process observation cache and refresh Task used by HTTP | next-call guidance and event source |
-| endpoint details | the `/catalog/endpoints/{id}` route and error shape | client attribution |
-| calls | request assembly, credentials, policy, limits, idempotency, relay, errors, metering, audit | team MCP accepts team tools; V2 accepts catalog ids only and splits read/write methods |
+| catalog search | loading, ranking, price view, near misses, and the same process observation cache and refresh Task used by HTTP | next-call guidance and event source; V2 drops rows on its hidden platforms |
+| endpoint details | the `/catalog/endpoints/{id}` route and error shape | client attribution; V2 refuses an endpoint on its hidden platforms |
+| calls | request assembly, credentials, policy, limits, idempotency, relay, errors, metering, audit | team MCP accepts team tools; V2 accepts catalog ids only, splits read/write methods, refuses its hidden platforms and shows no invitation |
 | balance | team selection, grant labels, balance route, error shape | client attribution |
-| feedback | `/feedback`, categories, privacy guidance, team scope and limits | client attribution |
 | catalog requests | `/tool-requests`, rate limit, field limits, caller IP | event source and client attribution |
 | transport | host checks, compression, cache headers, eager auth, static capabilities | V2 has a separate audience, metadata path, scope marker, and Claude browser origin |
 | lifecycle | the transport factory and `mcp_lifespan` | V2 mount and lifespan depend on its feature flag |
@@ -119,7 +132,12 @@ shared behavior and must also prove the listed differences. Keep these V2 proper
 new directory review approves a contract change:
 
 - `/mcp/v2/` is the stable URL, and `/mcp/v2` resolves to the same resource.
-- The tool list has ten tools, including `feedback` and `review`; directory submissions must reflect this schema.
+- The tool list has the six tools the directory listing was submitted with: `catalog_search`,
+  `catalog_get`, `catalog_call_read`, `catalog_call_write`, `balance`, `catalog_request`. Adding a
+  tool changes the listing; do it with a resubmission, not in passing.
+- V2 does not list, describe or call image, video, voice or music generation
+  (`_DIRECTORY_HIDDEN_PLATFORMS`): the listing states the server does not use AI models to generate
+  images, video or audio. The team `/mcp/` keeps them.
 - V2 accepts catalog ids only. It does not list or call arbitrary team tools or passthrough paths.
 - Read and write calls stay separate, and their annotations match their method classes.
 - V1 and V2 OAuth audiences do not cross.
@@ -181,11 +199,17 @@ idle SSE streams which can never deliver useful work.
 `call` is annotated **destructive + open-world + non-idempotent**, which reads as pessimistic until
 you notice treg does not model the upstream: it relays to somebody else's API and cannot know whether
 that endpoint charges, writes or deletes. Claiming otherwise would be a guess presented as a fact.
-`feedback` and `catalog_request` are the other non-reads. `catalog_request` is a write, but a harmless one (a row on treg itself,
-nothing upstream, nothing spent), so it stays closed-world and non-destructive. It relays to
-`POST /tool-requests` so rate limiting and field caps live in one place, forwarding the edge's
-`X-Forwarded-For` — the in-process relay would otherwise collapse every MCP caller into one
-rate-limit bucket. `catalog_search`'s zero-result hint names it, so an agent that just searched
+`feedback`, `review` and `catalog_request` are the other non-reads. They are harmless writes (a row on treg itself,
+nothing upstream, nothing spent), so they are non-destructive; on the team MCP they are open-world,
+because their text leaves the caller's account for the treg team (a review's reason may be quoted on a
+public catalog page), which is how the Codex plugin review reads that hint. OpenAI's clients (`openai-mcp/` for ChatGPT and its plugin reviewer, `codex-mcp-client/`
+for Codex, by User-Agent) are not offered `review` at all: `_OpenAIClientGate` drops it from
+`tools/list` and the review sentence from the instructions, and call results carry no review or
+feedback invitation for them, because that review reads agent-initiated rating as analytics
+collection. Other clients keep both. `catalog_request` relays to
+`POST /tool-requests` so rate limiting and field caps live in one place. Like every in-process
+call, it carries the caller's address as `_bearer` resolved it (`client_ip.py`, never the
+client-written `X-Forwarded-For`); otherwise every MCP caller would share one rate-limit bucket. `catalog_search`'s zero-result hint names it, so an agent that just searched
 and found nothing can file the gap in the same session — and the miss itself is logged as a
 `SearchMiss` row (`audit.record_search_miss`, `source="mcp"` on the team MCP and
 `source="claude-connector"` on V2): this tool reads the catalog in-process, so the HTTP route's own
@@ -203,7 +227,14 @@ capability pins, per-member tool access, the credential ladder, metering) live i
 second path that "just read the database" would be a second implementation of every one of them,
 drifting quietly. The in-process client stamps `X-Treg-Client: mcp` for the team MCP and
 `X-Treg-Client: claude-connector` for V2 (attribution, never a gate), so each MCP surface is
-distinguishable from unreported CLI traffic and from the other MCP surface.
+distinguishable from unreported CLI traffic and from the other MCP surface. It also forwards the
+host behind the tool call, as `_bearer` read it: `X-Treg-Mcp-Client` (`clientInfo.name`) and
+`X-Treg-Mcp-User-Agent` (the inbound User-Agent), on both MCP surfaces. `tool_called` and
+`call_intake_failed` record them as `mcp_client` and `mcp_user_agent`, and only when `X-Treg-Client`
+names an MCP surface, so a direct `/call/` cannot pose as an MCP host. The stateless transport keeps no `initialize`, so `clientInfo` is known only on a
+2026-07-28+ request, which carries it on every request; older clients are told apart by User-Agent.
+The internal request keeps httpx's own User-Agent, since that is what an own-key upstream sees, and
+relay drops every `x-treg-*` header before the upstream.
 
 The catalog is the one exception: read straight from `catalog_store`, which is already parsed in
 memory, so a search answers in about a millisecond. That is a **speed** choice, not a permission one.
@@ -244,7 +275,17 @@ each of which was added because a real endpoint needed it:
 
 Optional, and it is the caller's. Pass the same key when repeating a call whose answer never arrived:
 treg replays the stored response, does not reach the provider, and charges nothing, with
-`replayed: true` on the result.
+`replayed: true` on the result. The key becomes an `Idempotency-Key` header, and a header value is
+ASCII: an ASCII key travels unchanged, a non-ASCII one percent-encoded as UTF-8 (a digest of the whole
+key when that outgrows the stored length), so the same key always maps to the same header
+(`_header_idempotency_key`).
+
+## Request-building tools refuse undeclared arguments
+
+The SDK's argument model ignores keys a tool does not declare. For `call`, `call_media`,
+`catalog_call_read` and `catalog_call_write` a dropped key is a wrong request (`data` instead of
+`body` sent an empty POST), so `_UnknownCallArguments`, a `tools/call` middleware on both surfaces,
+refuses it before anything is sent and names the accepted arguments. Advertised schemas are unchanged.
 
 ## `call` says when the overflow relay served it
 
@@ -327,6 +368,12 @@ AuthKit MCP servers all do this; FastMCP tracks a 401-free `initialize` as a bug
 now fires for **every id-bearing JSON-RPC request** — `initialize`, `tools/list`, `tools/call`. Only
 **notifications** (no id, no response expected) and **`ping`** (liveness) pass without a credential;
 `.well-known/*` discovery is separate GET routes, untouched — that IS the discovery the client needs.
+Any **non-POST** request (a GET probe included) is challenged the same way (missing or dead token),
+and otherwise refused with **405** `Allow: POST`: the transport is stateless, so the SDK's standalone
+GET stream has no session to carry anything, and letting a GET through left a client that probes
+with one waiting on keep-alive pings instead of a 401. The protected-resource metadata is also served at the
+trailing-slash paths RFC 9728 derives from `/mcp/` and `/mcp/v2/`, since some clients do not follow
+a redirect during discovery.
 The challenge also carries `scope` (spec SHOULD) so a client requests least-privilege scopes up front.
 
 The middleware judges two cases, not one. **No credential** → the plain challenge above. **A dead
@@ -385,7 +432,7 @@ challenge scopes while omitting the RFC 8707 `resource` parameter. In that case,
 requests keep the V1 default.
 
 **Each MCP version has its own audience set.** `mcp_resource_audiences(version)` includes the
-configured `public_url` plus `config.PUBLIC_HOST_ALIASES` for that version. This is symmetric so a
+configured `public_url` plus `Settings.public_host_aliases` for that version. This is symmetric so a
 grant survives a host change or rollback. Host and trailing-slash aliases can normalize within V1 or
 within V2, but they never cross versions. A V1 token fails on `/mcp/v2/`, and a V2 token fails on
 `/mcp/`.
@@ -590,8 +637,8 @@ override it, and the header is not relayed to the provider.
 
 The generic `call` surfaces accept optional `form` scalar fields and base64 `uploads`, capped at 30
 MiB before the internal request, so multipart voice creation does not change the existing JSON call
-contract. `/mcp/v2/` names the audio tool `catalog_call_media`; both surfaces independently register
-and test `resources_list`. Native audio never passes through JSON/text decoding.
+contract. Only the team `/mcp/` registers `call_media` and `resources_list`; `/mcp/v2/` has neither.
+Native audio never passes through JSON/text decoding.
 
 `X-Treg-Meta` (see [money](money.md)) is read off the MCP **transport** in `mcp.call()` and forwarded
 on the internal request, the same way `catalog_request` forwards `X-Forwarded-For`. It is deliberately

@@ -40,7 +40,9 @@ Three layers, imports pointing inward:
 - **`infra/judge.py`** — TypeSafe's System One API (Jev). One request carries the query and every
   candidate as `state`, and one Noul question per candidate; the answer is a probability per row.
   It never raises: timeout, non-200, malformed body all return `probs=None` with a reason, and the
-  caller serves the baseline. Answers are cached in-process by (model, query, candidate ids, and
+  caller serves the baseline. A refusal every later request will also meet (401, 402 no credit, 403)
+  is an outage the baseline page hides, so it is logged at ERROR, which reaches error tracking: at
+  most once per status every ten minutes. Answers are cached in-process by (model, query, candidate ids, and
   any criteria or extra questions). A caller may attach Noul `criteria` to every candidate question
   and add `extra` questions about the same state, Noul (a probability) or Choice (the option, its
   confidence and every option's probability); a candidate in `job_view`'s shape is asked about a
@@ -127,9 +129,12 @@ query's vector), then lays the answer out for a page (`agent_page`):
   spend on the judge. It guards every dealt caller in `v2` mode before any judge, keyed by who
   the caller is (team and email); a caller the search could not resolve shares one bucket, since
   the tool reads the catalog without validating a per-team token and a made-up token would
-  otherwise be a fresh cap each search. Past it the hour's searches are the lexical page,
-  recorded `keyword:rate_limited`. The hub read and the cap each open and close their own
-  session before the judge is called.
+  otherwise be a fresh cap each search. The open HTTP route (`/catalog/search?engine=agent`, the
+  CLI's search) knows the caller's address, so there an unresolved caller is capped by address
+  instead (`ip:<address>`): one script cannot spend every signed-out caller's judge. Past it the
+  hour's searches are the lexical page, recorded `keyword:rate_limited`. The hub read, the caller
+  lookup and the cap each open and close their own session before the judge is called; the
+  route's own session is never used, and a failed caller lookup searches as unresolved.
 
 The HTTP route and the CLI still answer from the shipped ranker; they follow once the route's hub
 read holds no session through a judge call and the CLI sends its token.
@@ -209,6 +214,9 @@ and the public `/search` page, anonymous, rate limited, streamed, and switchable
   change how agents pick and turn the experiment into a different one. A v2 answer's verdict is a
   word, and its hint says what to do with it.
 - Page length is the same in every arm, so "more options" cannot masquerade as "better options".
+- A recently-added search (`added_within_days` or `sort=newest`, catalog.md "`added`") is not part
+  of the experiment: `added_page` serves it with no judge and no record. Without those inputs
+  `catalog_search` runs the experiment exactly as before.
 - Nothing here touches `/call/`, money, or the HTTP search route (`/catalog/find` is its own
   route). The routed-discovery switch
   (`routed_discovery`) applies to the judged page through the shared finishing function.

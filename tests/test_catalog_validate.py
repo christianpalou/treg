@@ -82,7 +82,7 @@ def test_cost_modifiers_accept_only_supported_declarative_credit_rules():
 
     bad_settle: list[str] = []
     validator.check_cost(base | {"settle": "estimate"}, "catalog:test", bad_settle, [])
-    assert any("cost.settle currently supports only 'base', 'modifiers' or 'usage'" in error for error in bad_settle)
+    assert any("cost.settle currently supports only 'base', 'modifiers', 'usage' or 'quantity'" in error for error in bad_settle)
 
 
 def test_status_marker_references_must_exist_and_end_at_a_live_endpoint():
@@ -228,9 +228,30 @@ def test_async_descriptor_must_be_a_mapping():
     assert any("async must be a mapping" in error for error in _async_errors([]))
 
 
-def test_async_descriptor_requires_per_success_cost():
-    errors = _async_errors(_valid_async(), {"type": "per_call"})
-    assert any("cost.type per_success" in error for error in errors)
+def test_async_descriptor_requires_per_success_or_per_call_cost():
+    assert _async_errors(_valid_async(), {"type": "per_call"}) == []
+    errors = _async_errors(_valid_async(), {"type": "per_result"})
+    assert any("cost.type per_success or per_call" in error for error in errors)
+
+
+def test_async_descriptor_bounded_by_max_age_may_have_no_failure_word():
+    descriptor = _valid_async()
+    del descriptor["status"]["failure"]
+    assert any("failure (optional with max_age)" in error for error in _async_errors(descriptor))
+    descriptor.update(max_age=300, terminal_on_submission=True)
+    assert _async_errors(descriptor) == []
+
+
+@pytest.mark.parametrize(("key", "value", "message"), [
+    ("max_age", 0, "async.max_age must be a positive number"),
+    ("max_age", 86401, "async.max_age must be a positive number"),
+    ("max_age", True, "async.max_age must be a positive number"),
+    ("terminal_on_submission", False, "terminal_on_submission must be true"),
+])
+def test_async_descriptor_rejects_invalid_bounds(key, value, message):
+    descriptor = _valid_async()
+    descriptor[key] = value
+    assert any(message in error for error in _async_errors(descriptor))
 
 
 def test_async_descriptor_rejects_non_get_or_non_utility_targets():
@@ -330,20 +351,6 @@ def test_untracked_extended_async_consumers_are_explicitly_byok_only():
         "tikhub.x.youtube-web-v2-get-video-captions-result",
         "dataforseo.x.serp-ai-summary",
         "dataforseo.x.serp-screenshot",
-        "dataforseo.x.on-page-content-parsing",
-        "dataforseo.x.on-page-duplicate-content",
-        "dataforseo.x.on-page-duplicate-tags",
-        "dataforseo.x.on-page-keyword-density",
-        "dataforseo.x.on-page-links",
-        "dataforseo.x.on-page-non-indexable",
-        "dataforseo.x.on-page-pages",
-        "dataforseo.x.on-page-pages-by-resource",
-        "dataforseo.x.on-page-raw-html",
-        "dataforseo.x.on-page-redirect-chains",
-        "dataforseo.x.on-page-resources",
-        "dataforseo.x.on-page-uncrawlable-resources",
-        "dataforseo.x.on-page-waterfall",
-        "dataforseo.x.on-page-summary-id",
     }
     for endpoint_id in ids:
         endpoint = catalog.by_id[endpoint_id]
@@ -492,6 +499,7 @@ def test_validator_checks_the_endpoint_descriptor_that_replaces_the_provider_def
         "    method: POST\n"
         "    path: /generate\n"
         "    summary: Generate a video\n"
+        "    added: '2026-09-01'\n"
         "    input:\n"
         "      body:\n"
         "        model: {type: string, required: true}\n"
@@ -577,7 +585,7 @@ def test_flat_price_usage_settlement_is_accepted():
     (lambda c: c.update(usage={"path": "usage.cost", "unit": "tokens"}),
      "needs a numeric fx.yaml unit_rates_usd entry"),
     (lambda c: c.update(settle="base"), "usage is only valid with settle: usage"),
-    (lambda c: c.update(settle="later"), "supports only 'base', 'modifiers' or 'usage'"),
+    (lambda c: c.update(settle="later"), "supports only 'base', 'modifiers', 'usage' or 'quantity'"),
 ])
 def test_flat_price_usage_settlement_rejects_bad_shapes(mutate, message):
     cost = _flat_usage_cost()
@@ -629,6 +637,26 @@ def test_reported_charge_requires_supported_units_and_path(rule):
     ))
 
 
+@pytest.mark.parametrize("rule,ok", [
+    ({"in": "query", "name": "max_cost_usd", "unit": "usd"}, True),
+    ({"in": "header", "name": "max_cost_usd", "unit": "usd"}, False),
+    ({"in": "query", "name": "max_cost_usd", "unit": "micro"}, False),
+    ({"in": "query", "name": "", "unit": "usd"}, False),
+    ({"in": "query", "name": "max-cost", "unit": "usd"}, False),
+    ({"in": "query", "name": "max_cost_usd", "unit": "usd", "extra": 1}, False),
+    (None, False),
+])
+def test_ceiling_param_shape(rule, ok):
+    errors: list[str] = []
+    validator.check_ceiling_param(rule, "test", errors, prefix="cost.ceiling_param")
+    assert bool(errors) is not ok
+    cost = dict(catalog_store.load().by_id["trykitt.people.email.find"]["cost"])
+    cost["ceiling_param"] = rule
+    errors = []
+    validator.check_cost(cost, "test", errors, [], provider="serper")
+    assert bool(errors) is not ok
+
+
 def test_reported_credit_charge_requires_a_provider_fx_rate():
     cost = dict(catalog_store.load().by_id['trykitt.people.email.find']['cost'])
     cost['reported_charge'] = {'path': 'billing.charge', 'unit': 'credit'}
@@ -652,6 +680,61 @@ def test_platform_request_requires_declared_fixed_body_value(rule, valid):
     validator.check_platform_request(rule, {'body': {
         'realtime': {'type': 'boolean', 'enum': [True]},
     }, 'queryParams': {'memory': {'type': 'integer', 'enum': [1024]}}}, 'test', errors)
+    assert (not errors) is valid
+
+
+_LABEL_INPUT = {'body': {'agent': {'type': 'string'}, 'credits': {'type': 'integer'}},
+                'pathParams': {'label': {'type': 'string'}}, 'headers': {'x-agent': {'type': 'string'}}}
+
+
+@pytest.mark.parametrize('rule,valid', [
+    (['body.agent'], True),
+    (['pathParams.label', 'headers.x-agent'], True),
+    (['body.credits'], False),          # a label is text, never a number
+    (['body.missing'], False),
+    (['body.agent', 'body.agent'], False),
+    ([], False),
+    ('body.agent', False),
+])
+def test_team_label_names_declared_text_fields(rule, valid):
+    errors = []
+    validator.check_team_label(rule, _LABEL_INPUT, 'test', errors)
+    assert (not errors) is valid
+
+
+@pytest.mark.parametrize('rule,valid', [
+    (['body.notify.email'], True),
+    (['body.notify'], False),            # an object, not an address
+    (['pathParams.label'], False),
+    (['body.nope'], False),
+    ([], False),
+])
+def test_caller_email_names_declared_text_fields(rule, valid):
+    errors = []
+    validator.check_caller_email(rule, {**_LABEL_INPUT, 'body': {**_LABEL_INPUT['body'], 'notify': {
+        'type': 'object', 'properties': {'email': {'type': 'string'}}}}}, 'test', errors)
+    assert (not errors) is valid
+
+
+_QTY = {'type': 'per_success', 'value': 1, 'currency': 'credit', 'per': 1, 'unit': 'credit',
+        'quantity': {'field': 'body.credits', 'max': 100000}, 'settle': 'quantity'}
+
+
+@pytest.mark.parametrize('patch,valid', [
+    ({}, True),
+    ({'quantity': {'field': 'body.agent', 'max': 10}}, False),        # not an integer field
+    ({'quantity': {'field': 'body.credits'}}, False),                  # no maximum
+    ({'quantity': {'field': 'body.credits', 'max': 0}}, False),
+    ({'settle': None}, False),                                         # must settle at what was bought
+    ({'type': 'per_call'}, False),
+    ({'quantity': {'field': 'body.credits', 'max': 10, 'applied': 'added'}}, True),
+    ({'quantity': {'field': 'body.credits', 'max': 10, 'applied': 5}}, False),
+    ({'reported_charge': {'path': 'cost', 'unit': 'credit'}}, False),  # a report must not change it
+])
+def test_a_quantity_price_is_bounded_and_settles_at_what_was_bought(patch, valid):
+    cost = {k: v for k, v in {**_QTY, **patch}.items() if v is not None}
+    errors = []
+    validator.check_cost_quantity(cost, _LABEL_INPUT, 'test', errors)
     assert (not errors) is valid
 
 
@@ -730,7 +813,8 @@ def test_contactout_person_routes_cannot_recapture_pii():
     endpoints = yaml.safe_load(path.read_text())["endpoints"]
     safe = {"contactout.people.count", "contactout.people.email.verify",
             "contactout.companies.search", "contactout.companies.enrich"}
-    structural = {"contactout.people.contact.work", "contactout.people.contact.phone"}
+    structural = {"contactout.people.contact.work", "contactout.people.contact.phone",
+                  "contactout.people.contact.personal"}
     for ep in endpoints:
         if ep["id"] in safe:
             continue
@@ -988,3 +1072,21 @@ def test_a_fixed_price_spools_when_its_success_rule_is_declared():
     errors: list[str] = []
     validator.check_spooled_response(ep, None, "x", errors)
     assert errors == []
+
+
+def test_the_fast_catalog_loader_reads_every_file_like_the_pure_python_one():
+    """`store._Loader` uses libyaml's C parser when it is installed; every shipped catalog file must
+    parse to the same document as with the pure-Python SafeLoader, timestamps kept as strings."""
+    import yaml
+    from treg.domain.catalog import store
+
+    class Pure(yaml.SafeLoader):
+        pass
+    Pure.yaml_implicit_resolvers = store._Loader.yaml_implicit_resolvers
+    if not getattr(yaml, "__with_libyaml__", False):
+        pytest.skip("libyaml not installed")
+    assert issubclass(store._Loader, yaml.CSafeLoader)
+    for path in sorted(store.CATALOG_DIR.rglob("*.yaml")):
+        text = path.read_text(encoding="utf-8")
+        assert yaml.load(text, Loader=store._Loader) == yaml.load(text, Loader=Pure), path.name
+    assert yaml.load("checked: 2026-09-01", Loader=store._Loader) == {"checked": "2026-09-01"}

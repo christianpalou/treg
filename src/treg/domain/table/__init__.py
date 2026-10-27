@@ -19,8 +19,9 @@ Four kinds of tool, four sources of columns (`column_source`):
 
 from __future__ import annotations
 
-import json
 from typing import Any
+
+from ... import jsontext
 
 MAX_DEPTH = 3               # a nested object flattens to `a.b.c` columns, no deeper
 MAX_WALK = 4                # how deep the search for lists of objects goes
@@ -49,9 +50,6 @@ _PEOPLE_MAP: tuple[tuple[str, tuple[str, ...]], ...] = (
 LIST_MAPS: dict[str, tuple[tuple[str, tuple[str, ...]], ...]] = {"people": _PEOPLE_MAP}
 
 
-# ------------------------------------------------------------------------------------------------
-# Cells and records
-
 def cell(value: Any) -> Any:
     """One value as a spreadsheet cell: a scalar as it is; a list of scalars joined with ", "
     (decision B); an object, or a list holding objects, as compact JSON."""
@@ -59,7 +57,7 @@ def cell(value: Any) -> Any:
         return value
     if isinstance(value, list) and all(v is None or isinstance(v, (bool, int, float, str)) for v in value):
         return ", ".join("" if v is None else str(v) for v in value)
-    return json.dumps(value, ensure_ascii=False, separators=(",", ":"))
+    return jsontext.dumps(value, separators=(",", ":"))
 
 
 def _hidden(key: Any) -> bool:
@@ -120,9 +118,6 @@ def _is_record_list(value: Any) -> bool:
     items = _items(value)
     return bool(items) and all(isinstance(v, dict) for v in items)
 
-
-# ------------------------------------------------------------------------------------------------
-# The four kinds of tool
 
 def from_contract(body: Any, output_fields: list[str], list_field: str | None) -> dict[str, Any]:
     """A routed job's answer, `{output, raw, _treg}`. `list_field` names the contract's required
@@ -303,4 +298,4 @@ def to_table(body: Any, *, contract_output: list[str] | None = None, list_field:
             return from_hub(body, hub_fields)
         return generated(body)
     except Exception:  # noqa: BLE001 - a table is a view; the answer itself was already delivered
-        return raw(json.dumps(body, ensure_ascii=False, default=str))
+        return raw(jsontext.dumps(body, default=str))

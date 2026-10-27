@@ -30,9 +30,8 @@ def routed_endpoint(contract: Contract, children: list[dict], adapters: dict[str
     prices = sorted(p for p in ((cost_view(e.get("cost"), e["provider"]) or {}).get("usd") for e in kids) if p is not None)
     lo, hi = (prices[0], prices[-1]) if prices else (None, None)
     # A child priced per call or per result bills its provider's answer even when treg judges it a
-    # miss and moves on: the caller pays those too (hub simulation runs 1-3: a people search shown
-    # as $0 charged $0.0905 for four misses, then a $0.05 hit). Only per-success and free children
-    # are free on a miss.
+    # miss and moves on: the caller pays those too. Only per-success and free children are free
+    # on a miss.
     billed_miss = sorted(e["id"] for e in kids
                          if ((e.get("cost") or {}).get("type") not in ("per_success", "free", None)))
     max_usd = contract.default_max_cost_usd or 1.00
@@ -68,11 +67,18 @@ def routed_endpoint(contract: Contract, children: list[dict], adapters: dict[str
                            f"(default ${contract.default_max_cost_usd or 1.00:g} per call; misses on per-success providers are free). Options ride as "
                            "headers, never in the body: X-Treg-Route-Waterfall: 0 (stop at the first miss), "
                            "X-Treg-Route-Max-Cost: <usd>, X-Treg-Route-Prefer / X-Treg-Route-Exclude: <provider>. The "
-                           "response is {output, raw, _treg: {served_by, tried}}; X-Treg-Served-By names the child.")},
+                           "response is {output, raw, _treg: {served_by, tried}}; X-Treg-Served-By names the child."
+                           + (f" X-Treg-Route-Verify: true checks a hit with {contract.check.endpoint} in the same call, "
+                              "at that call's own price, and reports it in _treg.verification "
+                              "{verdict, checked, served_by, cost_micro}." if contract.check else ""))},
         "test_request": {"body": {k: _EXAMPLE_VALUES.get(k, "…") for k in _best_variant(contract, kids, adapters)}} if contract.identity else {},
         "cost": {"type": "per_success", "value": lo, "currency": "USD", "per": 1, "unit": "call",
                  "source": "inferred", "confidence": "documented", "checked": None,
-                 "note": ((f"the children's range ${lo:g}–${hi:g} per hit, 0% markup; you pay the child that served "
+                 # No single quote is honest when children bill their misses: a $0 floor reads
+                 # as "free". Quote nothing.
+                 **({"varies": True} if billed_miss else {}),
+                 "note": ((("NOT free: misses are billed too. " if billed_miss else "")
+                           + f"the children's range ${lo:g}–${hi:g} per hit, 0% markup; you pay the child that served "
                            f"AND every child tried before it that bills a miss ({len(billed_miss)} of {len(kids)} do), "
                            f"up to X-Treg-Route-Max-Cost (default ${max_usd:g} a call). X-Treg-Route-Exclude them, or "
                            "X-Treg-Route-Waterfall: 0, to pay for one provider only")

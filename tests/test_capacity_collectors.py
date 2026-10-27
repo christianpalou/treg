@@ -6,14 +6,66 @@ Each test mocks the upstream API response and verifies that the collector return
 
 from __future__ import annotations
 
+import json
 import math
 from datetime import timedelta
 
 import httpx
 import pytest
 
-from treg.domain.capacity import collectors, policy, sweep
+from treg.domain.capacity import collectors, policy, signatures, sweep
 from treg.timeutil import utcnow_naive
+
+
+async def test_blitzapi_key_info_supplies_exact_monthly_balance():
+    def probe(request):
+        assert request.method == "GET"
+        assert str(request.url) == "https://api.blitz-api.ai/v2/account/key-info"
+        assert request.headers["x-api-key"] == "test-key"
+        return httpx.Response(200, json={"valid": True, "records_remaining": 199982,
+                                         "next_reset_at": "2026-11-16T13:40:18Z",
+                                         "max_requests_per_seconds": 10})
+
+    async with httpx.AsyncClient(transport=httpx.MockTransport(probe)) as client:
+        row = await collectors._blitzapi(client, "test-key")
+    assert row["value"] == 199982 and row["unit"] == "records"
+    assert "10 requests/s" in row["note"]
+    assert policy.default_policy("blitzapi", has_key=True).capacity_type == "monthly_quota"
+
+
+@pytest.mark.parametrize("body", [
+    {"valid": False, "records_remaining": 1},
+    {"valid": True, "records_remaining": None},
+    {"valid": True, "records_remaining": True},
+    {"valid": True, "records_remaining": "1"},
+    {"valid": True, "records_remaining": -1},
+])
+async def test_blitzapi_key_info_rejects_invalid_balance(body):
+    async with httpx.AsyncClient(transport=httpx.MockTransport(
+            lambda _: httpx.Response(200, json=body))) as client:
+        with pytest.raises(ValueError, match="no valid remaining-record balance"):
+            await collectors._blitzapi(client, "test-key")
+
+
+async def test_sixtyfour_balance_uses_the_free_credit_route():
+    def probe(request):
+        assert request.method == "GET"
+        assert request.url == "https://api.sixtyfour.ai/check-balance"
+        assert request.headers["x-api-key"] == "test"
+        return httpx.Response(200, json={"credits": 12.5})
+
+    async with httpx.AsyncClient(transport=httpx.MockTransport(probe)) as client:
+        row = await collectors._sixtyfour(client, "test")
+    assert row == {"value": 12.5, "unit": "credits", "note": "Organization credit balance"}
+
+
+@pytest.mark.parametrize("credits", [None, True, "12.5", float("nan"), -1])
+async def test_sixtyfour_balance_rejects_invalid_credit_values(credits):
+    async with httpx.AsyncClient(transport=httpx.MockTransport(
+            lambda _: httpx.Response(200, content=b'{"credits": NaN}' if isinstance(credits, float)
+                                     and math.isnan(credits) else json.dumps({"credits": credits})))) as client:
+        with pytest.raises(ValueError, match="Sixtyfour returned no valid credit balance"):
+            await collectors._sixtyfour(client, "test")
 
 
 async def test_spidercloud_balance_converts_api_credits_to_usd():
@@ -107,6 +159,16 @@ async def test_openmart_balance_collector():
     }
 
 
+async def test_openmart_negative_balance_is_exact_and_exhausts():
+    # Openmart refuses with 402 once spent, so past zero is a real, exhausting reading.
+    row = await _serve_json(collectors._openmart, {"balance": -12, "period_end": None})
+    assert row["value"] == -12 and not row.get("informational")
+    snap = sweep.snapshot_from("openmart", row)
+    state = policy.latest_state(policy.default_policy("openmart", has_key=True), snap)
+    assert state.health == "exhausted" and state.exhausted_until is not None
+
+
+
 async def test_tavily_capacity_uses_key_credit_remainder():
     def probe(request):
         assert request.method == "GET"
@@ -167,6 +229,35 @@ async def test_search1api_capacity_rejects_invalid_balance(balance):
             await collectors._search1api(client, "test")
 
 
+async def test_hlrlookup_capacity_sends_the_pair_to_the_free_balance_route(monkeypatch):
+    monkeypatch.setenv("TREG_PLATFORM_KEY_HLRLOOKUP_SECRET", "test-secret")
+    collectors.get_settings.cache_clear()
+
+    def probe(request):
+        assert request.method == "POST"
+        assert request.url == "https://api.hlrlookup.com/apiv2/balance"
+        assert json.loads(request.content) == {"api_key": "test", "api_secret": "test-secret"}
+        return httpx.Response(200, json={"Status": "OK", "Credits": 2499.5})
+
+    try:
+        async with httpx.AsyncClient(transport=httpx.MockTransport(probe)) as client:
+            row = await collectors._hlrlookup(client, "test")
+    finally:
+        collectors.get_settings.cache_clear()
+    assert row == {"value": 2499.5, "unit": "credits", "note": ""}
+
+
+@pytest.mark.parametrize("payload", [
+    {"Status": "OK", "Credits": True},
+    {"Status": "OK", "Credits": "NaN"}, {"Status": "OK"}, {"Status": "ERROR", "Credits": 10},
+])
+async def test_hlrlookup_capacity_rejects_uncertain_balances(payload):
+    async with httpx.AsyncClient(transport=httpx.MockTransport(
+            lambda _: httpx.Response(200, json=payload))) as client:
+        with pytest.raises(ValueError, match="HLR Lookup balance"):
+            await collectors._hlrlookup(client, "test")
+
+
 async def test_serper_capacity_uses_free_account_balance():
     def probe(request):
         assert request.method == "GET"
@@ -194,7 +285,9 @@ async def test_litescrape_capacity_uses_free_key_status():
 
     async with httpx.AsyncClient(transport=httpx.MockTransport(probe)) as client:
         row = await collectors._litescrape(client, "test")
-    assert row == {"value": 75765, "unit": "calls", "note": "key concurrency limit 25"}
+    assert row == {"value": 75765, "unit": "calls", "note": "concurrency limit 25"}
+    assert not any(word in row["note"].lower() for word in sweep._FORBIDDEN_IN_NOTE), \
+        "the sweep withholds a note that looks like a credential"
 
 
 @pytest.mark.parametrize("balance", [None, True, "100", -1])
@@ -728,20 +821,6 @@ async def test_getleadsio_balance_collector_uses_fair_use_credits(remaining, exp
             assert "Live Leads wallet is not included" in row["note"]
 
 
-@pytest.mark.parametrize('remaining,expected', [(300, 300), (0, 0), (None, None), (-1, None), ('unlimited', None), (True, None)])
-async def test_quickenrich_subscription_allowance_from_free_discovery(remaining, expected):
-    def reply(request):
-        import json
-        assert request.method == 'POST' and request.url.path == '/api/employees/contact-finder'
-        assert request.headers['authorization'] == 'Bearer private-test-key'
-        assert json.loads(request.content)['per_page'] == 1
-        return httpx.Response(200, json={'success': True, 'data': [], 'meta': {'credits_used': 0, 'remaining_credits': remaining}})
-    async with httpx.AsyncClient(transport=httpx.MockTransport(reply)) as client:
-        row = await collectors._quickenrich(client, 'private-test-key')
-    assert row['value'] == expected
-    assert 'private-test-key' not in str(row)
-
-
 @pytest.mark.parametrize('balance',[0,9.992])
 async def test_trykitt_balance_is_usd(monkeypatch,kitt_on,balance):
     def reply(request):
@@ -767,7 +846,7 @@ async def test_contactout_pool_stats_are_informational_even_when_empty(contactou
         } | extra
         async with httpx.AsyncClient(
             transport=httpx.MockTransport(
-                lambda r: httpx.Response(200, json={"status_code": 200, "usage": usage})
+                lambda r, usage=usage: httpx.Response(200, json={"status_code": 200, "usage": usage})
             )
         ) as c:
             row = await collectors.provider_balance("contactout", c)
@@ -829,9 +908,11 @@ async def test_fiber_ai_rejects_uncertain_pools(output):
 async def test_spyfu_spent_allowance_is_informational_not_empty():
     row = await _serve_json(collectors._spyfu, {"baseUnits": 10000, "unitsUsed": 17114,
                                                 "finalCost": 3.56, "requestCount": 40})
-    assert row["informational"] is True and row["value"] is None
+    assert row["informational"] is True and row["value"] == -7114
     snap = sweep.snapshot_from("spyfu", row)
-    assert snap.confidence == "informational" and not snap.error
+    assert snap.confidence == "informational" and not snap.error and snap.remaining == -7114
+    state = policy.latest_state(policy.default_policy("spyfu", has_key=True), snap)
+    assert state.exhausted_until is None
 
 
 async def test_spyfu_reports_units_left_under_allowance():
@@ -872,10 +953,75 @@ async def test_documented_balance_collectors(collector, payload, value, unit):
     assert (row["value"], row["unit"]) == (value, unit)
 
 
-@pytest.mark.parametrize("collector", [collectors._anyapi, collectors._cloro,
-                                       collectors._reapi, collectors._piapi])
-@pytest.mark.parametrize("payload", [{}, {"usd": -1, "remaining": -1, "balance": -1,
-                                          "equivalent_in_usd": -1}])
+@pytest.mark.parametrize("collector", [collectors._anyapi, collectors._reapi, collectors._piapi])
+@pytest.mark.parametrize("payload", [{}, {"usd": -1, "balance": -1, "equivalent_in_usd": -1}])
 async def test_documented_balance_collectors_reject_missing_or_negative(collector, payload):
     with pytest.raises(ValueError):
         await _serve_json(collector, payload)
+
+
+@pytest.fixture
+def platform_env(monkeypatch):
+    """Set env vars and drop the cached settings; the cache is dropped again afterwards."""
+    def set_env(**env):
+        for name, value in env.items():
+            monkeypatch.setenv(name, value)
+        collectors.get_settings.cache_clear()
+    yield set_env
+    collectors.get_settings.cache_clear()
+
+
+@pytest.mark.parametrize("provider,body,value", [
+    ("cloro", {"remaining": -1200, "perCycle": 50000, "cycleResetsAt": "2026-11-01T00:00:00.000Z"}, -1200),
+    ("firecrawl", {"success": True, "data": {"remainingCredits": -250.5}}, -250.5),
+    ("hlrlookup", {"Status": "OK", "Credits": "-3.5"}, -3.5),
+    ("firecrawl", {"success": True, "data": {"remainingCredits": 0}}, 0),
+])
+async def test_overdraft_vendors_read_negative_without_refusing_calls(platform_env, provider, body, value):
+    platform_env(**{f"TREG_PLATFORM_KEY_{provider.upper()}": "test-key"})
+    async with httpx.AsyncClient(transport=httpx.MockTransport(
+            lambda _r: httpx.Response(200, json=body))) as client:
+        row = await collectors.provider_balance(provider, client)
+    assert row["value"] == value and row["informational"] is True and row["overdrawn"] is True
+    assert row["note"].endswith("informational: overdrawn, the vendor still serves and bills the overage")
+    snap = sweep.snapshot_from(provider, row)
+    assert snap.remaining == value and snap.confidence == "informational" and not snap.error
+    state = policy.latest_state(policy.default_policy(provider, has_key=True), snap)
+    assert state.exhausted_until is None and not state.is_exhausted()
+
+
+def test_every_overdraft_vendor_has_a_refusal_signature():
+    # An overdrawn reading never exhausts, so the vendor's refusal is the only thing that will.
+    refusals = {
+        "cloro": (403, '{"error": {"code": "INSUFFICIENT_CREDITS"}}'),
+        "firecrawl": (402, '{"success": false, "error": "Insufficient credits"}'),
+        "hlrlookup": (200, '{"results": [{"error": "INSUFFICIENT_CREDIT"}]}'),
+    }
+    assert set(refusals) == collectors.OVERDRAFT_SERVED
+    for provider, (status, body) in refusals.items():
+        assert signatures.classify(provider, status, body=body).kind in ("balance", "quota"), provider
+
+
+async def test_openrouter_reads_credits_with_the_management_key(platform_env):
+    platform_env(TREG_PLATFORM_KEY_OPENROUTER="inference-test-key",
+                 TREG_PLATFORM_OPENROUTER_MANAGEMENT_KEY="management-test-key")
+
+    def probe(request):
+        assert str(request.url) == "https://openrouter.ai/api/v1/credits"
+        assert request.headers["authorization"] == "Bearer management-test-key"
+        return httpx.Response(200, json={"data": {"total_credits": 100.5, "total_usage": 25.75}})
+
+    async with httpx.AsyncClient(transport=httpx.MockTransport(probe)) as client:
+        row = await collectors.provider_balance("openrouter", client)
+    assert (row["value"], row["unit"]) == (74.75, "USD")
+    assert not sweep.snapshot_from("openrouter", row).error
+
+
+async def test_openrouter_without_a_management_key_is_no_api_and_skips_request(platform_env):
+    platform_env(TREG_PLATFORM_KEY_OPENROUTER="inference-test-key",
+                 TREG_PLATFORM_OPENROUTER_MANAGEMENT_KEY="")
+    async with httpx.AsyncClient(transport=httpx.MockTransport(
+            lambda _r: pytest.fail("the inference key must not be sent to /credits"))) as client:
+        row = await collectors.provider_balance("openrouter", client)
+    snap = sweep.snapshot_from("openrouter", row)
+    assert snap.error == "no_balance_api" and snap.remaining is None

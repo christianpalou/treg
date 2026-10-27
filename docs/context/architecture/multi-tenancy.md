@@ -24,11 +24,29 @@ sources:
   - src/treg/domain/identity/access.py
   - src/treg/domain/identity/api_keys.py
   - src/treg/domain/identity/session.py
+  - src/treg/application/enterprise_sso.py
+  - src/treg/alembic/versions/0079_enterprise_sso.py
+  - src/treg/alembic/versions/0080_enterprise_sso_audit.py
+  - src/treg/alembic/versions/0081_sso_manual_block.py
+  - src/treg/alembic/versions/0082_oauth_sso_provenance.py
+  - src/treg/alembic/versions/0083_enterprise_sso_safety.py
+  - src/treg/alembic/versions/0084_enterprise_workos_cleanup.py
+  - src/treg/alembic/versions/0085_enterprise_sso_blocks.py
+  - src/treg/worker.py
+  - src/treg/routers/enterprise_sso.py
+  - src/treg/infra/workos.py
+  - tests/test_enterprise_sso.py
   - src/treg/domain/identity/promotions.py
   - tests/test_team_limit.py
   - tests/test_auth.py
   - tests/test_token_revocation.py
   - src/treg/routers/auth.py
+  - src/treg/infra/turnstile.py
+  - src/treg/client_ip.py
+  - tests/test_client_ip.py
+  - src/treg/web/captcha.js
+  - tests/test_turnstile.py
+  - frontend/tests/captcha.test.ts
   - src/treg/routers/orgs.py
   - src/treg/routers/resources.py
   - src/treg/domain/tools/bundles.py
@@ -43,6 +61,61 @@ related:
 ---
 
 # Multi-tenancy (orgs)
+
+## Enterprise SSO
+
+A team owner may purchase an enterprise SSO subscription, then open a short-lived WorkOS Admin
+Portal link from the team dashboard. WorkOS handles the customer's SAML or OIDC connection; treg
+keeps its own `User`, `Membership`, roles, sessions, and API keys. A successful WorkOS code exchange
+is accepted only when the returned organization matches this team's stored WorkOS organization and
+its connection is the same one previously used. A new human joins the existing team as `member`;
+an owner changes roles through the normal Members controls. Email domain alone never grants access.
+Email discovery checks WorkOS verified organization domains and routes to matching paid team links;
+if several teams match, the employee chooses one. It accepts a `past_due` team while Stripe retries.
+The exact team link bypasses discovery. Neither route grants membership until the state-checked
+WorkOS callback verifies the person and their organization.
+
+The owner may require SSO after one successful test sign-in. `require_member` then requires a signed
+browser session carrying this team ID for non-owners. An SSO browser session or derived CLI identity
+token can access only that team, even when the user belongs to several. Regular email or social login still identifies
+the global user but does not open that team. The owner retains a regular-login recovery path. API
+keys are separate credentials, and a regular browser session cannot mint a new Default key for an
+enforced team. A WorkOS profile is linked by stable profile and IdP IDs, with account email checked
+on later sign-ins; email changes need explicit review rather than silent account reassignment. New
+accounts require an email matching a verified WorkOS organization domain and the organization's
+external ID must match the treg team. Outside-organization profiles are refused. An existing global
+account requires a concurrent normal treg session for the same verified user before first linking.
+CLI pairing and OAuth consent check SSO scope and enforcement at issuance. OAuth codes, refresh
+families, and access tokens retain the SSO team; exchange, refresh, and use recheck policy. An OAuth
+grant made before SSO enforcement cannot continue into the enforced team. Earlier non-owner
+bearer keys, including agent keys, stop authorizing this team after enforcement. New human or
+agent keys issued through an authorized team session carry issuance provenance and work until
+their membership or key is revoked. Employees can also issue an SSO-scoped CLI key after company
+sign-in; the owner retains recovery access.
+
+On the Directory Sync plan, signed WorkOS events maintain a roster of active directory users,
+including people who have not yet signed in. Once a directory is connected, SSO sign-in requires a
+matching active IdP user in that roster. Inactive/deleted users lose their team membership and keys;
+deleting the directory removes all linked non-owner memberships. Owner recovery remains available.
+WorkOS event IDs make redelivery harmless. The SSO-only plan does not promise automatic offboarding.
+Provisioning never maps external groups into treg roles. A worker can reconcile the complete
+WorkOS roster to repair missed webhook deliveries. A manual team removal takes precedence over
+active directory records until the owner restores access. Durable, minimal `EnterpriseSSOAudit`
+rows record SSO sign-ins and failures, setup actions, role changes, enforcement switches, directory
+removals, manual team removals, and owner restores. Access changes and their audit rows commit together; setup actions are recorded after
+WorkOS responds. A retention worker deletes expired rows under the deployment's chosen policy.
+Full-roster repair recognizes WorkOS directories in the `linked` state and can discover one if its
+activation webhook was missed. It ignores other directory states so a disconnected directory cannot
+authorize employees. The repair also removes pre-sync SSO identities absent from the roster. Only
+`active` directory users count as
+provisioned. SSO and Directory Sync stay active while Stripe retries a `past_due` subscription.
+When the subscription ends, enforcement is lifted so existing members can use normal sign-in.
+Cancellation removes only SSO-created memberships; pre-existing members remain.
+The cleanup worker then deletes the canceled team's WorkOS directory and connection, clears
+obsolete SSO identity links, and records completion before a new checkout can start.
+`EnterpriseSSOBlock` retains only team and treg user IDs plus a timestamp for an explicit admin
+removal. `finish_signin` checks it across replacement WorkOS connections; restoration, team
+deletion, and global user erasure remove it.
 
 The registry is **tenant-isolated**: an **Org** owns resources, a **User** is a global identity, and a
 **Membership** links them with a role and IS where the caller's token lives. A token = a `(user, org)`
@@ -66,6 +139,9 @@ change is required. This is a current-ownership cap, not a daily creation limit.
 [Enrich Arena](../interface/enrich-arena.md) runs and evaluations require both the creating user
 and the active team to match. Regular team membership alone does not expose another member's results.
 Team deletion removes evaluations before their runs through `ORG_SCOPED_MODELS`.
+`OrgFlowControlVersion` configuration history is also in that list and is explicitly deleted
+with its Org. Its `org_id` intentionally has no foreign key; management writes must validate
+Org existence and coordinate with deletion before cleanup starts. See [configuration storage](data-model.md#org-flow-control-configuration-storage).
 
 - **`Org`** — `id, name, slug (unique), previous_slug, suspended, demo, public_demo, created_at`. The tenant that owns
   secrets/tools/bundles. **`public_demo`** marks a team whose member token is PUBLISHED (e.g. on the
@@ -73,7 +149,8 @@ Team deletion removes evaluations before their runs through `ORG_SCOPED_MODELS`.
   `require_member` / `require_identity`.
 - **`User`** - identity only: `id, email (unique), created_at`, plus `email_verified_at` and
   `signup_promo_available`. No token, no role. Verified accounts can claim signup credit once
-  across all teams; old accounts cannot claim again. See [money](money.md#signup-credit-eligibility).
+  across all teams and once per inbox (aliases share it); old accounts cannot claim again. See
+  [money](money.md#signup-credit-eligibility).
 - **`Membership`** — `user_id, org_id, role (owner|admin|member|viewer), token_hash (idx), webhook_url,
   daily_call_cap` (per-user daily usage cap; `-1` = unlimited, admin-set — see the API fragment's
   usage-metering section), **`tool_access`** (JSON; **NULL = ALL tools** — the default, so nobody is
@@ -135,11 +212,12 @@ Team deletion removes evaluations before their runs through `ORG_SCOPED_MODELS`.
   another org, 403 when the role gate fails. **`_require_can_register`** gates create (secrets/tools/
   skills/oauth): a **viewer** (rank below member) may `call` + list only, and gets 403 on any register.
   `ROLE_RANK` orders owner > admin > member > viewer.
-- **Per-member tool ACL (the release feature).** `_require_tool_access(caller, tool.name)` gates **all**
-  use of a tool — the proxy `call_tool`, the server `run_tool_server`, AND the local `grant_local_run`:
+- **Per-member tool ACL (the release feature).** `_require_tool_access(caller, tool.name)` gates
+  the proxy `call_tool` and the local `grant_local_run`:
   allowed if the member's `tool_access` is NULL (all) or names the tool; the **owner is exempt**
   (`_tool_allowed`), admins + members can be restricted. `_require_local_run(caller)` additionally gates the
-  LOCAL tier on `local_run_enabled` (off → server runs only). Set via `set_member_access`
+  local tier on `local_run_enabled`. Server-side CLI execution is disabled for every caller, including
+  owners; `run_tool_server` always returns 503. Access is set via `set_member_access`
   (`PATCH /orgs/{id}/members/{user}/access`, admin+; an owner can't be restricted): `_normalize_tool_access`
   validates the names against the org's tools (422 on unknown) and **collapses an all-tools selection back
   to NULL** so a fully-checked member keeps auto-getting new tools. It's an **explicit allow-list**: a
@@ -165,9 +243,11 @@ Team deletion removes evaluations before their runs through `ORG_SCOPED_MODELS`.
   (which predates it and creates a `User` directly) and `auth_email_start` (refuse early, mint no code).
   `list_members` carries `is_agent` so one roster can show people and machines apart.
 - **Email-domain blocklist.** The same choke points, for throwaway mail and domains used for bulk
-  registration. New verified accounts can receive one promotional balance, so farming verified inboxes
-  remains an abuse path even though repeated team creation no longer earns credit. **Entirely configuration**: the classifier
-  (`_is_blocked_email` in `domain/identity/access.py`, pure — it only answers) reads
+  registration. New verified accounts can receive one promotional balance per inbox, so farming
+  many real or catch-all inboxes remains an abuse path even though repeated team creation and
+  `+tag` / Gmail-dot aliases no longer earn credit. **Entirely configuration**: the classifier
+  (`_is_blocked_email` in `domain/identity/access.py`, pure - it only answers; it walks the
+  `_norm_email` domain, whose trailing dots are dropped so `a@listed.example.` cannot pass) reads
   `TREG_BLOCKED_EMAIL_DOMAINS` and nothing else, parsed once per distinct value in `config.py`
   (trim, drop a leading `@`/`.`, lowercase, and drop any dotless entry so a typed `com` cannot
   refuse the world). Unset — the default — blocks nothing, and the next domain is a **dashboard
@@ -190,8 +270,8 @@ Team deletion removes evaluations before their runs through `ORG_SCOPED_MODELS`.
   no mail), `find_or_create_user` (so OTP verify, the GitHub and Google callbacks and the emailed
   invite link `POST /auth/invite-signin` refuse before the row lookup, raising
   `signup.BlockedEmailError` which each door translates to a `blocked_domain` kind), `register_user`
-  (`POST /users` mints user + team + promo in one call), `create_org` (`POST /orgs`, the other promo
-  door, reachable with a token minted before the listing) and the code-based `POST /invites/accept`
+  (`POST /users` mints an unverified user + team in one call; the team is funded when that user
+  first verifies), `create_org` (`POST /orgs`, the promo door, reachable with a token minted before the listing) and the code-based `POST /invites/accept`
   (which constructs a `User` directly, so it guards itself). Every refusal is the `machine_identity`
   sibling's exact 403 `this address cannot be used to sign in` (a brand page on the browser doors,
   like `suspended`): the caller learns neither that a list exists nor what is on it. Deliberately a
@@ -211,6 +291,71 @@ Team deletion removes evaluations before their runs through `ORG_SCOPED_MODELS`.
   `_normalize_project_access`) so an agent can be project-scoped at mint time — under the same
   sent-guard, so a rotate that omits it still preserves it. `Membership.created_by` (migration A23)
   stamps the minting admin, giving every agent an owner in the roster.
+- **Client address.** Every per-IP limit (email code requests, tool requests, public demo, find,
+  arena, onboarding sandbox, judge) keys on `client_ip.of(request)`, never on a header the client
+  wrote. `X-Forwarded-For` is a list each proxy appends to, so its first entry is the client's own
+  claim: trusting it let a script send a fresh address per request and skip every per-IP limit.
+  The address is `TREG_CLIENT_IP_HEADER` when set and a valid IP (behind Cloudflare
+  `cf-connecting-ip`, which Cloudflare refuses from clients; a request without it logs
+  `event=client_ip_header_missing` at most once a minute per process and falls back; a request with
+  no `X-Forwarded-For` never crossed a proxy, such as a health check or an in-process relay, and
+  stays silent), else the
+  `X-Forwarded-For` entry `TREG_TRUSTED_PROXY_HOPS` from the right (default 1, the one the nearest
+  proxy appended; 0 for direct clients), else the socket peer. MCP tools call the API in process:
+  `mcp._bearer`, which every tool calls first, records the caller's resolved address in a
+  task-scoped variable, and `mcp._api` forwards it on every internal request
+  (`client_ip.forwarding_headers`), so MCP callers keep their own per-IP buckets instead of sharing
+  the transport's loopback peer. Each process logs `event=client_ip_sources`
+  once with which address headers arrived and how many `X-Forwarded-For` entries, never values.
+- **Bot check on email sign-in.** Cloudflare Turnstile guards `start_email_login`, the only door that
+  mints an inbox proof from a bare HTTP call (GitHub and Google already sit behind their own
+  checks). Off unless both `TREG_TURNSTILE_SITE_KEY` and `TREG_TURNSTILE_SECRET` are set, so
+  self-hosters load no widget and call no Cloudflare. Every page with an email sign-in form, the
+  CLI's `/login` page included, loads `/captcha.js` (`routers/web.py` fills in the public site key)
+  and sends `captcha_token` from `tregCaptcha.token('email_start')`; a test fails if a page posting
+  to `/auth/email/start` does not. The script: a fresh single-use token per request (a double click
+  starts a second check rather than resending one); a check started when a field marked
+  `data-captcha="email_start"` gains focus, so the click rarely waits (invite and share email
+  fields never summon a widget); `interaction-only`, so the widget is invisible unless Cloudflare
+  wants a click, and then floats under the form being filled in (inside an open modal `<dialog>`,
+  in the dialog itself, since the top layer is above any z-index and the rest of the page is inert),
+  re-placed when it becomes visible and as the visual viewport moves; one check runs at a time, so
+  refocusing the field never floats a second widget; a submit waits at most 30s for an unanswered
+  check (10s for a script that has not loaded, then `!blocked`), but a check awaiting a click is
+  never torn down, so the next click finds its token; a stale check is removed before a new one
+  starts. When it cannot get a token it sends a
+  reason instead, `!blocked` (script blocked), `!pending` (still waiting for a click) or `!error`,
+  which the server never forwards to Cloudflare and only uses for the message and the log.
+  `infra/turnstile.py` only classifies: `pass` (siteverify success, action `email_start`, hostname
+  in `TREG_TURNSTILE_HOSTNAMES`, else the public host and its known aliases), `missing`, `invalid`
+  (failed, reused, expired, over 2048 characters, or solved for another action or host) and
+  `unavailable` (timeout, transport error, Cloudflare's `internal-error`, or our own secret
+  rejected, which also logs `event=turnstile_secret_rejected`: a wrong secret must not read as
+  every caller being a bot). It never raises.
+  The use case runs the per-email and per-IP rate window first and counts refused requests, so
+  junk tokens cannot drive unbounded siteverify calls, and commits before the check so no
+  connection waits on Cloudflare. Then `auth._check_browser` decides by `TREG_TURNSTILE_MODE`:
+  `observe` (default) logs `event=turnstile_email_start outcome=<outcome> reason=<reason>` and
+  changes nothing; `enforce` refuses `missing` and `invalid` with 400 (`captcha_blocked`,
+  `captcha_pending` or `captcha_failed`, by reason; no code, no mail) and lets `unavailable`
+  through. The outcome rides in the OTP's `Ephemeral` entry to verify: in enforce mode a non-`pass`
+  creates the new `User` with `signup_promo_available=false` (an existing user is never touched),
+  so a siteverify outage costs a new account its credit, not everyone their sign-in. An outage of
+  Cloudflare's script itself is not absorbed: every browser then sends `!blocked`, which enforce
+  refuses (the message points to Google and GitHub, which stay open). A
+  `TREG_FIXED_LOGIN_CODES` account skips the check (nothing is mailed; reviewers may script it).
+  `treg login --email` cannot pass a browser check: every captcha refusal carries
+  `X-Treg-Captcha: required`, on which the CLI says so and continues with the browser handshake;
+  a request from the CLI's email door gets a detail naming `treg login`, for released CLIs that
+  only print it.
+  Observe mode measures false refusals before enforcing: `event=turnstile_email_start` (outcome,
+  reason, `client=cli|browser`) pairs with `event=turnstile_email_verify` (outcome, `new_user`,
+  client) logged when a code is redeemed, so per outcome the redeemed share is the share of real
+  people enforce would refuse; `signup_completed` also carries the outcome as `captcha`. A real
+  solve our own rules reject logs `event=turnstile_mismatch` with Cloudflare's action and
+  hostname, and startup logs `event=turnstile_misconfigured` for a half-set key pair or a public
+  host missing from the hostnames, the two ways enforce could refuse everyone. A paid solving service still passes;
+  the check raises the cost of a bare script, not of a determined farm.
 - **Observed agents (`GET /orgs/{id}/agents/observed`, admin+).** The OTHER half of the agents story:
   the runtimes already calling under members' own tokens. The CLI fingerprints its host runtime
   (`CLAUDECODE` → `claude-code`, `CODEX_*`, `CURSOR_*`, …; `TREG_CLIENT` overrides) and sends
@@ -270,8 +415,8 @@ bearer path refuses it once expired rather than reviving an expired cookie.
 - **Org management endpoints:** `register_user` (`POST /users`, legacy open-registration, used by the
   test fixture) still creates the user + an org + owner membership via `_make_org_membership` (mints the
   token) — NOT reached by the dashboard/CLI login doors, which no longer auto-make an org. Both this door
-  and `create_org` read the first-party ad-click cookie (`application.signup._ad_attribution_from`) and,
-  when enabled and present, stamp `Org.ad_gclid`/`ad_click_id_type`/`ad_landing`/`ad_click_at` on the
+  and `create_org` read the first-party ad-click cookie (`application.signup._ad_attribution_from`),
+  or the email's `AdClickStash` row when the request has no cookie, and, when enabled and present, stamp `Org.ad_gclid`/`ad_click_id_type`/`ad_landing`/`ad_click_at` on the
   new org — preserving whether the click was a GCLID, GBRAID or WBRAID — see
   [ads-conversions](ads-conversions.md). `create_org`
   (`POST /orgs`, `require_identity`),
@@ -301,7 +446,8 @@ bearer path refuses it once expired rather than reviving an expired cookie.
   pending `AdConversion`: a queued conversion belongs to the team it would be attributed to,
   `Media`: hosted reference files would otherwise outlive the team until their TTL, and
   `HubListing`/`HubTool`: a maker's published tools and search listings go with the team that owned
-  them).
+  them). Workbench `TableDoc` entries are removed before their `TeamDatabase` mapping; see
+  [the storage boundary](workbench-storage.md#management-metadata) for remote-resource cleanup.
   **That list is the only one**, plus one named exception: `cascade_delete_org` also deletes every
   `HubRun` where `caller_org_id == org.id` before that sweep, because a run names the team that
   CALLED by that foreign key and the maker only by number — a caller's traces go with the caller, a
@@ -402,7 +548,10 @@ the ledger/hold it references. Pinned read scopes do not change budget concurren
   must resolve their id through an org-owned `AsyncTaskRecord` or `AsyncResourceRecord` before the
   upstream is contacted. `_one_resource_value` reads the id from the query string or, when the
   catalog descriptor names a body parameter (`in: body`), from the JSON body — either way exactly one
-  value must be supplied. BYOK calls keep access to ids in the team's own provider account.
+  value must be supplied. A body may be one object or a provider's array of task objects
+  (DataForSEO's `[{"id": ...}]`); every element must name that same id, so an owned first task
+  cannot carry another team's id in a second. A `produces` path may take every list item with `*`
+  (`tasks.*.id`): one submission of several tasks owns each of them. BYOK calls keep access to ids in the team's own provider account.
 - **Shared-provider durable objects are org-scoped.** A platform-key managed-resource call verifies
   every scalar or array id against `ProviderResource` before contacting the provider. A `use` tool
   may additionally declare a read-only public lookup: an id absent from the ownership table is

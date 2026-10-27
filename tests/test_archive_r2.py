@@ -86,11 +86,47 @@ async def test_legacy_read_reports_final_source(r2, monkeypatch, path, outcome):
     assert report['source'] == {'r2': 'r2', 'db_fallback': 'db', 'unavailable': 'none'}[outcome]
     assert report['fallback_reason'] == ('none' if outcome == 'r2' else 'not_found')
     assert report['r2_attempts'] == 1 and report['total_ms'] >= report['r2_read_ms']
+    assert 'snapshot_id' not in report  # Inline pointers have no snapshot identity.
     assert digest not in str(report) and RAW.decode() not in str(report)
 
 
+@pytest.mark.parametrize('outcome', ['r2', 'db_fallback', 'unavailable'])
+async def test_observation_identifies_only_failed_selected_snapshot(clients, r2, monkeypatch, outcome):
+    from treg import analytics
+    monkeypatch.setattr(get_settings(), 'archive_body_read_lookup', 'r2-first')
+    for _ in range(2):
+        await clients.get(URL, headers={'Cache-Control': 'no-cache'})
+        await archive.drain()
+    async with db.session_maker() as s:
+        rows = (await s.execute(select(ArchiveSnapshot).order_by(ArchiveSnapshot.id))).scalars().all()
+        carrier, selected = rows
+        assert selected.body_of == carrier.id
+        for row in rows:
+            row.body_storage = None
+            if outcome != 'db_fallback':
+                row.body = None
+            s.add(row)
+        selected_id = selected.id
+        await s.commit()
+    if outcome != 'r2':
+        r2.objects.clear()
+    events = []
+    monkeypatch.setattr(analytics, 'capture', lambda who, name, props: events.append((name, props)))
+    actual = await archive._read_change_body(selected_id)
+    assert actual == (None if outcome == 'unavailable' else RAW)
+    (name, report), = events
+    assert name == 'archive_body_read' and report['outcome'] == outcome
+    assert report['path'] == 'observation' and report['storage'] == 'legacy'
+    if outcome == 'unavailable':
+        assert report['snapshot_id'] == selected_id
+    else:
+        assert 'snapshot_id' not in report
+    assert archive.content_hash(RAW) not in str(report) and RAW.decode() not in str(report)
+
+
 @pytest.mark.parametrize('failure', ['db_error', 'cancelled'])
-async def test_read_failure_and_cancellation_finish_observation(r2, monkeypatch, failure):
+@pytest.mark.parametrize('snapshot_id', [None, 123])
+async def test_read_failure_and_cancellation_finish_observation(r2, monkeypatch, failure, snapshot_id):
     from treg import analytics
     monkeypatch.setattr(get_settings(), 'archive_body_read_result', 'r2-first')
     async def fail(*args):
@@ -101,9 +137,14 @@ async def test_read_failure_and_cancellation_finish_observation(r2, monkeypatch,
     events = []
     monkeypatch.setattr(analytics, 'capture', lambda who, name, props: events.append(props))
     with pytest.raises(asyncio.CancelledError if failure == 'cancelled' else RuntimeError):
-        await archive_bodies.read(archive_bodies.BodyPointer(archive.content_hash(RAW), None, None, None), 'result')
+        pointer = archive_bodies.BodyPointer(archive.content_hash(RAW), None, None, None, snapshot_id)
+        await archive_bodies.read(pointer, 'result')
     assert len(events) == 1 and events[0]['outcome'] == failure
     assert events[0]['source'] == 'none' and 'private database details' not in str(events)
+    if failure == 'db_error' and snapshot_id is not None:
+        assert events[0]['snapshot_id'] == snapshot_id
+    else:
+        assert 'snapshot_id' not in events[0]
 
 
 @pytest.mark.parametrize('source', ['r2', 'db'])
@@ -263,7 +304,10 @@ async def test_legacy_initialization_keeps_db_baseline_when_r2_precompare_times_
         attempted.set()
         await asyncio.Event().wait()
     monkeypatch.setattr(r2, 'get', stalled_get)
-    monkeypatch.setattr(archive, '_CHANGE_TIMEOUT_S', 0.1)
+    # The bound also covers the database reads before the R2 get; 0.1 s could expire there under a
+    # loaded parallel run, never reaching the stalled get this test is about. The get never returns,
+    # so a wider bound still ends in the timeout.
+    monkeypatch.setattr(archive, '_CHANGE_TIMEOUT_S', 1.0)
     await archive._store(**common, body=b'{}')  # Unknown must preserve the previous decisive result.
     assert attempted.is_set()
     async with db.session_maker() as s:
@@ -540,6 +584,23 @@ async def test_pruner_strips_both_db_bytes_but_preserves_r2(clients, r2, monkeyp
         assert await r2.get(row.content_hash) is not None
 
 
+async def test_erasure_holds_no_connection_across_object_deletes(clients, r2, monkeypatch):
+    """Team deletion erases the team's own-key bodies from R2 (archive.md, "Opting out"); the
+    fixture's `check_io` asserts no DB connection is checked out by the deleting task while the
+    store is being asked to delete, the same invariant the uploads are held to."""
+    from tests.test_archive import OWN, _own_key, _vendor_says
+    _vendor_says(monkeypatch, OWN)
+    monkeypatch.delitem(__import__('treg.domain.catalog.store', fromlist=['load']).load().by_id[EP], 'cache')
+    await _own_key(clients)
+    await clients.get(URL)
+    await archive.drain()
+    assert hashlib.sha256(OWN).hexdigest() in r2.objects
+    org = (await clients.get('/orgs')).json()[0]
+    r = await clients.delete(f"/orgs/{org['org_id']}", params={'confirm': org['slug']})
+    assert r.status_code == 200, r.text
+    assert r2.delete_calls == 1 and hashlib.sha256(OWN).hexdigest() not in r2.objects
+
+
 @pytest.mark.parametrize('setting', ['archive_body_write', 'archive_body_read_lookup',
                                     'archive_body_read_result', 'archive_body_read_terminal'])
 async def test_startup_fails_before_db_when_r2_configuration_missing(monkeypatch, setting):
@@ -613,7 +674,9 @@ async def test_upload_timeout_and_byte_shedding_are_observable(clients, r2, monk
 
 
 async def test_upload_timeout_retries_once_and_recovers(clients, r2, monkeypatch):
-    monkeypatch.setattr(get_settings(), 'archive_r2_timeout_s', 0.08)
+    # One attempt may use 40% of this budget. 2s still times out a 1s put and leaves
+    # room to retry when a busy event loop delivers that timeout late.
+    monkeypatch.setattr(get_settings(), 'archive_r2_timeout_s', 2.0)
     events, calls = [], 0
     real_put = r2.put
     async def timeout_once(body, **kwargs):

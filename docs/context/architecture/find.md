@@ -16,6 +16,8 @@ sources:
   - tests/test_find_bench.py
   - tests/test_find_recall.py
   - tests/test_catalog_find.py
+  - tests/test_search_queries.py
+  - tests/fixtures/search_queries.yaml
   - frontend/src/state/find.js
   - frontend/src/components/FindAnswer.vue
   - frontend/src/pages/SearchPage.vue
@@ -35,8 +37,10 @@ It is the discovery experiment's mechanism ([search-experiment](search-experimen
 recall read by one `infra.judge` request, bucketed at `search_judge_keep` / `search_judge_high`)
 served to people. The v2 engine below also answers MCP `catalog_search` in the experiment's `v2`
 mode, laid out for an agent by `application/catalog_search.py`
-([search-experiment](search-experiment.md)); `/catalog/search` answers from the shipped ranker, and
-nothing here touches `store.search`, its scoring or the evidence rerank.
+([search-experiment](search-experiment.md)); `/catalog/search` answers from the shipped ranker (or,
+with `engine=agent`, the CLI's search, the same use case as MCP's). Nothing here touches
+`store.search`'s scoring or the evidence rerank; the two share only `store.provider_focus`, the
+reading of a provider named in the query (below).
 
 ## Two engines, one switch
 
@@ -50,8 +54,9 @@ nothing here touches `store.search`, its scoring or the evidence rerank.
 
 Both stream the same two NDJSON events - `candidates` as soon as recall is computed, `judged` when
 the judge answers - so the pages animate the wait on the first. The judge abstains rather than
-fails; an abstaining judge falls back to the keyword page (`store.rank_band`, 25 rows, unjudged,
-verdict `keyword`), never to an error. `admit` rate limits per IP and per deployment through
+fails; an unambiguous provider name still opens that provider's tools, while other abstentions
+fall back to the keyword page (`store.rank_band`, 25 rows, unjudged, verdict `keyword`).
+`admit` rate limits per IP and per deployment through
 `ratestore` in a session committed and closed before the judge is called, and the evidence read
 (below) happens after the judge has answered: no request holds a connection while Jev thinks.
 
@@ -81,7 +86,8 @@ none, and the page lists only the vendors the lexical order happened to reach.
   has none. The long-term fix for a member that does another job is its own capability.
 - **uncatalogued endpoint**: no capability; its own unit.
 
-Only the browse surface (`store.browsable`, no routed parents). A first-party endpoint may share its
+Only the browse surface (`store.browsable`, no routed parents, no paused provider: `store.paused`,
+see catalog.md § Paused providers). A first-party endpoint may share its
 capability's id, so the index keeps jobs (`job_pos`) and endpoints (`pos`) apart.
 
 **Channels.** A lexical channel scores each unit with the idf of every query word its card holds as
@@ -100,7 +106,8 @@ merely have one member mentioning it.
 **Fusion and seats.** Each channel's top 300 fuse by reciprocal rank (k=60): the lexical channel
 admits only units with a hit, the semantic one its 300 most similar whatever the sign, so a query
 with no word on any card still fills its seats by meaning. Seats: the jobs on a
-platform the query names first (`find_platform_seats`), then the best jobs to `find_jobs`, then the
+provider the query names first, then the jobs on a platform it names (`find_platform_seats` each),
+then the best jobs to `find_jobs`, then the
 representatives of those jobs in fused order (`find_delta`), then uncatalogued endpoints
 (`find_raw`). `?platform=` keeps one shelf's units.
 
@@ -122,9 +129,23 @@ at any length, "exa"; or, from four letters, a prefix of exactly one provider's)
 model name. A word several platforms or providers share ("video", "search", "ads", "goog") names
 none of them, and the judged answer reads it. Product names come from endpoint names on the `AI generation` platforms: words two or
 more of those names share and names elsewhere rarely use ("gemini", "seedance", "flux"; not
-"image"), minus the keys of `aliases.yaml` ("tts" is a way of saying a job, not a product), and
+"image"), or, on a platform with a single endpoint, words of its name no other name uses ("jev"),
+minus the keys of `aliases.yaml` ("tts" is a way of saying a job, not a product), and
 adjacent pairs of them ("nano banana"), matched with spaces and hyphens folded away.
 On a shelf only a provider there counts.
+
+**A provider named with a task** (`Focus`, from `store.provider_focus`): "exa search", "people data
+labs company enrichment". A provider is named by its id or its whole display name as a token
+sequence, longest first, matched before function words are dropped: a domain is part of the name
+("you.com", "apollo.io"), while "you" or "context" alone is a word. A name that is a platform's
+("tiktok") names the platform, and one of only short or function words ("x") names nothing. The rest of the query is what recall, the semantic
+channel and the judge read, so the name's own words ("people") cannot pull the answer to another
+job; the provider's jobs take the first seats, its uncatalogued endpoints come first, and on the
+page its rows lead each job (never folded away), its jobs lead the page and no routed row leads
+(the caller chose the provider). The focus holds only where one of the provider's rows matches a
+word of the rest (`store.provider_focus`, the keyword page's own decision, so the two pages cannot
+disagree): "does perplexity mention my brand" is a question about the AI engine, and reads as typed.
+A bare name is the name table's.
 
 ## v2: the semantic channel
 

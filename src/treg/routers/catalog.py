@@ -20,12 +20,10 @@ from ..domain.catalog import store as catalog_store
 from ..domain.catalog import stats as endpoint_stats
 
 
-# The app alias preserves the moved handlers' original @app.get decorator text byte-for-byte.
 app = APIRouter()
 public_router = app
 
-# ---- endpoint catalog (what you can DO once connected) ------------------------------------
-# The credential registry above answers "how do I connect Moz?"; these answer "and then what can I
+# What you can DO once connected. /providers.json answers "how do I connect Moz?"; these answer "and then what can I
 # call?" — platform-grouped operations with cost, verification date and captured example responses.
 # Open like /providers.json: the data is curated public documentation, no org's anything is in it.
 # See docs/context/architecture/catalog.md.
@@ -216,6 +214,17 @@ async def catalog_provider(service: str) -> dict:
     }
 
 
+def _quote_skip(ep: dict, cat) -> str | None:
+    """Why the router would not call this child on treg's key, in `route.py`'s words; None if it would."""
+    if catalog_store.paused(ep):
+        return f"{ep['provider']} is paused on this deployment"
+    if not cat.platform_eligible(ep):
+        return "not platform-eligible and no own key"
+    if not get_settings().platform_key_for(ep["provider"]):
+        return f"no {ep['provider']} key on this deployment and no own key"
+    return None
+
+
 def _plan_row(c) -> dict:
     """One quote line, token-frugal: what an agent needs to pick or set a ceiling. Measured rates
     ride only when they exist; the unmeasured case says nothing rather than four nulls."""
@@ -244,7 +253,7 @@ async def _overflow_disclosure(ep: dict, cat) -> dict:
         return {}
     try:
         await overflow_routes_view.load()
-    except Exception:  # noqa: BLE001 - a disclosure must never take the catalog down
+    except Exception:
         logging.getLogger("treg.catalog").warning("overflow routes unavailable", exc_info=True)
         return {}
     for route in overflow_routes_view.for_endpoint(ep["id"]):
@@ -266,7 +275,7 @@ async def _observed_or_empty(
     """
     try:
         return await reader.get_many(endpoint_ids)
-    except Exception:  # noqa: BLE001
+    except Exception:
         logging.getLogger("treg.catalog").warning("endpoint stats unavailable", exc_info=True)
         return {}
 
@@ -291,13 +300,14 @@ async def _verdicts_or_empty() -> dict[str, dict]:
     `_observed_or_empty`: an enrichment must never take the catalog down."""
     try:
         return await feedback_app.endpoint_verdicts()
-    except Exception:  # noqa: BLE001
+    except Exception:
         logging.getLogger("treg.catalog").warning("endpoint verdicts unavailable", exc_info=True)
         return {}
 
 
 @app.get("/catalog/search")
 async def catalog_search(request: Request, q: str = "", limit: int = 25,
+                         added_within_days: int | None = None, sort: str = "", engine: str = "",
                          observations: endpoint_stats.EndpointObservationReader = Depends(
                              _endpoint_observation_reader),
                          db: AsyncSession = Depends(get_session)) -> dict:
@@ -307,9 +317,24 @@ async def catalog_search(request: Request, q: str = "", limit: int = 25,
     shelf hides it. Ranking is plain token matching (see `catalog_store.search`) so results are
     reproducible and explainable; equal scores — the common case, not the edge — then break on what
     treg has MEASURED and on price, so the cut stops being file order. `hints` carries the next
-    command, since finding the endpoint is never the goal — inspecting or calling it is."""
+    command, since finding the endpoint is never the goal — inspecting or calling it is.
+
+    `added_within_days` and `sort=newest` (catalog.md "`added`") list recently added tools, with or
+    without words; absent, this route answers exactly as it did before them.
+
+    `engine=agent` answers with the search an agent's `catalog_search` gets (the same use case, the
+    judged answer where it runs, the same records), in this route's row shape: the CLI's search.
+    Absent, the route is the plain keyword search it always was."""
     cat = catalog_store.load()
     limit = max(1, min(limit, 100))
+    try:
+        opts = catalog_store.added_options(added_within_days, sort)
+    except catalog_store.AddedOptionError as e:
+        raise HTTPException(status_code=400, detail=str(e)) from None
+    if opts.active:
+        return await _added_search(request, q, limit, opts, cat, observations, db)
+    if engine == "agent" and q.strip():
+        return await _agent_search(request, q, limit, cat, observations)
     # Rank a WIDER band than the page: collapsing a routed group (below) frees rows, and the next
     # jobs down the ranking should fill them rather than the page coming up short.
     ranked, total, tie_truncated = catalog_store.rank_band(q, cat, min(100, limit * 4))
@@ -325,13 +350,14 @@ async def catalog_search(request: Request, q: str = "", limit: int = 25,
         stats = {**stats, **hub_stats}
         ranked = catalog_store.merge_by_score(ranked, hub_ranked)
         total += len(hub_ranked)
+    led = catalog_store.led_by(q, cat)   # a named provider leads: its rows' scores carry the lead
     results = [
         # The evidence that decided the order, shown rather than merely applied: a caller comparing
         # two rows should be able to see WHY one is above the other.
-        (dict(ep) | {"score": score, "observed": stats.get(ep["id"])}) if ep.get("kind") == "hub" else
+        (dict(ep) | {"score": None if led else score, "observed": stats.get(ep["id"])}) if ep.get("kind") == "hub" else
         (catalog_store.endpoint_view(ep, _provider_display(ep["provider"]), cat)
          | catalog_store.endpoint_context(ep, cat)
-         | {"score": score, "observed": stats.get(ep["id"])})
+         | {"score": None if led else score, "observed": stats.get(ep["id"])})
         for ep, score in ranked
     ]
     results = catalog_store.group_routed(results, max_children=catalog_store.MAX_ROUTED_CHILDREN)[:limit]
@@ -368,6 +394,8 @@ async def catalog_search(request: Request, q: str = "", limit: int = 25,
             hints.append(f"{q!r} matches too broadly to rank on measured reliability past the first "
                          f"{catalog_store.RERANK_BAND} equally-scoring rows — add a word to narrow it")
     out = {"query": q, "count": len(results), "total": total, "results": results, "hints": hints}
+    if led:
+        out["led_by"] = sorted(led)   # the providers the query named; their rows come first
     if not results and q.strip():
         # the rows that JUST missed the admission gate and which words they missed — an agent (or
         # the CLI display) turns this straight into the corrected query
@@ -377,6 +405,99 @@ async def catalog_search(request: Request, q: str = "", limit: int = 25,
             first = near[0]
             hints.insert(1, f"nearest: {first['endpoint_id']} matches "
                             f"{', '.join(first['matches'])} but not {', '.join(first['missing'])}")
+    return out
+
+
+async def _agent_search(request: Request, q: str, limit: int, cat,
+                        observations: endpoint_stats.EndpointObservationReader) -> dict:
+    """`/catalog/search?engine=agent`: `application.catalog_search.search`, the use case behind an
+    agent's `catalog_search`, shaped as this route's rows plus the answer's verdict and jobs.
+
+    The judge and the embedding are awaited inside the use case, so nothing here may hold a
+    database connection across it: the hub's reader and the caller are each resolved in a session
+    of their own, closed at once, and the route's session is never touched. A caller who is not
+    signed in (or whose token does not resolve) is capped by address, not in one shared bucket."""
+    from ..application import catalog_search as search_app
+    from ..application import search_experiment
+    from ..domain.identity import access
+    from ..infra.db import session_maker
+    from .auth import _client_ip   # auth imports web, which imports this module
+    from .hub_gate import reader
+
+    token = request.headers.get("x-treg-token", "")
+    auth = request.headers.get("authorization", "")
+    if not token and auth.lower().startswith("bearer "):
+        token = auth[7:].strip()
+
+    async def identify() -> tuple[str | None, int | None, str | None]:
+        key = search_experiment.caller_key(token)
+        if not token:
+            return key, None, None
+        try:
+            async with session_maker() as s:
+                member = await access.require_member(request, x_treg_token=token, treg_session="", db=s,
+                                                     x_treg_org=request.headers.get("x-treg-org", ""))
+        except Exception:  # noqa: BLE001 - who is asking is attribution, never a reason to fail a search
+            return key, None, None
+        return key, (member.org.id if member.org is not None else None), member.email
+
+    async with session_maker() as s:
+        slug, email = await reader(request, s)
+    page = await search_app.search(
+        q, limit, cat=cat, source="cli", caller=search_app.Caller(hub_slug=slug, hub_email=email),
+        observed=lambda ids: _observed_or_empty(observations, ids), identify=identify,
+        provider_display=_provider_display, client_ip=_client_ip(request))
+    led = catalog_store.led_by(q, cat)
+    results = [
+        (dict(ep) | {"score": None, "observed": page.stats.get(ep["id"])}) if ep.get("kind") == "hub" else
+        (catalog_store.endpoint_view(ep, _provider_display(ep["provider"]), cat)
+         | catalog_store.endpoint_context(ep, cat)
+         | {"score": None if page.judged or led else score, "observed": page.stats.get(ep["id"])})
+        for ep, score in page.rows
+    ]
+    results = catalog_store.group_routed(results, max_children=catalog_store.MAX_ROUTED_CHILDREN)[:limit]
+    out = {"query": q, "count": len(results), "total": page.total, "results": results, "engine": "agent"}
+    if page.verdict is not None:
+        out["verdict"] = page.verdict
+        if page.reason:
+            out["reason"] = page.reason
+        out["jobs"] = [{"capability": j.capability, "providers": j.providers, "shown": j.shown} for j in page.jobs]
+    if not results:
+        near = catalog_store.near_misses(q, cat)
+        if near and page.verdict != find.NONE:
+            out["near"] = near
+    return out
+
+
+async def _added_search(request: Request, q: str, limit: int, opts: catalog_store.AddedOptions, cat,
+                        observations: endpoint_stats.EndpointObservationReader, db: AsyncSession) -> dict:
+    """`/catalog/search` with a recently-added option: a flat list of tools, each with its `added`
+    day and provider (`application.catalog_search.added_page`)."""
+    from ..application import catalog_search as search_app
+    from .hub_gate import reader
+    slug, email = await reader(request, db)
+    page = await search_app.added_page(
+        q, cat, limit, opts, caller=search_app.Caller(hub_slug=slug, hub_email=email),
+        observed=lambda ids: _observed_or_empty(observations, ids))
+    results = [
+        (dict(ep) | {"score": score, "observed": page.stats.get(ep["id"])}) if ep.get("kind") == "hub" else
+        (catalog_store.endpoint_view(ep, _provider_display(ep["provider"]), cat)
+         | catalog_store.endpoint_context(ep, cat)
+         | {"score": score, "observed": page.stats.get(ep["id"])})
+        for ep, score in page.rows
+    ]
+    window = f"in the last {opts.days} days" if opts.days else "yet"
+    hints = ([f"treg catalog get {results[0]['id']}   # params, cost and an example response"] if results
+             else [f"no tool{' matching ' + repr(q) if q.strip() else ''} was added {window}"])
+    if page.total > len(results):
+        hints.append(f"{page.total - len(results)} more — raise limit (max 100)")
+    out = {"query": q, "count": len(results), "total": page.total, "results": results, "hints": hints,
+           "sort": "newest" if opts.newest or not q.strip() else "best"}
+    if opts.days is not None:
+        out["added_within_days"] = opts.days
+    if opts.capped:
+        out["capped_at_days"] = catalog_store.ADDED_DAYS_MAX
+        hints.insert(0, f"added_within_days is capped at {catalog_store.ADDED_DAYS_MAX}")
     return out
 
 
@@ -433,9 +554,35 @@ def _related_capabilities(ep: dict, cat) -> list[dict]:
     return sorted(out, key=lambda r: r["capability"])[:5]
 
 
+async def _your_values(request: Request, db: AsyncSession, ep: dict) -> dict:
+    """The values only this reader may send for a row's `team_label` and `caller_email` fields, so
+    a signed-in agent gets its first call right. The route stays open: an anonymous reader, or one
+    whose token does not resolve to a team, gets nothing extra. Not cached at the edge."""
+    token = request.headers.get("x-treg-token", "")
+    auth = request.headers.get("authorization", "")
+    if not token and auth.lower().startswith("bearer "):
+        token = auth[7:].strip()
+    cookie = request.cookies.get("treg_session", "")
+    if not token and not cookie:
+        return {}
+    from ..application.call.resolve import team_label
+    from ..domain.identity.access import require_member
+    try:
+        caller = await require_member(request, x_treg_token=token, x_treg_org=request.headers.get("x-treg-org", ""),
+                                      treg_session=cookie, db=db)
+    except HTTPException:
+        return {}
+    values = {path: team_label(caller.org_id) for path in ep.get("team_label") or ()}
+    values |= {path: caller.email for path in ep.get("caller_email") or ()}
+    return {"your_values": values,
+            "your_values_note": "On treg's key send these exactly: the label is your team's own; "
+                                "an alert email may only be yours."}
+
+
 @app.get("/catalog/endpoints/{endpoint_id}")
 async def catalog_endpoint(
     request: Request,
+    response: Response,
     endpoint_id: str,
     observations: endpoint_stats.EndpointObservationReader = Depends(
         _endpoint_observation_reader),
@@ -464,8 +611,19 @@ async def catalog_endpoint(
             "error": f"unknown endpoint {endpoint_id!r}",
             "hint": catalog_store.unknown_id_hint(endpoint_id, cat),
             "did_you_mean": catalog_store.near_ids(endpoint_id, cat)})
+    if catalog_store.paused(ep):
+        # Out of search while paused, but a held id is told why instead of "unknown endpoint".
+        raise HTTPException(status_code=503, detail=oauth_providers.paused_detail(
+            ep["provider"], endpoint_id))
     view = (catalog_store.endpoint_view(ep, _provider_display(ep["provider"]), cat)
             | catalog_store.endpoint_context(ep, cat))
+    if ep.get("team_label") or ep.get("caller_email"):
+        personal = await _your_values(request, db, ep)
+        if personal:
+            # One reader's label and email: never stored by a shared cache, never served to another.
+            response.headers["Cache-Control"] = "private, no-store"
+            response.headers["Vary"] = "Authorization, X-Treg-Token, X-Treg-Org, Cookie"
+        view |= personal
     siblings = [
         catalog_store.endpoint_view(other, _provider_display(other["provider"]), cat)
         for other in sorted(cat.for_capability(ep["capability"]), key=lambda e: e["id"])
@@ -514,18 +672,28 @@ async def catalog_endpoint(
                                    cost_at(cat.cost_view(k.get("cost"), k["provider"]), {}, ad), st.get("hit_rate"),
                                    st.get("ok_rate"), st.get("p50_ms"), st.get("last_ok_days")))
         routing = {
-            "contract": {"identity": [list(v) for v in contract.identity], "output": contract.output,
+            "contract": {"identity": [list(v) for v in contract.identity], "output": {
+                             # `analytics` is treg's own event mapping, not part of the answer.
+                             k: {a: b for a, b in (v or {}).items() if a != "analytics"}
+                             for k, v in contract.output.items()},
                          "miss": contract.miss, "derive": contract.derive} if contract else None,
-            "plan": [_plan_row(c) for c in rank(cands)],
+            # A child the router would not call on treg's key (`route.py` drops it the same way)
+            # stays in the plan for its `accepts`, ranked after the rest and saying why.
+            "plan": [_plan_row(c) for c in rank([c for c in cands if not _quote_skip(c.endpoint, cat)])]
+                    + [_plan_row(c) | {"skipped": _quote_skip(c.endpoint, cat)}
+                       for c in rank([c for c in cands if _quote_skip(c.endpoint, cat)])],
             # The same job from providers whose adapter is not (yet) verified: not chosen by the
             # router, still callable by id — the search page groups them under this row, so the
-            # page it points at must name them too (found 2026-08-28: "+18 more" led to a list of 6).
+            # page it points at must name them too.
             "also": [{"endpoint_id": s["id"], "usd": ((s.get("cost") or {}).get("usd"))}
                      for s in siblings if s["id"] not in set(ep.get("routed_children") or [])],
             "headers": {"X-Treg-Route-Waterfall": "on by default: a miss tries the next provider; 0 = stop at the first miss",
                         "X-Treg-Route-Max-Cost": "USD ceiling for the whole call (default 1.00)",
                         "X-Treg-Route-Prefer": "provider[,…]", "X-Treg-Route-Exclude": "provider[,…]",
-                        "X-Treg-Route-Strict-Filters": "1 = never call a provider that cannot apply a filter you sent (answers 422, nothing charged); off by default — the answer names what was ignored in X-Treg-Ignored-Filters"},
+                        "X-Treg-Route-Strict-Filters": "1 = never call a provider that cannot apply a filter you sent (answers 422, nothing charged); off by default — the answer names what was ignored in X-Treg-Ignored-Filters",
+                        **({"X-Treg-Route-Verify": f"true = check a hit with {contract.check.endpoint} in the same call, at its own price, "
+                                                   "inside X-Treg-Route-Max-Cost; the answer is _treg.verification "
+                                                   "{verdict, checked, served_by, cost_micro}"} if contract and contract.check else {})},
         }
     return {
         "endpoint": view | ({"routed_children": ep.get("routed_children")} if ep.get("kind") == "routed" else {}),
@@ -569,13 +737,17 @@ async def _hub_endpoint_view(endpoint_id: str, db: AsyncSession,
     script, the maker's tools and every key (docs/HUB-DECISIONS.md round 4 q4, round 5 q7)."""
     from ..application import hub as hub_app
     from ..domain.hub import PAY_NOTE as HUB_PAY_NOTE, fees_label as hub_fees_label, price_label as hub_price_label
-    from ..models import Org
+    from ..models import HubListing, Org
     if not hub_app.visible_to(org_slug, email) or not hub_app.is_hub_id_shape(endpoint_id):
         return None
     row = await hub_app.tool_for(db, endpoint_id, caller_slug=org_slug, caller_email=email)
     if row is None:
         return None
     org = await db.get(Org, row.org_id)
+    # a listed tool's `added` is the UTC day treg approved it for search; an unlisted one has none
+    listing = await db.get(HubListing, row.tool_id)
+    added = (listing.decided_at.date().isoformat()
+             if listing is not None and listing.state == "approved" and listing.decided_at else None)
     from ..application.hub.health import health_of
     health = await health_of(db, row.tool_id, row.version, row.check_result)
     base = get_settings().public_url.rstrip("/")
@@ -586,7 +758,7 @@ async def _hub_endpoint_view(endpoint_id: str, db: AsyncSession,
     example = {k: v for k, v in example.items() if v not in ("", None, 0)}
     rng = (await hub_app.price_ranges(db, {row.tool_id: m})).get(row.tool_id)
     # An approved job puts the tool beside that job's providers, and them beside it: the same
-    # comparison catalog_get gives a provider row (round 3). Its own numbers carry the seed.
+    # comparison catalog_get gives a provider row. Its own numbers carry the seed.
     capability = await hub_app.approved_capability(db, row.tool_id)
     cat = catalog_store.load()
     siblings = [catalog_store.endpoint_view(o, _provider_display(o["provider"]), cat)
@@ -602,7 +774,7 @@ async def _hub_endpoint_view(endpoint_id: str, db: AsyncSession,
             "id": row.tool_id, "kind": "hub", "hub": True, "version": row.version,
             "name": row.name, "summary": row.summary, "provider": org.slug if org else "",
             "provider_display": org.slug if org else "", "method": "POST",
-            "path": f"/call/{row.tool_id}",
+            "path": f"/call/{row.tool_id}", "added": added,
             "inputs": inputs, "output": m.get("output", {}), "writes": row.writes,
             "recipe": "script" if row.kind == "script" else "steps",
             "limits": m.get("limits", {}),

@@ -2,6 +2,12 @@
 title: Endpoint catalog — what you can DO with a connected key, and which provider should do it
 status: shipped
 sources:
+  - src/treg/domain/catalog/rankings.py
+  - src/treg/application/rankings.py
+  - tests/test_rankings.py
+  - scripts/catalog_added.py
+  - scripts/catalog_backfill_added.py
+  - .github/workflows/catalog-added.yml
   - src/treg/catalog/fetchinio.yaml
   - src/treg/web/logos/fetchinio.svg
   - src/treg/catalog/examples/fetchinio.linkedin.user.profile.json
@@ -56,6 +62,15 @@ sources:
   - src/treg/catalog/examples/linkup.web.fetch.structured.json
   - src/treg/catalog/examples/linkup.web.answer.json
   - src/treg/catalog/examples/linkup.web.answer.status.json
+  - src/treg/catalog/parallel.yaml
+  - src/treg/catalog/pdl.yaml
+  - src/treg/catalog/pdl.extended.yaml
+  - src/treg/web/logos/parallel.svg
+  - src/treg/catalog/examples/parallel.web.search.json
+  - src/treg/catalog/examples/parallel.web.search.advanced.json
+  - src/treg/catalog/examples/parallel.web.extract.json
+  - src/treg/catalog/examples/parallel.people.search.json
+  - src/treg/catalog/examples/parallel.companies.search.json
   - src/treg/catalog/keenable.yaml
   - src/treg/catalog/olostep.yaml
   - src/treg/catalog/spidercloud.yaml
@@ -75,6 +90,7 @@ sources:
   - src/treg/catalog/examples/tinyfish.web.agent.run.cancel.json
   - tests/test_tinyfish.py
   - src/treg/catalog/exa.yaml
+  - src/treg/catalog/anyapi.yaml
   - src/treg/catalog/anyapi.extended.yaml
   - src/treg/catalog/adyntel.yaml
   - src/treg/catalog/examples/adyntel.meta-ads.library.advertiser.json
@@ -116,6 +132,7 @@ sources:
   - .github/workflows/catalog-drift.yml
   - scripts/catalog_drift.py
   - scripts/catalog_ingest.py
+  - scripts/catalog_ingest_crawl4ai_recipes.py
   - scripts/catalog_validate.py
   - src/treg/catalog/aliases.yaml
   - src/treg/catalog/fx.yaml
@@ -158,12 +175,15 @@ sources:
   - src/treg/domain/money/settlement.py
   - src/treg/domain/catalog/stats.py
   - src/treg/infra/catalog_observations.py
+  - src/treg/infra/catalog_stat_dirty.py
   - src/treg/application/catalog_stats.py
   - src/treg/alembic/versions/0038_endpoint_day_stats.py
+  - src/treg/alembic/versions/0066_endpointdaystat_verdicts.py
   - src/treg/routers/catalog.py
   - tests/test_aigc_pr_b.py
   - tests/test_catalog_api.py
   - tests/test_catalog_validate.py
+  - tests/test_call_verdict.py
 related:
   - architecture/money.md
   - architecture/proxy-model.md
@@ -223,6 +243,35 @@ against the declared public predicate after closing the database session, before
 assigned to any organization is never sent through the public lookup. BYOK never applies this
 policy. Fish remains deployment-disabled until live management-price, shared-account permission,
 and commercial checks pass.
+
+`team_label` covers provider objects that outlive a call and are kept per label (monitors,
+schedules, feeds) on treg's one shared account. It lists request fields (body, header, query or
+path) that must carry the calling team's own label, `resolve.team_label(org_id)`: stable, one per
+team. `_enforce_team_label` checks it on the shared key only, before reserve; the caller sends it,
+so the relay stays faithful, and a missing or other team's label is a 400 naming the expected
+value. A team's own key never applies it.
+
+`caller_email` lists request fields (nested body paths allowed, such as `notify.email`) that, when
+sent on the shared key, may only carry the caller's own verified email, compared case-insensitively;
+another address is a 400 before reserve, and leaving the field out is fine. `_enforce_caller_email`
+checks without rewriting, so a shared provider account sends alerts only to the person who asked.
+
+For a signed-in reader, `GET /catalog/endpoints/{id}` (and so MCP `catalog_get`) adds
+`your_values` on rows with `team_label` or `caller_email` fields: the exact values that reader may
+send (its team's label, its own email), so an agent gets its first call right without a bounce. An
+anonymous reader gets nothing extra; the route is not cached at the edge. MCP `my_tools` also
+returns the team's `team_label`.
+
+`cost.quantity` prices a call by a whole number the caller chooses (a budget of provider credits):
+`{field, max}` names a declared integer body or query field and its ceiling. A missing or
+out-of-range value is a 400 before reserve, the hold is `quantity x price`, and `settle: quantity`
+settles exactly that on success, ignoring any provider-reported charge (adding room is often free on
+the provider's side and reported as 0). An optional `applied` JSON path names the answer field that
+says the units were added; when it is not `true` (a retry the provider recognised by its purchase
+id) the call settles at 0. A cancel after the request has left (`settle._finish_cancelled_call` with
+`sent`) charges the hold instead of returning it, because the provider may already have added the
+units; the retry with the same purchase id then settles at 0, so the team pays exactly once. The validator requires it on a `per_success` price with no
+`reported_charge`. Together they let a team buy a budget for background work under its own label.
 
 ## Authorization metadata
 
@@ -372,6 +421,14 @@ tasks after the owned
 team that submitted the task on the shared key. Account-wide task listing, mixed batch Tasks,
 closed-beta Extract, and the undocumented Responses route are outside the shared-key catalog.
 
+Parallel's Search and Extract responses list billed SKUs in `usage[]`, so their rows settle through
+generic `settle: usage` terms with a `[name=...]` selector. Search's turbo/fast and basic/advanced
+modes report the same `sku_search` name at different prices, so each price is its own row with a
+`mode` enum. Each row holds its base price, as Exa does; usage settles results past ten and each
+further Extract URL. An unreadable URL returns 200 under `errors[]` with an empty `usage[]`, and the
+routing miss releases the hold. Entity Search reports no usage: its people and companies rows settle
+the documented flat price and allow `match_limit` up to the 100 included results.
+
 Spider's `spidercloud.yaml` curates Scrape, Crawl, Search, Links, Unblocker and Screenshot. The
 standard routes are live-verified with public targets. Only the bounded Search listing is offered
 on the shared key: with `fetch_page_content=false`, a two-result limit and the default listing each debited ten
@@ -413,6 +470,7 @@ scripts/
   catalog_verify.py           # live-tests CORE endpoints with a real credential; writes examples/
   catalog_verify_extended.py  # the same for the extended tier, in bulk, under a spend cap
   catalog_ingest.py           # bulk-generates the extended tier from provider specs
+  catalog_ingest_crawl4ai_recipes.py  # writes the marked recipes block of crawl4ai.yaml from GET /recipes
   catalog_cost_provenance.py  # backfills cost units + provenance; re-run after any re-ingest
 src/treg/routers/catalog.py    # open Catalog JSON routes, attached in legacy registration order
 ```
@@ -523,8 +581,10 @@ Rules:
   descriptions in different files, is an error; and a proposal that endpoints of two providers use
   is a warning to promote it here, deleting it from every provider file.
 - `capability_titles:` maps an id to a short title people scan on a platform shelf, only where the
-  description runs long. The description stays whole, because agents read it and search ranks on it;
-  the shelf shows it on hover. A title naming no capability fails the catalog load.
+  description runs long. The full description stays available on the comparison page and to agents.
+  Both title and description are indexed by the platform shelf filter, catalog search, and find
+  recall, so shortening a title does not discard the longer search vocabulary. A title naming no
+  capability fails the catalog load.
 - One job, one id. Two ids of one platform with the same description are a validator warning: they
   split one comparison row in two. Rename the losing id on its rows (endpoint ids do not change) and
   check `contracts.yaml` and `adapters.yaml`, which are keyed by capability. Count-only search
@@ -584,9 +644,69 @@ endpoints:
       currency: USD
       note: "charged on 2xx only; errors free"
     verified: 2026-07-28             # date of the last PASSING catalog_verify.py run; absent = unverified
+    added: '2026-07-28'              # REQUIRED: the UTC day this tool reached main; never changes
     example_response: examples/tikhub.tiktok.user.profile.json   # written by catalog_verify.py
     docs_url: https://docs.tikhub.io/…
 ```
+
+### `added` — the day a tool reached main
+
+Every tool row, core and extended, carries `added: 'YYYY-MM-DD'`: the **UTC** day the tool first
+became available on main. It lives on the row in the tool's own provider file, next to `verified:`
+(after `id:` when the row has none), and never in a shared dates file that every listing PR would
+conflict on. It is not `verified` (that moves on every re-check, and many rows have none) and not
+the provider's `source.curated` day.
+
+- **Rule A.** An existing tool keeps the day it reached main. A new tool takes the day its PR is
+  prepared; if the PR waits long, its author updates the new rows' dates before merging. All dates
+  are UTC days, so a tool may show `added` one day before a `verified` its author wrote in local
+  time.
+- **Never changes.** The date is keyed by tool id across the whole catalog, so a row promoted from
+  `<service>.extended.yaml` to core, or moved between files, keeps it. The `Catalog added dates`
+  workflow runs `scripts/catalog_added.py --base origin/<base>` on every pull request and fails,
+  listing the ids, when an existing id's date differs from the base branch. A deliberate change (a
+  wrong backfill, a renamed tool given its old id's date, a rule change) passes only with the
+  `added-date-change` label; outside CI, `--allow-change` is the same override.
+- **The helper.** `uv run python scripts/catalog_added.py` writes today's UTC date into every row
+  that has none and never touches an existing one; `--check` lists the rows without one. It
+  inserts one line per row as text, so comments and hand layout survive. `catalog_validate.py`
+  fails a row whose `added` is missing, not `YYYY-MM-DD`, or in the future, and names the helper.
+- **Ingest.** `carry_verification` carries `added` by id from every catalog file BEFORE its
+  method/path check: a tool whose route moved is still the tool that reached main that day. Only
+  an id the catalog has never had gets today's UTC date, so a re-import never re-dates a tool.
+  For a row whose route still matches it also carries the reviewed facts no spec holds (`cost`,
+  `observed_cost`, `expect`, `untestable`, `status`), but not `platform_blocked` once the fresh row
+  declares `resource_ownership.requires`: declared ownership is what the block stood in for.
+- **Backfill.** `scripts/catalog_backfill_added.py` dated the existing rows once from the
+  first-parent history of main: the first merge day on which each id was present in any catalog
+  file. A branch that merged main into itself and was then fast-forwarded onto main puts its own
+  line on that history and hides main's merges of the period behind each "merge main into" commit,
+  so those lines of main are walked too and an id takes the earliest day any of them had it. Its report lists the big days, possible renames (an id leaving while another with the
+  same provider, method and path arrives), ids removed and re-added, and unplaceable rows; a
+  reviewed rename is applied with `--same-tool OLD=NEW`. The first catalog commit gives most of
+  the original catalog one shared date, which is correct.
+
+#### Recently added tools — two search options
+
+`added_within_days=N` and `sort=newest` are the same two options on every surface:
+`GET /catalog/search`, `treg catalog search --new [DAYS] --sort newest`, MCP `catalog_search` on
+`/mcp/` and `/mcp/v2/`. The dashboard does not offer them yet. Without either
+option search is exactly what it was (same rows, same order); the only addition is `added` on each
+row, and in `GET /catalog/endpoints/{id}`. `store.added_options` reads them: a window below one day
+is a 400 (an `invalid_option` error on MCP); above `ADDED_DAYS_MAX` (365) it is capped and the
+answer says so (`capped_at_days`). A bare CLI `--new` asks for 30 days, and the MCP and
+agent-facing docs suggest 30.
+
+With an option, `application.catalog_search.added_page` builds the page: `store.added_keep` keeps
+rows whose `added` day is today (UTC) or within the N days before it, words are optional, and the
+answer is a flat list, best match first with words and newest first with `sort=newest` or with no
+words. It runs no judge and writes no experiment record. Two rows have no provider YAML:
+
+- **A routed row** (`treg.<capability>`) has `added: null` and is left out of these lists. It is a
+  choice among tools, not a tool that arrived on a day; its children are the tools, each with its
+  own date. A date derived from the children would be a guess.
+- **A listed hub tool** has `added` = the UTC day treg approved its listing
+  (`HubListing.decided_at`), the day it reached search. An unlisted one shows none.
 
 ### Domain sections — grouping endpoints for browse
 
@@ -682,7 +802,9 @@ billing rule (a failed generation is not charged), not the display unit.
 The validator checks the effective descriptor. Dotted JSON paths are syntactically valid; success
 is non-empty; failure may be empty only when optional, non-empty `billed_failure` supplies the
 terminal failure values; optional `progress` names expected non-terminal values so the CLI can
-distinguish them from a new undocumented provider state; all status lists are pairwise disjoint. `interval` is positive; poll has exactly one of `endpoint`
+distinguish them from a new undocumented provider state; all status lists are pairwise disjoint. A
+descriptor with `max_age` may omit failure words altogether, because its task always ends. `interval`
+is positive; poll has exactly one of `endpoint`
 or `url_from`; result has exactly one of `path` or `fetch`; every descriptor block rejects unknown
 keys. Status values are compared after string coercion on both sides; a missing or unrecognized value
 means still in progress, in both the CLI awaiter and the settlement worker, but the CLI warns once
@@ -695,10 +817,25 @@ so a terminal field such as MiniMax's `file_id` is not confused with the utility
 The named path/query input must exist on the target endpoint. Body-mode polling is deliberately
 outside the frozen contract because no surveyed provider uses it and the generic client could not
 faithfully execute it. Dynamic URLs require a non-empty `url_hosts` allow-list. Any endpoint with
-`async:` must use `cost.type: per_success`. The descriptor is metadata
+`async:` must use `cost.type: per_success` or `per_call`. The descriptor is metadata
 beside the faithful relay: it never changes provider-native parameters or response bodies. The call
 router serializes the effective descriptor into `X-Treg-Async` before the response stream starts;
 it does not inspect or buffer the upstream body.
+
+Three optional keys cover a provider that usually answers at once and only sometimes hands back a
+task (BounceBan's single verification answers `verifying` for a greylisted mailbox):
+
+- `terminal_on_submission: true`: when the submission's own status is already a success word, the
+  call is finished. It settles on the response like a synchronous call: no wait, no poll, no
+  pending task. The direct call path, the routed bridge, Enrich Arena and `treg call --await` all
+  read it through `domain.asynctasks.finished_on_submission`.
+- `max_age` (seconds, at most a day): the provider's polling window. The worker stops polling at it
+  and times the task out; the routed and Arena waits and the CLI awaiter never wait past it.
+- `interval` also paces the CLI awaiter, so one caller plus the worker stays near a provider's
+  per-task poll limit. treg does not count polls across pollers.
+
+`terminal_on_submission` asks for `terminal_example_response` like any routed async tool; for a row
+whose finished answer is its usual first answer, both examples may be the same file.
 
 Older async pairs that settle on their existing request paths use `resource_ownership` alongside
 the deferred-settlement design. `produces` maps response JSON paths to provider-local resource
@@ -720,7 +857,13 @@ required id but omit this metadata, so new legacy-style pairs cannot rely on a r
 boundary by hand.
 Generated legacy task consumers for which no trustworthy producer→id chain is represented are
 explicitly `platform_blocked` instead: Akta request status, TikHub's captions-result route, and the
-DataForSEO on-page/SERP task consumers remain callable with BYOK but never receive treg's shared key.
+DataForSEO SERP task consumers (`serp/ai_summary`, `serp/screenshot`) remain callable with BYOK but
+never receive treg's shared key.
+
+A provider's task queue is ingested as owned async pairs (`catalog_ingest.dfs_submission`): the
+submission's `produces` may take every list item (`tasks.*.id`), so a batch owns each of its tasks,
+and its free reader declares the matching `requires`. A reader of the account-wide queue is never
+the poll target. Every shared-key submission must have an owned reader (`tests/test_dataforseo_async.py`).
 `carry_verification` preserves that reviewed block across re-ingestion just like a verification
 stamp; silently regenerating it away would reopen the tenant boundary.
 
@@ -1025,7 +1168,9 @@ that slice: it bills one whole credit (~$0.0245) for one email or ten (observed 
 `usd_per_call`. Settlement still reads `usd` and the derived email-count rule — display only.
 `Catalog.cost_view` reads the provider-neutral `cost.display` flags: `unit` names the shown unit,
 `grouped` shows the price for `cost.per` units, `round_up` labels a started block, `variable` adds
-a plus sign for selected additions, and `maximum` labels a validated reserve ceiling as "up to"
+a plus sign for selected additions, `value` shows the price of one `unit` when that is not the reserve
+unit (a job held at its full size but billed per page shows the page price; the hold still reads `usd`),
+and `maximum` labels a validated reserve ceiling as "up to"
 (it may wrap a price table, whose fallback is already the global upper bound). The result is
 display USD / unit / prefix / suffix fields only; `usd` and settlement are untouched. The validator
 checks the flags, requires a grouped price to declare a positive integer `per`, and refuses a table
@@ -1064,9 +1209,18 @@ billable, the recovery report): architecture/money.md.
 For synchronous providers that disclose the exact charge in the response, a paid cost may declare
 `reported_charge: {path: ..., unit: usd}` or use `unit: credit` when the provider has an `fx.yaml`
 credit rate. The catalog estimate still reserves a safe
-ceiling. A finite nonnegative response value settles the call at that amount; missing, invalid, or
-non-finite evidence falls back to the normal estimate/miss rules. `reported_charge` is generic
+ceiling. A finite nonnegative response value settles the call at that amount; a missing value in a
+body whose own `status` is 400 or more settles at zero; other missing, invalid, or non-finite
+evidence falls back to the normal estimate/miss rules. `reported_charge` is generic
 catalog metadata, not a provider-specific billing branch, and cannot be combined with `cost.settle`.
+
+A provider file, or one endpoint's `cost`, may declare `ceiling_param: {in: query, name, unit: usd}`.
+When the call has a caller ceiling and the caller did not send that query name, the call application
+appends it to the outbound query at the remaining ceiling in USD, so the provider refuses a dearer
+source instead of settling it. The validator requires `in: query`, `unit: usd` and an identifier
+`name`. The provider rule lives on `Catalog.ceiling_params`, not on `provider_meta` and not copied
+onto every cost, so catalog reads stay unchanged. A row-level `cost.ceiling_param` overrides it.
+The appended pair is outbound only: `params_hash` and the archive key stay the inbound query.
 
 `spooled_response: true` marks a synchronous endpoint whose answer inlines media too large for
 the 8 MiB settlement buffer (Gemini returns images as base64 in its JSON: ~9 MB at 2K, ~23 MB at
@@ -1087,7 +1241,9 @@ option such as a spend cap or memory size can bound what one call costs. An Apif
 `call_fee`, the flat per-run charge settled with its counted rows (money.md, Apify dataset-row settlement). Provider-specific
 request guards bound shapes whose billing formulas need more context than an exact selector:
 Openmart requires its explicit 1-25 record count, while Tavily Map and Crawl require an explicit
-integer limit from 1 to 20. Resolution applies these only after selecting the platform offer and
+integer limit from 1 to 20. Ocean.io search requires an explicit 1-100 page size, and person
+enrichment excludes separately billed contact reveals from the shared-key request. Resolution
+applies these only after selecting the platform offer and
 before reserve; a team's own credential retains the upstream contract.
 
 A second treg-set kind, **`kind: treg_trial`**, prices a provider at exactly **$0** with a
@@ -1221,6 +1377,8 @@ Do these steps in order; each has a hard success criterion.
    `TREG_CATALOG_CRED` env var. It calls every endpoint's `test_request`, checks `expect`, writes
    the truncated example response to `examples/`, and prints PASS/FAIL per endpoint. Stamp
    `verified: <today>` ONLY on endpoints that passed — documented ≠ verified; docs lie.
+   Every new row also gets `added:` (`uv run python scripts/catalog_added.py` writes today's UTC
+   date where it is missing).
 8. **Scrub.** Read every captured example: replace anything personal that is not the public test
    target's own public data. The account-info endpoints of YOUR OWN key (quota, balance) must have
    emails/ids masked before commit.
@@ -1323,6 +1481,15 @@ the provider's OpenAPI bundle without a live probe and says so with `skipped` an
 `example_response`; an invented fixture would be worse than none. `lusha.extended.yaml` is
 hand-maintained (no ingester reads Lusha's client-rendered reference), so the "regenerated wholesale"
 caveat above does not apply to it and the tombstone survives.
+
+### Paused providers — a deployment setting, not a row
+
+`TREG_PAUSED_PROVIDERS` names providers this deployment cannot serve right now. `store.paused(ep)`
+takes their rows out of `_match` (so `search`, `candidates`, `near_misses`, `rank_band`), out of
+`added_rows`, out of find's recall and name rows, out of `_capability_alternatives`, and out of
+routed plans. `by_id` keeps them, so a direct lookup or call answers `503 provider_paused` rather
+than "unknown endpoint" (`interface/api.md`). The rows themselves do not change: lifting the pause
+restores them as they were.
 
 ### `platform_blocked:` — works upstream, but not on treg's plan
 
@@ -1533,6 +1700,9 @@ needing an async crawl id).
 A provider whose POST routes take `application/x-www-form-urlencoded` may read the credential from
 the form body and reject a query token with a misleading auth error (Just One API). For
 `bodyType: form` entries `catalog_verify.py` and `catalog_verify_extended.py` move it into the body.
+`bodyType: form` means form only: a JSON body sent to such a row gets a 400 naming the fix
+before any upstream trip (nothing is rewritten), and the MCP `call` tool form-encodes an object
+body for it. A row whose upstream also takes JSON declares `json`.
 A provider's other quirks live on its rows as `note`, `enum` or `example`, never here.
 
 ## Choosing between providers (`domain/catalog/stats.py`)
@@ -1550,9 +1720,8 @@ a name, and fail. Routing would also have been the first feature to break the fo
 relays rather than models.
 
 What treg owes instead is the half only treg can supply, because only treg sees every call from every
-tenant: `endpoint_stats.observed()` aggregates **success rate, p50/p95 latency, last-answered and
-sample size** per endpoint from `CallRecord` — which has recorded `endpoint_id`, `status_code` and
-`duration_ms` since the marketplace shipped and was never read. It rides on
+tenant: the observation reader publishes **success rate, p50/p95 latency, last-answered and
+sample size** per endpoint from folded `CallRecord` evidence. It rides on
 `/catalog/endpoints/{id}`, attached to the endpoint **and every sibling**, because the choice is made
 on that page and an agent will not make a second round-trip to compare reliability.
 
@@ -1576,13 +1745,17 @@ acceptable entry exists.
 
 Refresh is process-level singleflight. Concurrent misses join one shared Task, duplicate endpoint ids
 already in flight are not queued again, and the Task batches the requested ids. Its
-`PostgresEndpointObservationReader` opens an independent session only around one small read and
-closes it as soon as that finishes. HTTP `/catalog/search`, both MCP catalog-search tools,
+`PostgresEndpointObservationReader` opens an independent session for bounded summary reads and
+closes it as soon as that finishes. On PostgreSQL, a short read-only repeatable-read transaction
+keeps the cursor, day buckets and overdue corrections in one snapshot, so a concurrent repair
+cannot make old bucket contents appear trustworthy by deleting their marker between reads.
+HTTP `/catalog/search`, both MCP catalog-search tools,
 routed planning in `application.call.route.build_plan`, and the prose pages that print observed stats
 (`/use-cases/*`, `/workflows` and `/workflows/*`) receive the same reader instance from bootstrap, so
 their request paths have no observation DB dependency, check out zero connections, and join the same
 refresh Task. A refresh failure keeps stale
-entries, backs off before retry, and never changes the Catalog response status; a failure with no
+entries without renewing their age, backs off for at least sixty seconds before retry, and never
+changes the Catalog response status; a failure with no
 cached entry is honest emptiness. The adapter exposes entry-level `fresh`, `stale`, and `miss`
 counters plus `refresh` and `refresh_failure` counts. Its invalidation story is the two TTLs: deploys
 and process restarts begin cold, and no cross-instance correctness depends on the cache.
@@ -1590,25 +1763,93 @@ and process restarts begin cold, and no cross-instance correctness depends on th
 **The evidence is folded once, off the request path** (`application/catalog_stats.py`, run by the
 `treg-worker catalog stats` cron). Refreshing straight from `callrecord` meant every web process
 re-aggregating thirty days of audit rows for an endpoint and its siblings whenever its cache
-expired, and again from cold after each deploy: on a large audit table that is tens of seconds per
-pass, each pass evicting the pages the money path needs. The worker instead
+expired, and again from cold after each deploy. The worker instead
 walks the audit table by primary key from a persisted cursor (`EndpointStatCursor`) and folds each
 row into one `EndpointDayStat` bucket per endpoint per UTC day: counts, the newest success, the
-`hit`/per-success tallies, and a uniform reservoir of at most `stats.LATENCY_SAMPLE` successful
-durations. Rows younger than sixty seconds wait for the next run so an audit insert that commits
+`hit`/per-success tallies, the count of each verdict word (`verdicts`, a JSON object; NULL on a
+bucket folded before revision `0066`, read as empty), and a uniform reservoir of at most
+`stats.LATENCY_SAMPLE` successful durations. Rows younger than sixty seconds wait for the next run so an audit insert that commits
 late is never skipped; a plain tool call (no `endpoint_id`) and a treg refusal (`refused_by`) are
-not evidence and are not folded, exactly as the live query excludes them. The first run bisects the
+not evidence and are not folded, exactly as the live query excludes them. An entry may declare
+`observed_from: YYYY-MM-DD` when its provider replaced the service behind it: the folded reader
+(`PostgresEndpointObservationReader.get_many`) then drops that endpoint's day buckets before the
+date, so its published reliability describes only the current service. The YAML line carries the
+reason as a comment. The first run bisects the
 primary key to the first row inside the window rather than reading older pages, consumes at most
-`--max-rows` per run, and the reader keeps computing the live aggregate until a run reports it
-has caught up (`caught_up_at`), so a deployment that never schedules the worker behaves as before.
-The same fallback applies when the worker stops: a cursor not updated for `STALE_AFTER_S` (two
-hours) sends the reader back to the live aggregate with a warning, so a dead cron degrades to the
-old cost rather than to buckets that silently age out of the window. Each batch is one
+`--max-rows` per run, and the reader requires a recent `caught_up_at` and `updated_at`. Missing,
+incomplete or stale folds raise `EndpointObservationUnavailable`; no cache refresh falls back to
+`stats.observed` or scans `CallRecord`. A deployment without the worker publishes no observations.
+Each batch is one
 transaction under the cursor row's lock and re-reads every bucket it touches inside that lock;
 nothing about a bucket is carried between batches, so two overlapping runs (a slow backfill
 still going when the next schedule fires) serialize cleanly instead of one erasing the other's
 fold with the cursor already past the rows.
-Once caught up, an observation is the sum of that endpoint's day buckets from the day of the
+The public `/rankings` page (`routers/rankings.py`) is the buckets' second reader, through a worker: `treg-worker rankings refresh` (`application/rankings.refresh`) builds every board and saves it as the one `rankingssnapshot` row, and the page and `/rankings/data/{board}` read only that row (kept five minutes per process), so no web process adds up the buckets. The refresh reads the counts of the last thirty complete days without the latency reservoirs (most of the table), then only the first 50 values of each reservoir of the last seven days (cut in Postgres with `jsonb_path_query_array`; a reservoir's prefix is still a uniform pick), closes the session, and `domain/catalog/rankings.py` builds the boards in memory: most used tools and endpoints by successful calls (7 and 30 days, the 7-day change against the week before), trending, each category's providers by share, most reliable tools (all of a tool's endpoints together: a 5xx is mostly the provider's own systems), fastest endpoints (speed depends on the job, so it stays per endpoint), top AI models (the generation platforms and decision models, filed as Image, Video, Audio or Decision: per model, keyed by the capability's model segment or else the model's name without its vendor, so one model at several vendors adds up, by type), and head to head: per job (one capability), the providers past the reliability floor side by side on success rate and median time, for the busiest jobs with at least two such providers. The last complete day is the day before both today and the cursor's `watermark`, so a stopped worker never shows a partial day. The usage boards (most used, most called, the chart, top by category) have no floor on purpose: they list every tool with calls, so a tool only one team uses shows that team's volume, never the team. The boards that rate or compare have floors (trending 1,000 successful calls this week, reliability 100 decided calls, speed 20 timed calls) so a small base cannot make a large percentage; `async` endpoints are left out of reliability and speed. It never reads `CallRecord`.
+
+Late terminal evidence uses a persistent correction queue, `EndpointStatDirty`, keyed by endpoint
+and original UTC submission day. `audit._write_batch` updates the actual matching `CallRecord`
+rows with `RETURNING`, then calls `catalog_stat_dirty.mark_dirty` in the same transaction. Repeated
+notifications increment one marker's revision; they do not create one job per call or reset its age.
+Task finalization and money's settle/release transaction remain unchanged. Audit is still
+best-effort analytics, not durable money evidence.
+
+After its append pass, the same worker replaces marked day buckets from source rows with
+`id <= cursor_id`. The cursor lock serializes replacement with append folding, preventing double
+counts. A replacement recomputes the entire `Tally`, including success classification, last success,
+hit/verdict counts and the bounded latency reservoir. It conditionally acknowledges only the marker
+revision it read; a correction arriving during the scan remains queued. After a successful full
+replacement, a retained newer revision's `queued_at` advances to the source scan's start, unless
+already newer. This is a conservative lower bound on the age of still-uncovered corrections,
+not the repair's completion time or the pass's earlier start. The replacement and age advance
+commit together without changing the revision or retry schedule. Continuous terminal writes
+therefore cannot make a regularly repaired bucket look abandoned; failures and rollbacks never
+renew its age. `catalog_stat_dirty` owns
+all marker writes; the worker owns transaction boundaries. Repairs read only one endpoint/day
+through the existing `(endpoint_id, created_at)` index and stream bounded batches without source-row
+locks. The source query keeps only `refused_by IS NULL`, excluding empty-string refusal values,
+before transport: these records never contribute to `Tally`. Filtering can reduce transferred rows
+but does not guarantee fewer heap reads or faster repairs when refusals are rare. An empty source
+still replaces the old bucket with a reconciled zero tally and acknowledges its marker.
+Each batch is unpacked locally, avoiding an async result transition per row, and yields to
+the event loop before the next batch. Batching preserves the complete source query and its single
+snapshot; it does not cap the day or reduce the database scan. Repairs have independent bucket-count,
+elapsed-time and per-bucket timeout budgets. A failed replacement
+rolls back, retains its marker and defers retry, allowing other buckets to progress. The elapsed-time
+budget covers the repair loop, not the append pass or queue maintenance.
+
+Revision `0074` adds `EndpointDayStat.terminal_reconciled`, initially false for existing rows.
+`catalog_stats._seed_corrections` queues legacy async/result-adapter buckets from the small summary
+table, without scanning audit history. New buckets are reconciled by construction; appending to a
+legacy bucket cannot mark it reconciled. Async endpoints with adapters are published only when all
+applicable day rows are reconciled and no correction is older than `STALE_AFTER_S`. Unavailable
+endpoints retain their cache entries only for their original TTL; other complete endpoints in the
+same refresh can still be published. Async endpoints without adapters use ordinary folds. Async
+hit rates always use terminal evidence, never an inference from whether credits were charged.
+The current UTC day has the same overdue check: a genuinely stalled repair must not remain
+publishable indefinitely. One untrustworthy applicable day suppresses that endpoint's whole
+observation; silently dropping the day would shorten its evidence window and bias rates and
+provider comparisons.
+
+**Explicit requeue closes an earlier writer overlap.** After retiring writers that could change
+terminal evidence without marking its original day, `catalog_stats.requeue_async_stats` previews
+existing async/result-adapter buckets inside the current UTC window. An explicit apply selects
+and records its current target list under the fold cursor lock, setting `terminal_reconciled=False`
+and marking the same keys dirty in one transaction. Counts, samples and timestamps stay intact;
+existing marker age and retry backoff are preserved. The ordinary cron processes the queue with its existing budgets.
+Append folding keeps False, so a later True proves that a full repair happened after the reset.
+This works even when that repair's pass began earlier; `updated_at` is not completion evidence.
+
+The applied JSON manifest records the exact target keys. `catalog_stats.repair_status` reads their
+flags and markers in one statement snapshot. Missing, unreconciled or still-dirty targets remain
+incomplete; targets outside the current window are reported as `aged_out`, not as repaired. A
+preview manifest is rejected as completion evidence. Status applies to the same database and an
+unaltered applied manifest; it does not establish that all writers have been upgraded or that a
+reader cutover is ready. Reapplying deliberately requeues the targets again. The explicit command
+does not run automatically or scan source audit rows. New terminal results can return an active
+day to `pending` after its initial repair. A true reconciliation flag proves that initial repair;
+the reader separately bounds how long further corrections may remain queued.
+
+The folded observation covers buckets from the day of the
 window's start onward (`stats.window_days`, at most one day more evidence than the live cut,
 never less), published through the same `stats.publish` floors the live path uses; the fold and
 the SQL are held equal by `tests/test_catalog_stats_refresh.py`. Merging days weights each
@@ -1636,15 +1877,29 @@ Five rules worth keeping:
   a daily-cap 429 — see the data-model fragment) never reached the provider; they are excluded even
   from `samples`, or a burst of refused calls dresses itself up as traffic. The 2026-08-12 Hunter
   incident — 309 refusals next to 488 real calls — is why.
+- **`not_found` ends a routed call.** A miss says "this provider has no answer"; `not_found:
+  {status, when?, means}` says "the target itself does not exist" (a scraped site answered 404 or
+  410), so every other provider can only find the same nothing or answer an empty page that reads
+  as a success. `routing.contracts.declared_not_found` reads it (`status` is one status or a list,
+  a 2xx allowed only with a `when` predicate, for providers that answer 200 and name the target's
+  404 in the body); `route.py` ends the call with `route_not_found` at that status (404 for a 2xx
+  declaration), charging nothing and asking no one else. `endpoint_view` shows `status` and
+  `means` on the tools that declare it. Each scrape adapter's `miss` predicate reads that
+  provider's own text field, so an empty page is a miss for every provider, not a hit.
+- **A failed `expect` rule is a miss.** A routed child's 2xx whose body fails the endpoint's own
+  `expect` success rule is a `miss` whatever the adapter reads off it; on a `per_success` row it is
+  free unless the provider reported a charge.
 - **`miss` semantics ride on the endpoint.** Some providers answer "asked and answered: no result"
   with an error status (PDL 404s a person it has no record of; Hunter's combined-find does the
   same). Endpoints with evidenced miss behaviour carry a `miss: {status, means}` block in their
   YAML, surfaced through `endpoint_view` — so an agent reads "404 = no match, don't retry" instead
   of treating an expected empty answer as a failure. Only annotate what the wire has demonstrated.
-  **The router and the arena read the same block through one function**
+  **The router, the arena and the hit verdict read the same block through one function**
   (`routing.contracts.declared_miss`, wrapped by `route._declared_miss` and called by
-  `arena.classify`): a child answering the declared 4xx is a MISS — the waterfall goes on and a
-  fully-missed call ends as a 200 miss, never `route_failed`. Where one status carries both a
+  `arena.classify` and `results.classify`): a child answering the declared 4xx is a MISS — the
+  waterfall goes on and a fully-missed call ends as a 200 miss, never `route_failed` — and any
+  call answering it records `CallRecord.hit = False` (state `empty`, reason `declared_miss`).
+  Without that, a provider that errors its misses recorded only its hits and read 100%. Where one status carries both a
   miss and a fault, `when:` adds a body predicate in the adapter expression language, evaluated
   only on a JSON-object body (`catalog_validate.py` rejects a `when` that is not a comparison or
   call, since a misspelt path would evaluate False forever and silently revert the endpoint to
@@ -1693,12 +1948,47 @@ Five rules worth keeping:
   endpoint look broken to every other tenant — precisely the failure the 4xx rule prevents. It was
   removed. "Never worked" is read off `ok_rate == 0`, which is computed from DECIDED samples only,
   so no volume of caller errors can produce it.
+- **An empty answer is a failure where the job demands content.** A contract marked
+  `empty_is_failure` (web.extract, web.search, google.serp.organic) counts a 2xx whose
+  `CallRecord.hit` is False as bad, in `Tally.fold` and in the live `observed` query alike
+  (`store.empty_is_failure`). `results.Result.hit` is False for a 2xx that names its own error in
+  the body (`provider_error`), so a provider answering 200 with `errors: [page_not_found]` counts
+  too. Without it a provider that answers 200 to everything ranks on a success rate it did not
+  earn; other capabilities keep "a miss is an answer". The judgement exists only where the
+  endpoint has a verified adapter `miss`, so every tool of these capabilities callable on treg's
+  key carries one; tools outside the routed jobs carry a judge-only adapter (`route: false`). A
+  test fails on any such tool without one (an own-key answer is not read, so tools treg's key
+  cannot call are exempt).
 
 ### Search scoring — most words must match, and the rare ones decide
 
-This is the shipped ranker: what `/catalog/search` and the CLI answer, the lexical page the
-discovery experiment measures against, and the page an agent's MCP search falls back to when the
-job-first answer abstains ([search-experiment](search-experiment.md)).
+This is the shipped ranker: what `/catalog/search` answers, the lexical page the discovery
+experiment measures against, and the page an agent's MCP search (and the CLI's, which asks
+`/catalog/search?engine=agent` for the same use case) falls back to when the job-first answer
+abstains ([search-experiment](search-experiment.md)).
+
+A query word matches only at the START of a word in a field (`store._needles`, haystacks stored
+word-padded by `_padded`): "search" matches "searches" but not "research", "ads" not "leads". A
+substring match tied a research-task status row with every search tool on "web search", and the
+evidence sort then put the free, always-200 status row first. A query word that is a provider's
+one-word name shorter than four letters matches only whole, or with a plural "s"
+(`WHOLE_WORD_BELOW`): "exa" had matched "exact" in summaries and outranked every Exa row. Any other
+short word still matches a word's start, so "web" finds "website" and "geo" "geolocation". CJK
+variants keep matching anywhere, since CJK text has no spaces between words.
+
+**A provider named with a task** (`store.provider_focus`): "exa search", "people data labs company
+enrichment". A provider is named by its id or its display name as a token sequence, longest first;
+a domain is part of the name ("you.com"; "you" alone is a word); a platform's name names the
+platform, and a name of only short or function words names nothing.
+The rest of the query is searched without the name, so its words ("people") cannot pull the page to
+another job; the provider's rows need only one of the rest's words, match it by stem too
+("enrichment" meets "enrich"), and lead the page in their own relevance order, with no routed row
+(the caller chose the provider). Every other row is admitted and scored by the rest exactly as an
+ordinary search for it would be, so the page after the provider's rows is the rest's own page. The
+lead lives in the scores, so a led page shows no score and says `led_by`. Where none of the
+provider's rows matches a word of the rest, the query is searched as typed; this one decision
+(`provider_focus`, cached per catalog) is also the judged answer's. A bare name is an ordinary
+search.
 
 `catalog_store.search` demanded EVERY query token match (AND). Right for the 2–3 word refinement
 ("tiktok comments" must not return every tiktok endpoint), and fatal for how agents actually query:
@@ -1809,7 +2099,9 @@ and the CLI so the three surfaces cannot disagree:
   provider's NAME; the row an agent should see first for that job — `treg.people.search`, where
   treg chooses among every provider — contained no word of the query. `search` now adds
   `treg.<capability>` at the best child's score whenever a child matched. The token-filter tests
-  exempt these pulled-in rows: their own text need not contain the query.
+  exempt these pulled-in rows: their own text need not contain the query. A query that names the
+  provider with a task ("leadsforge email") asked for that provider: its rows lead and no routed
+  row rides in.
 - **Vocabulary before ranking.** The same query first ranked `people.email.find` above
   `people.search` because `find` is a token of the former's capability NAME (weight 3) and only of
   the latter's summary (weight 2). The fix was to say in `capabilities.yaml` what the job is —
@@ -1830,7 +2122,9 @@ to choose (`docs/CAPABILITY-ROUTING-PLAN.md`). Everything else in the catalog st
   never provider names — `{full_name, domain}`, `{first_name, last_name, domain}`,
   `{linkedin_url}`), `derive` rules so the two name shapes match the same adapters, a small
   *output* core (`email` required; `confidence`, names, `verified` optional) and `miss` in
-  canonical terms. `raw` — the winning provider's body — is always returned and never documented
+  canonical terms. An output field may say where it lands in a call event (`analytics: key |
+  value | skip`, default skip; [call-events.md](call-events.md)); the public contract view drops
+  it. `raw` — the winning provider's body — is always returned and never documented
   as stable. `advice_unverified` (email and phone finds, and `people.search`) is one sentence the
   router attaches as `_treg.advice` to a hit whose `verified` is not true — a found contact is not
   a confirmed one (Hunter's `accept_all`, LeadMagic's personal finder, every phone provider), and a
@@ -1839,8 +2133,34 @@ to choose (`docs/CAPABILITY-ROUTING-PLAN.md`). Everything else in the catalog st
   the same team's 79-address bounce list (2026-09-08) was 73 unverified Hunter domain-search rows
   and agent-guessed `info@` addresses that one verify call each would have caught. The
   `hunter.companies.emails` catalog summary carries the same warning for direct `/call/` users,
-  whose body is relayed verbatim. A suggestion only: treg never chains the verify call, which
-  would double every hit's price and change what the find bills. `routed: false` declares an
+  whose body is relayed verbatim. By default the advice is a suggestion only: treg does not chain
+  the verify call, which would add a price to every hit. `check` (`people.email.find`:
+  `{endpoint: treg.people.email.verify, field: email, prefer: [bounceban]}`) is the opt-in: with
+  `X-Treg-Route-Verify` the router runs that call after a hit (`_run_check`), as an ordinary
+  linked child `:v` through `execute_call`, with the hit's `field` as its identity. A routed check
+  runs its own waterfall and closes its own holds; `prefer` reaches that call only, below the
+  team's own key in `rank`. A direct (non-routed) check is built by its adapter and leaves its hold
+  in the find's `pending`. The find's holds stay open during the check, so cancellation releases
+  both. The check gets the cost ceiling the find left; one that does not fit, is refused, or fails
+  never fails the find: `_treg.verification` says `checked: false` with a `reason` and costs 0
+  (`no_hit` when the find missed, which is never checked).
+  Its `verdict` is `results.verdict` on the serving child, the same word `CallRecord.verdict`
+  stores. `X-Treg-Cost-Micro` and `_treg.charged_micro` are find plus check; a check still pending
+  after the routed async wait reports its hold and `pending: true`, settled later by the worker. A
+  hit's advice is dropped once a check ran. The header on a contract without `check` is a 422
+  before anything is planned. `people.phone.find`'s check is direct: `hlrlookup.people.phone.verify`
+  under its own `people.phone.live` contract (`live` / `dead` / `unknown`; the format check stays
+  `people.phone.verify`), `routed: false` because it has one provider, and its adapter
+  `route: false` so the arena never picks it. A check's `when` (an expression over `{field: value}`)
+  and `skip_reason` skip a hit before any call: a phone not written internationally
+  (`e164_digits`) is `not_international`, because HLR reads a national number's first digits as a
+  country code. The check's `skip_advice` then replaces the find's advice, which would ask for
+  the header the caller already sent; the words live in `contracts.yaml`. The adapter sends `usa_status` only for `+1` numbers and never reads a cache.
+  A finder that sends bare national digits plus a country field can add the code in its `out`:
+  `with_country_code(phone, country)` turns a 10-digit US or Canadian number (spaces, `-`, `.`
+  and parentheses aside) into `+1…` and
+  leaves every other value as it came (QuickEnrich). `raw` is never touched.
+  `routed: false` declares an
   admission-only contract: its adapters verify like any other (which is what the archive's
   `has_result_rules` reads), but no `treg.<capability>` row is ever generated from it. For a
   capability whose "children" are one provider's price tiers, not a choice treg should make.
@@ -1849,15 +2169,40 @@ to choose (`docs/CAPABILITY-ROUTING-PLAN.md`). Everything else in the catalog st
   the plan with the reason, not ranked down like an ignored filter: a title-only search asked for
   one company's CEO returns title-matched strangers for any company and bills them as a hit. The
   rule is per candidate, so `{q, company_domain}` also drops the `q`-only providers.
+  `verdict` declares the per-call verdict word stored on `CallRecord.verdict`: `from` names the
+  output field it is read from, `words` the closed list a call may be stored with, and `map` the
+  values that become one (`people.email.find`: `verified: true` is `verified`). A verdict is read
+  only from an answer that fills the contract's required output, so a find that found nothing
+  stores none; it is independent of `miss` (ZeroBounce's `unknown` is a routing miss and still the
+  word `unknown`). `people.email.verify` keeps `catch_all` apart from `risky` so catch-all answers
+  can be counted on their own.
+  `prefer` is the contract's default provider order, used when the caller sends no
+  `X-Treg-Route-Prefer` (a caller's header replaces it). Cost per hit ignores time:
+  `ai-search.perplexity.answer` sets `prefer: [dataforseo]` because cost per hit ranked the cheaper
+  but slower and less reliable cloro first. Its `source_kind` output says
+  whether the answer read the Perplexity website (`website`, cloro) or its model API (`model_api`).
+  In `web.extract.structured` (a URL plus a JSON `schema` and/or an `instruction`) the most complete
+  identity variant is listed first, because the first variant a caller fills is the one every field
+  rides on.
 - **Adapters** — `adapters.yaml`, one per endpoint: `accepts` (identity variants), `in` (contract
   field → `queryParams.x` / `body.x`), `const` (fixed provider params), `out` (core field →
   expression over the body), `miss`, and `route: false` for an adapter that only judges hit/miss
-  evidence (results, stats, cache admission) and never joins routing or the arena. The expression language (`domain/catalog/routing/paths.py`)
+  evidence (results, stats, cache admission) and never joins routing or the arena. Where the
+  contract records a verdict, `verdicts` maps the provider's own words (normalized: lower case,
+  spaces and hyphens to `_`) to the contract's (`ok: valid`, `accept_all: catch_all`); a word that
+  is already the contract's maps to itself. `verdict` is an optional expression that reads the
+  provider's word when the contract's `from` field cannot (BounceBan and LimaData report a
+  catch-all domain as a flag next to `risky`). `results.verdict` reads the word at the call's
+  audit step and the async finalizer reads it from the terminal answer; a word the adapter does
+  not map is stored as NULL and logged, and `tests/test_call_verdict.py` holds every verifier's
+  example answer to a mapped word. The expression language (`domain/catalog/routing/paths.py`)
   is deliberately tiny: dotted paths with `[i]` (root `[0]`, `.` = the whole body), `coalesce`
   (first non-empty argument, else the last one),
   `/ N`, `==`/`!=` against literals, and named transforms (`split_first`, `split_last`, `join`,
   `has_type`, `len`, `list`, `obj`, `fmt`, `csv`, `lower`/`upper`, `at_least`, `at_most`, `null_if`, `choose`, `linkedin_handle`/
-  `linkedin_url`, `email_domain`, `host`, `dfs_location`, `seranking_source`, `tca_filter`).
+  `linkedin_url`, `email_domain`, `host`, `dfs_location`, `seranking_source`, `tca_filter`,
+  `e164_digits`, `starts_with`, `with_country_code`, `count_with`, `role_seniority`, `role_department`,
+  `scalar`).
   `values` reads rows from object-keyed or list responses; `get` applies dotted/indexed lookup
   to another expression result (for example, the first company in a domain-keyed response).
   These are generic helpers, not provider-specific rewrites.
@@ -1868,6 +2213,8 @@ to choose (`docs/CAPABILITY-ROUTING-PLAN.md`). Everything else in the catalog st
   expresses an upper bound in catalog-priced units (for example, fixed-page billing). Both the
   public quote and call-time plan use it through `routing/plan.py::cost_at`; invalid unit values
   remain unpriced. It does not replace the child's normal reserve/settle rules.
+  Optional adapter `max` (`{limit: 8}`) names a filter the provider caps: `build_plan` drops that
+  child for a request above the cap (`needs limit <= 8`) instead of letting it answer less than was asked.
 - **Verified at load, or absent** — `routing/contracts.py::verify`: `in` must reproduce the
   endpoint's own `test_request` and `out` must fill every required core field from its
   `example_response` (an example that is itself a miss passes with the hit half unverified).
@@ -1881,10 +2228,14 @@ to choose (`docs/CAPABILITY-ROUTING-PLAN.md`). Everything else in the catalog st
   `treg.<capability>` (`store.load` skips a `routed: false` contract) (`provider: treg`, `kind: routed`, `POST /<capability>`, `input` = the
   contract, `cost` = the children's range, `routed_children`, `miss_billed_by` = the children priced
   per call or per result, whose provider bills an answer treg judges a miss: the caller pays those
-  too, and the cost note says so). Never hand-written; not in any
+  too, and the cost note says so). When `miss_billed_by` is non-empty the cost carries `varies:
+  true` and `advertised_usd` quotes `usd_per_call: null`: the $0 floor of the range read as "free"
+  to an agent that then paid for hundreds of billed misses. The note leads with "NOT free" and
+  carries the range. Never hand-written; not in any
   provider file.
   `catalog_get` on it returns the contract and the ranked **plan** (the quote) —
-  nothing is reserved.
+  nothing is reserved. A child the router would not call on treg's key (paused, not
+  `platform_eligible`, no key on this deployment) ranks after the rest with a `skipped` reason.
 - **Ranking** — `routing/plan.py`: own keys (tier 2) first at cost 0; then
   `expected_cost_per_hit = cost_at(request) × P(billed) / P(hit)` where `cost_at` prices *this*
   request at its requested size (per-result × limit, credit-with-minimum rounded up) and `P(hit)`
@@ -1899,8 +2250,10 @@ to choose (`docs/CAPABILITY-ROUTING-PLAN.md`). Everything else in the catalog st
 - **Execution** — `application/call/route.py`, entered from `service._execute_call` when the
   resolved catalog row is `kind: routed`. Each attempt is a **full child `execute_call`** on a
   `CallContext` whose `call_ref` is `{parent}:r{n}` — its hold id, ladder (tiers 1/2/4/overflow),
-  reserve, relay, settle, audit row and cancellation compensation are the ordinary ones. Vendor
-  4xx (not 402/408/429) = usually the caller's fault, but scrapers answer 400 for their own outages
+  reserve, relay, settle, audit row and cancellation compensation are the ordinary ones. A 405 or
+  410 Gone is the provider's own (a discontinued route answers 410 to every request) and falls over
+  like a 5xx. Vendor
+  4xx (not 402/405/408/410/429) = usually the caller's fault, but scrapers answer 400 for their own outages
   (tikhub, live 2026-08-28), so the waterfall goes on ONLY to candidates that bill nothing for a
   rejected request — per_success, free, the org's own key, or per_call ≤ 1¢ (`CHEAP_RETRY_MICRO`;
   since 2026-09-07 a per_call rejection settles only at a charge the vendor itself reports, so this
@@ -1926,7 +2279,10 @@ to choose (`docs/CAPABILITY-ROUTING-PLAN.md`). Everything else in the catalog st
   under a 20000 envelope). A
   MISS tries the next candidate — the waterfall is ON by default (decided
   2026-08-28: the endpoint's job is to find the thing, and misses on the per-success children are
-  free); `X-Treg-Route-Waterfall: 0` stops at the first miss. **A child never settles its own
+  free); `X-Treg-Route-Waterfall: 0` stops at the first miss. A child that charges nothing (not
+  billable, or a provider-reported zero such as a free miss) releases its hold at once, before the
+  next child reserves: holding it to the end made a balance that covers each child in turn answer
+  a false 402 mid-waterfall. **A billed child never settles its own
   hold**: it leaves it open in the parent's `deferred_settles` list (`settle.DeferredSettle`) with
   the amount its settle would charge, and `run_routed` closes every one exactly once at the end
   (`settle.close_deferred`, one transaction): settled at that real price when the routed call
@@ -1936,7 +2292,11 @@ to choose (`docs/CAPABILITY-ROUTING-PLAN.md`). Everything else in the catalog st
   `released_micro` names what the providers billed treg. A crash between the two leaves the holds
   to the reaper, which releases in the caller's favour. `X-Treg-Route-Max-Cost` (default $1)
   bounds the sum before each reserve (a candidate
-  that would breach it is `skipped`). Quota-row quotes scale with the requested row count, just
+  that would breach it is `skipped`). Before any child runs, the route returns 402
+  `route_max_cost` (`cheapest_micro`, `plan`, `charged_micro: 0`) only when no candidate's
+  `price_micro` fits the ceiling, and that detail names the minimum price rather than the
+  first-ranked candidate: on a search `rank` puts specificity ahead of price, so a dearer
+  provider can be first while a later one still fits. Quota-row quotes scale with the requested row count, just
   like per-result quotes. Each child also receives the remaining ceiling after actual earlier
   charges; the shared reservation gate checks the resolved estimate including margin, even when
   the advisory quote was too low or the child uses overflow. A budget refusal skips that candidate
@@ -1960,14 +2320,24 @@ to choose (`docs/CAPABILITY-ROUTING-PLAN.md`). Everything else in the catalog st
   and charge; the existing async worker owns eventual settlement. Only declared terminal misses and
   failures may continue under the normal bounded fallback rules.
 - **Hit rate** — `CallRecord.hit` (nullable, alembic `0009`, last column) is the adapter's verdict
-  for a completed result. An accepted async submission leaves it NULL; the terminal finalizer
+  for a completed result: a 2xx the adapter judges, or the endpoint's declared `miss:` status
+  (False); any other error status stays NULL. An accepted async submission leaves it NULL; the terminal finalizer
   classifies the finished body and queues an audit update for the originating row, including a
   routed child. The poll response does not wait for that best-effort write. A
   confirmed terminal failure counts as a miss; pending and timed-out jobs remain undecided. Its
   `AsyncTaskRecord.hit` keeps the verdict if polling beats the background audit insert.
-  Async endpoints read their `CallRecord` observations live: the daily fold may consume a
-  submission before its terminal poll changes the hit, and its one-way cursor cannot revise it.
-  `stats.observed` publishes `hit_rate`/`hit_samples` (floor 20) and, for synchronous
+  `CallRecord.verdict` (the contract's verdict word, above) travels the same path beside it. The
+  worker folds its counts into `EndpointDayStat.verdicts` (calls per word, e.g. `{"valid": 31,
+  "catch_all": 4, "unknown": 2}`; `unknown` is a word like the others, never folded into a miss),
+  but `stats.publish` does not show them yet: the observation an agent reads carries no verdict
+  counts until the word mappings are proven. Publishing them later must retain the hit sample
+  floor and use corrected terminal evidence.
+  Async endpoints with result adapters read reconciled day buckets. A late terminal result marks
+  its original day dirty, and the worker replaces that bucket before acknowledging the marker.
+  Adapter presence requires reconciliation even when verification is lost. Without an adapter,
+  terminal classification never corrects `hit`, so ordinary day buckets suffice. HTTP success and
+  request latency describe the submission; they do not claim to measure job completion.
+  `stats.publish` publishes `hit_rate`/`hit_samples` (floor 20) and, for synchronous
   per-success endpoints, reads historical rows too (a 2xx with `cost_observed_micro == 0` is a miss).
   Async per-success endpoints use only the terminal verdict: a found result can cost zero credits.
   The plan, `catalog_get` and the CLI's HIT column read it; a registered tool (tier 1) or stored key
@@ -1982,6 +2352,12 @@ to choose (`docs/CAPABILITY-ROUTING-PLAN.md`). Everything else in the catalog st
   goes to a title-aware search, not a free domain-only one that would answer the whole company.
   Only caller-supplied keys count (`rank(given=…)`), never keys reached through `derive`. Price
   decides among equals.
+  **Not on a one-subject lookup** (contract `one_subject: true`: `people.email.find`, `people.email.find.personal`,
+  `people.phone.find`): every identity variant names the same person, so reading more of the
+  caller's keys does not change the question. There expected cost per hit ranks first and
+  specificity only breaks ties; specificity first had sent `{linkedin_url, full_name, domain}`
+  phone finds to a name+domain child at roughly 500 times the price of LinkedIn children that hit
+  on the same people.
 - **Ranking, dropped filters (2026-08-29)**: a candidate whose adapter cannot express a filter the
   caller SENT ranks below every candidate that can — `len(candidate.ignored)` sits in `rank()`'s key
   between specificity and price. It answers a LOOSER question, and a non-empty answer to the looser
@@ -1991,7 +2367,13 @@ to choose (`docs/CAPABILITY-ROUTING-PLAN.md`). Everything else in the catalog st
   Francisco — reported as a hit, $0.0025, no signal to the caller. `ignored_filters()` is pure and
   computed at PLANNING time (`routing/plan.py`), so the ranking and the per-attempt report read the
   same set. The provider stays reachable: it still wins when nothing better is callable, and price
-  still decides among candidates that ignore equally much.
+  still decides among candidates that ignore equally much. `limit` never counts: it is a page size,
+  not a narrowing filter, and the contract defaults it, so counting it demoted every limit-less
+  child (a free-on-miss role finder fell behind a search that bills its empty pages).
+  Only a filter the caller SENT counts (`ignored_filters(given=…)`): a contract default is not a
+  question anyone asked, and counting it made the call-time ranking disagree with the quote. A
+  filter sent through a one-argument transform with no value for it (an unmappable country) counts
+  as ignored, never becomes another value.
   **Coverage caveat**: of 16 `people.search` children, only icypeas maps geo today, so the rule
   currently floats one provider. lusha, crustdata, companyenrich and leadmagic all filter on
   location upstream — their adapters just do not map it. Until they do, the rule is doing more work
@@ -2048,11 +2430,13 @@ to choose (`docs/CAPABILITY-ROUTING-PLAN.md`). Everything else in the catalog st
   bracket-safe target), crustdata/diffbot people.enrich (truncated examples), the `*.bulk` jobs
   (async), hunter multi-domain (masked rows).
 - **Filters reach providers, or say they did not (2026-08-29)**: `country` (ISO code) becomes a name
-  through `country_name` (`catalog/countries.json`, 249 rows generated from pycountry) for providers
+  through `country_name` (`catalog/countries.json`, generated from pycountry) for providers
   that filter on a location NAME (icypeas); `location` is a free-text pass-through ("London, United
   Kingdom", "Europe") for the same providers; a filter the caller sent that an adapter never mentions
   is listed on the attempt as `ignored_filters` — silently unapplied was the worst outcome (the bench
-  had post-filtered in the agent because of it). Bench re-run, recruiting 30: same icypeas rows as the
+  had post-filtered in the agent because of it). `dfs_location` maps any ISO country to its location
+  code (`catalog/country_numeric.json`) and returns nothing for a value that names no country: a
+  country must never silently become a default one. Bench re-run, recruiting 30: same icypeas rows as the
   hand-written policy, one automatic fall-through, region briefs rescued by the pass-through.
 - **Routed DISCOVERY is a runtime switch (2026-08-29)**: `TREG_ROUTED_DISCOVERY=off` (default `on`)
   stops search leading with `treg.<capability>` and stops a routed parent riding in when a child

@@ -29,7 +29,7 @@ from __future__ import annotations
 import math
 import re
 import unicodedata
-from collections import defaultdict
+from collections import Counter, defaultdict
 from collections.abc import Callable, Sequence
 from dataclasses import dataclass, field
 
@@ -142,7 +142,8 @@ class Index:
 
 def shown_endpoints(cat: store.Catalog) -> list[dict]:
     """What find may answer with: the browse surface, routed parents out."""
-    return [e for e in cat.endpoints if store.browsable(e) and e.get("kind") != "routed"]
+    return [e for e in cat.endpoints
+            if store.browsable(e) and e.get("kind") != "routed" and not store.paused(e)]
 
 
 def short_label(label: str) -> str:
@@ -179,7 +180,8 @@ def build(cat: store.Catalog) -> Index:
         platform = cap.split(".")[0]
         units.append(Unit(
             kind=JOB, id=cap, cap=cap, platform=platform,
-            text=f"{cap.replace('.', ' ')}. {cat.capabilities.get(cap, '')}. {plat_label(platform)}. "
+            text=f"{cap.replace('.', ' ')}. {cat.capability_titles.get(cap, '')}. "
+                 f"{cat.capabilities.get(cap, '')}. {plat_label(platform)}. "
                  + "; ".join(names[:EXAMPLES]),
             providers=tuple(sorted({e["provider"] for e in members})), examples=tuple(names[:6]),
             members=tuple(e["id"] for e in members)))
@@ -256,23 +258,30 @@ def _products(eps: list[dict], cat: store.Catalog) -> tuple[dict[str, tuple[str,
     """Model and product names: words in the endpoint names on the AI generation platforms that at
     least two of those names share and that names elsewhere rarely use ("gemini" yes, "image" no),
     and that `aliases.yaml` does not already file as a way of saying a job ("tts" is text-to-speech),
-    plus the adjacent pairs of them ("nano banana"). Each maps, spaces and hyphens folded away, to
-    every shown endpoint whose name carries it, on any platform."""
+    plus the adjacent pairs of them ("nano banana"). On a platform with a single endpoint no two
+    names can share a word, so its name's words that appear nowhere else in the catalog count too
+    ("jev", the one judge). Each maps, spaces and hyphens folded away, to every shown endpoint whose
+    name carries it, on any platform."""
     gen = {slug for slug, p in cat.platforms.items() if p.get("category") == PRODUCT_CATEGORY}
     plat_words = {w for slug, p in cat.platforms.items() for w in words(f"{slug} {p.get('label', '')}")}
     vocabulary = {w for key in cat.aliases for w in words(key)}   # "tts", "t2v": a way of saying a job
     inside: dict[str, set[str]] = defaultdict(set)
     outside: dict[str, int] = defaultdict(int)
+    alone: set[str] = set()                                        # words of a one-endpoint platform's name
+    size = Counter(e["platform"] for e in eps if e["platform"] in gen)
     name_words = {e["id"]: words(e.get("name") or "") for e in eps}
     for e in eps:
         for w in set(name_words[e["id"]]):
             if e["platform"] in gen:
                 inside[w].add(e["id"])
+                if size[e["platform"]] == 1:
+                    alone.add(w)
             else:
                 outside[w] += 1
     product = {w for w, ids in inside.items()
-               if len(ids) >= 2 and len(w) >= 3 and w.isalpha() and w not in STOPWORDS
-               and w not in plat_words and w not in vocabulary and outside[w] <= 3 and outside[w] * 2 < len(ids)}
+               if len(w) >= 3 and w.isalpha() and w not in STOPWORDS and w not in plat_words and w not in vocabulary
+               and ((len(ids) >= 2 and outside[w] <= 3 and outside[w] * 2 < len(ids))
+                    or (w in alone and outside[w] == 0))}
     keys: dict[str, set[str]] = defaultdict(set)
     labels: dict[str, str] = {}
     for e in eps:
@@ -287,7 +296,6 @@ def _products(eps: list[dict], cat: store.Catalog) -> tuple[dict[str, tuple[str,
     return {k: tuple(sorted(v)) for k, v in keys.items()}, labels
 
 
-# ---- channels ------------------------------------------------------------------------------------
 def lexical(query: str, ix: Index, aliases: dict[str, list[str]]) -> list[float]:
     """Per unit: the idf of each query word it carries as a whole word (or through an alias; or, at
     half weight, for a word of five letters or more, as the prefix of a word of its id, platform or
@@ -349,10 +357,12 @@ def fuse(*channels: tuple[Sequence[float], Sequence[float], bool]) -> list[int]:
 
 def recall(query: str, ix: Index, aliases: dict[str, list[str]], *,
            semantic: Sequence[float] | None = None, platform: str | None = None,
-           n_jobs: int = 25, n_delta: int = 10, n_raw: int = 10, n_plat: int = 8) -> list[Candidate]:
+           n_jobs: int = 25, n_delta: int = 10, n_raw: int = 10, n_plat: int = 8,
+           providers: frozenset[str] = frozenset()) -> list[Candidate]:
     """The units the judge reads for `query`: jobs, then representatives, then uncatalogued
     endpoints. `semantic` is one similarity per unit (None = that channel is off). `platform` keeps
-    one shelf's units only."""
+    one shelf's units only. `providers` are the ones the query named: their jobs take the first
+    seats and their uncatalogued endpoints come first."""
     raw_lex = lexical(query, ix, aliases)
     lex, lsrc = pooled(raw_lex, ix)
     channels = [(lex, raw_lex, False)]
@@ -366,11 +376,18 @@ def recall(query: str, ix: Index, aliases: dict[str, list[str]], *,
 
     named, _ = named_platforms(query_tokens(query), ix)
     jobs: list[int] = []
-    if named:
+    if providers:
         for i in order:
             if len(jobs) >= min(n_plat, n_jobs):
                 break
-            if ix.units[i].kind == JOB and ix.units[i].platform in named:
+            if ix.units[i].kind == JOB and providers & set(ix.units[i].providers):
+                jobs.append(i)
+    if named:
+        seats = min(len(jobs) + n_plat, n_jobs)
+        for i in order:
+            if len(jobs) >= seats:
+                break
+            if ix.units[i].kind == JOB and ix.units[i].platform in named and i not in jobs:
                 jobs.append(i)
     taken = set(jobs)
     for i in order:
@@ -389,12 +406,12 @@ def recall(query: str, ix: Index, aliases: dict[str, list[str]], *,
             if m is not None and m not in reps and (not platform or ix.units[m].platform == platform):
                 reps.append(m)
     reps = sorted(reps, key=lambda m: rank.get(m, 10 ** 9))[:n_delta]
-    raw = [i for i in order if ix.units[i].kind == ENDPOINT and not ix.units[i].cap][:n_raw]
+    raw = sorted((i for i in order if ix.units[i].kind == ENDPOINT and not ix.units[i].cap),
+                 key=lambda i: not providers & set(ix.units[i].providers))[:n_raw]
     return ([Candidate(ix.units[i]) for i in jobs] + [Candidate(ix.units[i], "rep") for i in reps]
             + [Candidate(ix.units[i]) for i in raw])
 
 
-# ---- names ---------------------------------------------------------------------------------------
 def name_of(query: str, ix: Index, platform: str | None = None,
             provider_display: Callable[[str], str] = lambda s: s) -> NameHit | None:
     """What a query names, if it is a name: a platform (exactly its name or slug; or, from four

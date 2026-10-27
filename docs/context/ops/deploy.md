@@ -17,6 +17,8 @@ sources:
   - src/treg/web/selfhost.sh
   - src/treg/config.py
   - src/treg/infra/db.py
+  - src/treg/infra/money_admission.py
+  - scripts/bench_money_admission.py
   - src/treg/email.py
   - src/treg/audit.py
   - scripts/dev-local.sh
@@ -39,6 +41,33 @@ Fish Audio shared-key capacity monitoring requires both `TREG_PLATFORM_KEY_FISHA
 `TREG_PLATFORM_FISHAUDIO_WORKSPACE_ID`. The latter is the Fish workspace selector used only by the
 free API-credit probe; without it, capacity remains unknown rather than reading the unrelated
 personal wallet.
+
+OpenRouter capacity monitoring reads `TREG_PLATFORM_OPENROUTER_MANAGEMENT_KEY` (sweep only);
+without it, OpenRouter reports no balance API.
+
+## Call events
+
+Call events ([call-events.md](../architecture/call-events.md)) are off until
+`TREG_CALL_EVENTS_URL` and `TREG_CALL_EVENTS_HMAC_SECRET` are set on every process that serves
+calls or settles async tasks (web and the async worker); `TREG_CALL_EVENTS_TOKEN` is the stream's
+bearer when it requires one. Keep the secret stable: changing it breaks every join across the
+change.
+
+## Additional public domains
+
+`TREG_PUBLIC_HOST_ALIASES` is a JSON array of bare hostnames accepted for same-host social-login
+callbacks, MCP hosts/origins and token audiences, and the hub self-relay guard. It defaults to an empty tuple. Each deployment supplies its complete alias list explicitly;
+setting it replaces the list rather than appending to it.
+Adding an alias does not change `TREG_PUBLIC_URL`, canonical links or provider-connect callbacks.
+Register each alias's `/auth/google/callback` and `/auth/github/callback` with the respective OAuth
+client before enabling it. The OAuth state and browser session cookies stay on that alias.
+
+Turnstile's widget hostname list must include every browser alias. Server-side hostname validation
+accepts the canonical host and every configured alias; a non-empty
+`TREG_TURNSTILE_HOSTNAMES` overrides this fallback and must itself list every accepted host.
+
+Apply and verify the complete alias configuration before deploying code that consumes it. Older
+builds ignore the extra setting; deploying the new code first can invalidate existing alias grants.
 
 ## Entry point (`__main__.py`)
 
@@ -72,6 +101,9 @@ closed maintenance loop. Calling `maintenance.upgrade()` directly does not dispo
   and a hash-only backfill for existing membership credentials. It is marked `contract = True`
   because old code cannot enforce newly stored disable or revoke state. The migration is additive
   and uses SQL that works on SQLite and Postgres.
+- **First-run lookup removal floor:** revision `0078` drops `onboardingprofile`. Code older than it
+  reads or writes that table only while a `TREG_ONBOARDING_V2*` setting is on, so turn those off
+  before upgrading, and keep them off on any rollback past it.
 - **Alembic is authoritative:** migration scripts ship inside `src/treg/alembic/` in the wheel.
   `maintenance._alembic_config()` resolves that installed package resource, supplies the escaped
   configured URL, and runs Alembic in a worker thread.
@@ -94,9 +126,16 @@ for an `ALTER`. A deploy waits longer by retrying instead: `maintenance` re-runs
 head` up to `LOCK_RETRY_ATTEMPTS` times after a lock timeout, pausing a jittered few seconds between
 attempts so the table's short transactions can drain, and `env.py` commits each revision on its own
 (`transaction_per_migration`) so a retry resumes at the revision that timed out. Any other error
-fails the deploy at once. The one sanctioned exception to the 5 s cap is `CREATE INDEX CONCURRENTLY`
-in its own revision: its lock blocks nobody while it waits, so such a revision owns its longer
-timeouts and must detect and rebuild an invalid index left by interruption.
+fails the deploy at once. Concurrent index creation or removal may use longer bounded timeouts in
+its own revision: its lock permits ordinary reads and writes, although it conflicts with other
+maintenance. Such a revision restores the caller's timeouts and handles interruption: invalid builds
+must be rebuilt, and a partially completed removal must be retryable. Revision `0061` removes only
+ordinary indexes with verified unique-constraint replacements; its rollback recreates those indexes
+concurrently and requires enough disk space for them. Revision `0072` builds
+`ix_callrecord_call_ref` where a database stamped at the baseline never got it; a build on a large
+table outlasts any fixed statement timeout, so it lifts `statement_timeout` for that one statement
+(the lock timeout stays bounded) and the deploy's own pre-deploy limit bounds it. Deploy such a
+revision in a quiet window: the build reads the whole table while traffic keeps writing.
 
 Hot-table ALTERs stay cheap to retry when they sit in their own revision, add only nullable columns
 without defaults (metadata-only in PostgreSQL) and leave backfills and `NOT NULL` to later steps.
@@ -132,6 +171,14 @@ through. Live values and production sizing belong in the private operator runboo
 headroom. Resize from measurements, one pool at a time. A larger pool does not repair a slow scan,
 lock queue, disk-bound database or missing index.
 
+Web roles and worker commands also run local money-transaction diagnostics independently of the
+PostHog key. Verify fresh `money_trace_gauge` records for each deployed build and process, including
+tracking counts, sample age and drop counters. `money_txn_slow` and `money_txn_end` correlate backend
+PIDs with application transaction IDs and stages; join within their timestamp intervals because
+connections are reused. Read the coverage and loss limitations in
+[data-model](../architecture/data-model.md#product-analytics-writer-analyticspy) before interpreting
+missing records. Deployment requires no schema migration or new database privileges.
+
 All pools use `pool_pre_ping=True`, `pool_recycle=300` and `pool_timeout=5`. A request that gets no
 slot in time receives `503 {"treg_saturated": true}` with `Retry-After: 2` through
 `bootstrap_handlers._pool_saturated`. A `/call/` holds no connection during the upstream round trip.
@@ -139,6 +186,31 @@ slot in time receives `503 {"treg_saturated": true}` with `Retry-After: 2` throu
 SQLite aliases all three makers to one engine. It has no pool to protect and file-level write locks
 it cannot share, so separate engines would only manufacture lock failures. Tests pin routing rather
 than SQLite isolation.
+
+### Dashboard reports
+
+Team dashboard reports that aggregate whole windows of the audit and ledger tables
+(`/orgs/{id}/usage`, `/orgs/{id}/usage/by-tag`, `/orgs/{id}/agents/observed`) take
+`get_report_session` instead of `get_session`. It opens `read_session_maker`: the replica when
+`TREG_READ_DATABASE_URL` is set, otherwise the API pool. Either way:
+
+- at most `_REPORT_SLOTS` (2) reports run at once per process; a report that cannot get a slot
+  within `_REPORT_WAIT_S` (1 s) is refused before checkout;
+- each report transaction sets `statement_timeout` (`_REPORT_STATEMENT_TIMEOUT_MS`, 15 s) on
+  PostgreSQL, and the report as a whole runs under `_REPORT_DEADLINE_S` (15 s), so a report of
+  several sub-limit statements cannot hold its connection longer either. The deadline is an
+  `asyncio.timeout` around the dependency's yield: FastAPI runs a dependency's body and the endpoint
+  in one task, and cancelling an in-flight asyncpg query cancels it on the server;
+- both refusals answer `429 {"report_busy": "busy" | "timeout"}` with `Retry-After: 2` through
+  `bootstrap_handlers._report_busy`: the service is up, the report should be retried later. They are
+  not `treg_saturated` and record no `db_pool` fault.
+
+Authorization finishes on `get_session` first; `require_member` commits, so that session holds no
+connection while the report runs. On the API pool the gate caps reports at two of the process's
+API slots; `/call/` keeps the rest. Reports on the replica see replication lag.
+`tests/test_report_session.py` pins which routes take the report session. The dashboard runs the
+per-tag reports one at a time and retries a 429 with backoff (`withReportRetry` in
+`frontend/src/api.ts`); a report that still fails shows its error instead of being hidden.
 
 ### Optional read replica
 
@@ -165,6 +237,15 @@ These connection settings guard accidental writes; they are not an authorization
 be disabled by deliberate SQL. Use a physical replica/read-only database role or filesystem access
 controls as appropriate. Connection/query failures propagate without primary fallback.
 
+`/admin/errors` uses this datasource for evidence and org names. Authorization stays on the admin
+primary pool and releases its connection before the report begins. With no read URL configured,
+`get_admin_read_session` preserves the original admin pool rather than using the general reader's
+API-pool fallback. Configured reader failures never retry on the primary.
+Before enabling a hosted cutover, verify the running process has the intended read URL, the target
+is a readable replica with the required table grants, and replication lag is acceptable. Configuring
+a URL also moves the dashboard reports above and no other report. Removing it returns `/admin/errors`
+to the admin primary pool and the dashboard reports to the gated API pool.
+
 `pool_snapshot()` includes a separate `read` entry for a configured PostgreSQL datasource; SQLite
 engines are omitted as for the primary. `connection_budget()` describes only the primary pools;
 budget the read pool against its target database, including process count and deployment overlap.
@@ -172,8 +253,8 @@ If both URLs target the same server, add both budgets against that server's limi
 `dispose_engine()` also disposes the read engine. Schema upgrades, startup verification and test
 schema resets continue to target the primary.
 
-This datasource is opt-in infrastructure: no application query or worker currently uses it.
-Adopting callers must tolerate replica lag and keep writes, cursor advancement and concurrency
+This datasource is opt-in infrastructure; `/admin/errors` and the dashboard reports above use it.
+Further callers must tolerate replica lag and keep writes, cursor advancement and concurrency
 control on the primary. Operators must provision and synchronize a compatible schema and data;
 setting a URL does not establish replication, translate dialect-specific queries, or migrate any
 Cron job's workload. Configure it in a private local `.env` or the hosting service's environment;
@@ -195,6 +276,11 @@ Cron job's workload. Configure it in a private local `.env` or the hosting servi
   credentials make that provider unconfigured instead of failing halfway through consent.
 - `oauth_review_pending` is a comma-separated set of provider-registry review keys. Its hosted value
   is operational state and is maintained privately.
+- `paused_providers` is a comma-separated set of provider service ids this deployment cannot serve
+  right now, for example because its own app lost upstream access. Empty (the default) pauses
+  nothing. `paused_provider_messages` is an optional JSON object `{service: message}`; malformed
+  JSON fails at boot. Removing an id restores the provider with no reconnect. Its hosted value is
+  operational state and is maintained privately. See `interface/api.md` § `503 provider_paused`.
 - `promo_grant_micro` controls the once-per-verified-user signup grant. Zero pauses new automatic
   grants without changing existing balances.
 - `blocked_email_domains` is the complete comma-separated blocklist. Empty blocks no domains. It is
@@ -217,6 +303,107 @@ subsystems. Credentials must stay in the deployment secret store. `TREG_PLATFORM
 shared-serving allow-list. Most providers also require a configured platform key. A live-verified
 free endpoint declared `platform_auth: anonymous` needs only the allow-list because treg injects no
 provider credential.
+
+## Optional money admission
+
+Root Web requests have separate, default-disabled [published Org pause, rate and concurrency
+admission](../architecture/org-flow-control.md), enabled with `TREG_ORG_FLOW_CONTROL_ENABLED`
+and read through the shared Redis destination. A full snapshot's non-null
+`concurrency_limit.max_in_flight` controls shared root slots; `rate_limit:{rps,burst}` controls a
+shared token bucket. Each null field removes that limit. Rate and concurrency checks are atomic:
+a refusal consumes neither token nor slot. This does not change money admission or financial
+cleanup below, and requires no additional setting or database migration.
+
+The old `TREG_ORG_CONCURRENCY_*` configuration no longer controls concurrent request admission.
+There is no automatic migration or static fallback. Review old values and already published
+non-null rate and concurrency values before deploying the new behavior. Workers with the flag
+already enabled will begin enforcing published rate values after this deployment. Any equivalent
+dynamic rules must be separately approved, saved and published, and the shared flag enabled, through an
+authorized rollout. Saving alone does not activate rules; this code change performs none of
+those operational actions. See [concurrency migration](../architecture/org-concurrency.md#configuration-migration-and-rollback)
+for the sequence and the fixed lease/retry behavior.
+
+Restore published Redis keys before enabling workers; Redis connectivity, initialization and
+timeout failures allow new root calls, including failures during combined rate/slot admission.
+Missing keys clear local rules; malformed or conflicting publications retain the last valid rate
+and concurrency limits and original pause expiry. Cache saturation allows uncached Orgs.
+Per-worker refresh is eventual, not an all-worker acknowledgment. See the flow-control fragment
+for recovery limits.
+Bucket and slot keys are shared across configuration versions; rule updates do not reset live
+owners or grant a fresh burst. Accepted rate tokens are not refunded on request failure,
+cancellation or an ambiguous Redis reply. Disabling the flag bypasses new checks while accepted
+requests finish their existing cleanup.
+
+`TREG_MONEY_ADMISSION_ENABLED` defaults to `false`. Enabling it requires a shared Redis-compatible
+store at `TREG_KV_URL`; all participating web and money-worker processes must use the same store
+and rollout settings. No database migration or additional database privileges are required.
+
+- `TREG_MONEY_ADMISSION_ORG_IDS` is a JSON array of positive Org IDs. A non-empty array enables
+  admission only for those orgs; `[]` covers all orgs when the feature is enabled.
+- `TREG_MONEY_ADMISSION_WAIT_S` accepts values greater than 0 through 120 seconds, defaults to
+  5 seconds, and bounds the complete local/Redis acquisition attempt. Local-lock waiting uses
+  the same budget as Redis waiting. Cleanup is separately bounded by the KV operations. Exhausting this
+  budget rejects `reserve` before its funds transaction with HTTP 429 `money_admission_timeout`
+  and a jittered `Retry-After`: an integer from `TREG_MONEY_ADMISSION_RETRY_AFTER_S` through twice
+  that value (inclusive). The retry floor defaults to 1 second and accepts integers from 1 to 60.
+  The old `TREG_ORG_CONCURRENCY_RETRY_AFTER_S` name remains a validation alias for this money
+  setting; migrate any custom value to the money-specific name. It does not configure the
+  published concurrency guard, whose contention guidance is fixed at one second.
+  All other operations, including settlement and release, keep waiting without a database
+  connection up to `max(TREG_MONEY_ADMISSION_WAIT_S, 2 * TREG_MONEY_ADMISSION_LEASE_S)`, never more
+  than half of `TREG_HOLD_GRACE_S`, and only then fall back to the database path. Redis infrastructure errors retain
+  the database fallback for every
+  operation. A missing or non-positive
+  org on those operations refuses before checkout, and that refusal is not an HTTP 429.
+- `TREG_MONEY_ADMISSION_LEASE_S` defaults to 15 seconds. The owner renews while acquiring or using
+  its leases and deletes only leases with its token. Expiry, lost renewal or a Redis outage can
+  admit overlapping database transactions, so existing database locks remain authoritative.
+  The lease starts on acquisition and renews at TTL/3; it need not exceed the pre-acquisition wait.
+  Twice this value is also the settlement admission wait (up to half the hold grace), so raising
+  it lengthens how long a settlement queues for the lease before falling back.
+
+Allowing a 90–120 second admission wait does not guarantee an end-to-end request can wait that
+long. It changes no default or running configuration. Budget for earlier request stages, every
+admission scope (reserve and settle can each wait), upstream work, database execution, retries,
+and cancellation/lease cleanup. Longer queues retain more pending requests and can increase
+latency or client retries without increasing a hot org's transaction throughput.
+
+Before opting into a longer wait, review these independent limits:
+
+| Boundary | Existing behavior and compatibility |
+|---|---|
+| Redis commands and renewal | `infra.kv` keeps 1-second socket timeouts, 1.5-second lease attempts, and a 2.5-second per-key renewal/release retry budget. Renewal is also bounded by the earliest confirmed lease expiry. Optional counters/health probes retain their dedicated 200 ms deadline. None scales with the queue wait. |
+| Plain call / upstream | `bootstrap._lifespan` configures `call_timeout_s` (default 180 seconds) on the upstream HTTP client. This is an HTTP I/O timeout, not a total request deadline or a budget for admission plus execution. |
+| Hold age | `domain.money.hold_ttl_s` remains `call_timeout_s + hold_grace_s` (defaults: 180 + 60 = 240 seconds). Pre-reserve admission precedes hold creation, but later admission consumes hold age. A slow upstream plus 90–120 seconds of settlement waiting can exceed the stale-hold cutoff and race a reaper; pending async-task holds are excluded. Review hold lifetime before enabling longer waits. |
+| CLI / local proxy | `cli._client` has a 190-second read timeout; `localproxy.treg_client` defaults to 120 seconds. A full 120-second queue leaves no local-proxy execution headroom; even the CLI can time out across reserve, upstream, and settlement waits. |
+| MCP | `mcp._api` declares a 120-second HTTPX timeout, but its in-process `ASGITransport` does not enforce a network read deadline. This is not an end-to-end guarantee: the external MCP client and hosting path have independent limits. |
+| Async settlement worker | `application.asynctasks.settle_due` has a 30-second processing deadline that starts before the claim and provider poll, including admission and settlement; its separate task-claim lease is 60 seconds. It cannot spend 90–120 seconds in admission within that deadline. Expanding it would require coordinating claim ownership and execution headroom. |
+| Hub / other bounded callers | Hub recipe wall deadlines and per-call script limits include earlier execution; browser onboarding aborts after 60 seconds, and Arena applies its own run/attempt deadlines. They can cancel before the admission budget expires. |
+| Rate limiter | `infra.upstream.limiter.DEFAULT_MAX_WAIT_MS` remains 2,000 ms, independent of money admission. |
+| Render / edge / external clients | Their effective request, idle, and cancellation limits are outside this setting. Verify the actual hosting path and caller budget with execution headroom before rollout; accepting 120 in Settings does not certify a 120-second request through them. |
+
+Deploy compatible code first with admission disabled to collect the same eligible-operation
+baseline, then opt in a small Org set. Compare `money_admission_gauge` wait and end-to-end durations,
+fallback/lease-loss counters, and the existing pool, money-operation and database-failure signals
+under comparable load before expanding. Whole-session serialization can reduce hot-org throughput
+even when it improves connection occupancy, so reduced lock-wait time alone is not rollout
+acceptance. Defaults are acquisition bounds, not workload sizing recommendations. Disable the
+feature to restore the original database admission path; mixed
+settings or old writers weaken isolation but do not remove accounting's database protection.
+There is no global money concurrency cap, and unrelated orgs can still collectively fill a pool.
+See [money](../architecture/money.md#optional-admission-before-the-settlement-session) for exact
+operation coverage and [data-model](../architecture/data-model.md#product-analytics-writer-analyticspy)
+for aggregate boundaries and interpretation.
+
+`tests/test_money_admission_postgres.py` uses real disposable loopback PostgreSQL and Redis via
+`TREG_TEST_DB_URL` and `TREG_TEST_KV_URL`; without these it skips instead of contacting a service.
+The PostgreSQL CI job supplies both services. `scripts/bench_money_admission.py` compares disabled
+and enabled synthetic settlement workloads using the same variables, with database names required
+to start with `treg_admission_test`. It resets that disposable schema. Its timings are local
+synthetic evidence, not a production replay or a guarantee of deployed throughput. Benchmark
+clients use separate Redis connections and local mutex maps within one event loop; this exercises
+Redis contention without a shared local mutex hiding it, but is not an operating-system
+multi-process load or failure test.
 
 ## Safe local mode
 
@@ -260,10 +447,23 @@ A feature flag set in the calling shell (`TREG_HUB_ENABLED=1 scripts/dev-local.s
 reach the server on its own: the script starts the server inside a tmux session, and a tmux session
 inherits the **tmux server's** environment, not the calling client's — the server would start and
 answer every hub route `404` with no error. `dev-local.sh` expands a fixed passthrough list
-(currently `TREG_HUB_ENABLED`) in its own process and bakes the value into the command string tmux
-runs; add a flag to that list to pass another one through. The script's own three env vars
+(the hub, table and onboarding flags) in its own process and bakes the value into the command string
+tmux runs; add a flag to that list to pass another one through. Keys never go through that list:
+they go in `scripts/.dev-home/dev-keys.env`, which the server sources. The script's own three env vars
 (`TREG_EMAIL_DEV_MODE`, `TREG_CONNECT_DEMO_ENABLED`, `TREG_DATABASE_URL`) are appended last so they
 always win over anything passed through.
+
+Per-IP limits need a client address the client cannot write. Behind Cloudflare set
+`TREG_CLIENT_IP_HEADER=cf-connecting-ip`; behind other proxies set `TREG_TRUSTED_PROXY_HOPS` to the
+number of proxies that append to `X-Forwarded-For` (default 1; 0 when clients connect directly). Each
+process logs `event=client_ip_sources` once with the address headers its proxies deliver (names
+and counts only), and `event=client_ip_header_missing` when the configured header does not arrive.
+See [multi-tenancy](../architecture/multi-tenancy.md), "Client address".
+
+A deployment that installs a policy extension into the server environment (an extra `pip install`
+after the build) should set `TREG_REQUIRED_EXTENSIONS` to its entry-point name, so a build that
+lost it fails to start instead of serving without it. See
+[policy extensions](../architecture/policy-extensions.md).
 
 [`deploy/render.example.yaml`](../../../deploy/render.example.yaml) is a generic self-hosting example.
 It creates one web service and one PostgreSQL database, builds with
@@ -362,11 +562,95 @@ without importing the heavy database stack into the light `treg` CLI.
 - `treg-worker arena insights` folds new audit rows into the rolling Arena aggregate
   (`--max-seconds`, default 110, bounds one pass; schedule it every two minutes).
   It requires the archive object-store settings when R2 reads are enabled, opens the same client
-  lifecycle as the web service, and flushes read analytics before exiting.
+  lifecycle as the web service, and flushes read analytics before exiting. The same scheduled
+  command refreshes Web Arena's saved Battle totals when Web Arena is enabled and its reviewed
+  benchmark is published; that full refresh is gated to once every 30 minutes.
+- `treg-worker showcase activity` adds the new calls of each source an approved app uses (its team,
+  or its API keys) to the /showcase leaderboard rows, one per UTC week (schedule it hourly: a newly
+  approved app joins the activity boards at the next run; hosted only, so a self-hosted registry need
+  not schedule it). Each run reads only calls after each source's cursor, over `callrecord`'s
+  (org_id, id) or (org_id, api_key_id, id) index in small batches, up to a cap per run; a busy
+  source's first four weeks are counted over several runs.
+- `treg-worker rankings refresh` rebuilds the public /rankings boards from the per-day endpoint
+  stats (`endpointdaystat`, which `treg-worker catalog stats` writes) and replaces the one saved
+  row (schedule it hourly, as its own job: a failed run only leaves the rankings a run older, never
+  the catalog's reliability numbers). Until its first run the page says the rankings are being
+  prepared. Each run reads the counts of about thirty days and the first values of the last seven
+  days' latency samples, never `callrecord`.
+- `treg-worker media sweep` deletes public pictures no team, person or app names any more (schedule
+  it daily; it reads only `img/` in the public bucket and skips files younger than a day).
+- Pictures (avatars, /showcase icons and screenshots) are off until `TREG_MEDIA_STORE_ENDPOINT`, its
+  two keys, `TREG_MEDIA_STAGING_BUCKET` and `TREG_MEDIA_PUBLIC_BUCKET` are set (SECURITY.md, "Picture
+  storage"); pages then show initials. `TREG_MEDIA_BASE_URL` names the public bucket's domain; empty,
+  treg serves the bucket at `/media-files/` itself. Switching it later needs no data change.
 - `treg-worker catalog stats` folds new audit rows into per-endpoint, per-day reliability buckets
-  (`--max-rows`, default 500,000, bounds one pass; schedule it every few minutes). The catalog keeps
-  computing observations live until this command has caught up once, so it can be scheduled after
-  the application deploys, and a self-hosted registry that never schedules it loses nothing.
+  (`--max-rows`, default 500,000, bounds the append pass; schedule it every few minutes), then
+  repairs marked endpoint/day buckets. `--max-dirty-buckets` (20), `--max-repair-seconds` (60) and
+  `--bucket-timeout-seconds` (10) bound repair attempts; zero buckets or zero repair seconds pauses
+  repairs. The elapsed-time budget excludes append folding and queue maintenance. Each failed
+  bucket rolls back and retries after a delay; JSON results include `repaired`, `repair_failed` and
+  `repair_pending`. A persistently failing bucket must be investigated rather than retried with
+  unlimited time. Web cache refreshes read only summaries: missing, incomplete or stale worker
+  evidence gives unmeasured reliability, with existing cache entries expiring normally.
+  Apply additive revision `0074` before the new writers. Retire all old audit-producing processes
+  before starting historical correction, including Web processes and in-flight `asynctasks settle`
+  jobs; wait for their work to finish, and require new writers for subsequent jobs. Web shutdown drains
+  audit; settlement jobs do not guarantee an audit drain on exit, and audit remains best effort.
+  The updated worker automatically queues legacy async buckets from `endpointdaystat` and repairs
+  them across bounded runs. Setting a repair budget to zero pauses recounts only; ordinary folding
+  still runs and can mark newly created buckets reconciled. Async observations remain unavailable
+  until their applicable buckets are reconciled; no live aggregate fills this gap. If old writers
+  run after reconciliation, their unmarked changes require another historical correction before
+  trusting the summaries.
+- `treg-worker catalog requeue-async-stats` previews the existing mutable async day buckets in the
+  current UTC observation window. After all earlier writers have stopped, run it once with
+  `--apply` to reset their reconciliation flags and enqueue full repairs atomically. Save the JSON
+  output as the applied target manifest; apply selects targets afresh rather than applying an
+  earlier preview. Keep the existing scheduled `catalog stats` command unchanged. The enqueue
+  reads the small summary table; the normal worker later reads each marked
+  source day within its existing budgets. There is no schema migration or automatic requeue.
+
+  ```bash
+  treg-worker catalog requeue-async-stats
+  treg-worker catalog requeue-async-stats --apply > catalog-async-repair.json
+  treg-worker catalog repair-status --manifest catalog-async-repair.json
+  ```
+
+  Use the unedited manifest against the same database. `repair-status` is read-only and returns
+  exit code 0 when all still-in-window targets are reconciled and have no dirty marker, 1 while
+  any target is pending or missing, and 2 for an invalid manifest. Expired targets are listed as
+  `aged_out` rather than claimed as repaired. A default preview cannot be used as completion
+  evidence. Appending new calls cannot satisfy a reset flag; only a full repair restores it.
+  Repeating `--apply` starts another requeue, so do not add it to a recurring schedule. Active-day
+  buckets can return to `pending` after reconciliation because new terminal results enqueue more
+  corrections. That status combines unreconciled buckets and already-reconciled buckets with a
+  marker. Initial repair coverage, writer versions and worker health must be verified before
+  switching a reader; fresh same-day markers do not by themselves mean the initial repair failed.
+  For the summary-only reader cutover, deploy the worker with successful-repair age advancement
+  first and verify a successful repair pass, then deploy the Web reader. This change requires no
+  migration or scheduled-command change. A retained marker can be normal on an active bucket:
+  successful full repair advances its age bound to the source scan start, while failed or rolled
+  back repairs leave it aging. Check `caught_up`, `repair_failed`, cursor age and marker age;
+  `repair_pending > 0` alone does not indicate failure.
+
+  The reader logs `endpoint stats fold unavailable` when it cannot publish trustworthy evidence.
+  Consider a sustained-warning alert, scoped to the Web service, such as the following Loki
+  condition with a ten-minute pending period (replace the selector with your service label):
+
+  ```logql
+  sum(rate({service_name="<web-service>"} |= "endpoint stats fold unavailable" [5m])) > 0
+  ```
+
+  Correlate this with repair failures and worker lag; it is an optional-statistics warning, not
+  a failed provider call. This is alerting guidance, not a provisioned alert rule. There is no
+  reader feature flag or live-query fallback. Rollback requires redeploying the previous known
+  working Web build, which may restore expensive live aggregates; keep the audit writers and
+  statistics worker running. No schema downgrade is required.
+- `treg-worker spend rollup` folds new ledger settle entries into per-key, per-tool, per-day spend
+  (`--max-rows`, default 50,000, bounds one pass; schedule it every few minutes, after the web
+  service runs a build with revision 0070). It reads the primary database in small batches, and
+  its first run backfills 31 days over as many runs as `--max-rows` needs. The Team page's "Spent"
+  column and the Usage page's spend chart say spend history is being prepared until it has caught up once.
 - `treg-worker jev xboost` runs the `/jev` launch-radar demo once a day: it calls treg's own `/call/` API
   with `TREG_JEV_TREG_TOKEN` (a member token of the demo team, so the spend is an ordinary bill) and jev
   through the Vercel AI Gateway (`TREG_AI_GATEWAY_API_KEY`), and stores the run under Ephemeral for the page.
@@ -375,6 +659,9 @@ without importing the heavy database stack into the light `treg` CLI.
   (`--batch-size`, default 5000, rows per transaction; schedule it daily). `GET /admin/errors` is
   read-only and already withholds evidence past the window, so an unscheduled purge keeps the old
   bytes in the database but never shows them.
+- `treg-worker admin purge-ad-clicks` deletes email-to-click stash rows whose `updated_at` is past
+  the 90-day window ([ads conversions](../architecture/ads-conversions.md)); schedule it daily.
+  Without it, expired rows stop being read but stay in the database.
 - `treg-worker hub check [--only <tool_id>] [--json]` runs every live [hub](../architecture/hub.md)
   tool's `check.json` once, as its maker (spends the maker's balance at step prices); a no-op with
   exit 0 when `hub_enabled` is off. Schedule it every 6 hours; health is derived from the last three

@@ -100,10 +100,13 @@ async def test_session_key_not_hardcoded_constant():
     object.__setattr__(s, "session_secret", "")
     object.__setattr__(s, "secret_key", "")
     try:
-        import base64, hashlib, hmac
+        import base64
+        import hashlib
+        import hmac
         raw = json.dumps({"uid": 1, "exp": int(time.time()) + 999}, separators=(",", ":")).encode()
         sig = hmac.new(b"dev-session-key", raw, hashlib.sha256).digest()
-        b = lambda x: base64.urlsafe_b64encode(x).decode().rstrip("=")
+        def b(x):
+            return base64.urlsafe_b64encode(x).decode().rstrip("=")
         forged = f"{b(raw)}.{b(sig)}"
         assert sess.read_session(forged) is None  # the constant no longer signs anything
         assert sess.read_session(sess.make_session(7)) == 7  # real tokens still work
@@ -315,7 +318,6 @@ async def test_non_string_token_field_is_502_not_garbage(c):
 
 
 async def test_health_run_survives_injection_error(c):
-    import json as J
     u = await _register(c, "hi@t.io")
     tok = u["token"]
     # env (plaintext) secret bound with secret_file injector → _token_from_json raises at probe time
@@ -563,7 +565,7 @@ async def test_cannot_lock_out_the_last_superadmin(c):
     assert (await c.post(f"/admin/users/{uid}/superadmin", headers=_hdr(admin_tok), json={"value": False})).status_code == 409
     assert (await c.delete(f"/admin/users/{uid}", headers=_hdr(admin_tok))).status_code == 409
     # with a SECOND superadmin, demoting the first is fine again
-    other = (await _otp_login(c, "second-admin@x.io"))["token"]
+    await _otp_login(c, "second-admin@x.io")
     await _make_superadmin("second-admin@x.io")
     assert (await c.post(f"/admin/users/{uid}/superadmin", headers=_hdr(admin_tok), json={"value": False})).status_code == 200
 
@@ -636,16 +638,23 @@ def crypto_encrypt(v):
     return crypto.encrypt(v)
 
 
-def test_prune_handshakes_evicts_stale():
+async def test_prune_handshakes_evicts_stale(c):
     from datetime import timedelta
-    from treg.routers import auth as auth_routes
+    from treg.application import auth
+    from treg.models import Ephemeral
     from treg.timeutil import utcnow_naive
-    old = utcnow_naive() - timedelta(seconds=auth_routes.HANDSHAKE_TTL + 60)
-    auth_routes._cli_states["stale"] = ("lid", old)
-    auth_routes._cli_results["lidX"] = ({"token": "T"}, old)
-    auth_routes._cli_pending["lidP"] = ("CODE", 8, old)  # (pairing_code, attempts_left, created_at)
-    auth_routes._prune_handshakes()
-    assert "stale" not in auth_routes._cli_states and "lidX" not in auth_routes._cli_results and "lidP" not in auth_routes._cli_pending
+    old = utcnow_naive() - timedelta(seconds=60)
+    async with session_maker() as db:
+        for ns, key in ((auth.CLI_OAUTH_NS, "state"), (auth.CLI_LOGIN_NS, "result"),
+                        (auth.CLI_LOGIN_NS, "pending")):
+            db.add(Ephemeral(ns=ns, k=key, v={}, expires_at=old))
+        await db.commit()
+    assert (await c.post("/auth/cli/start")).status_code == 200
+    async with session_maker() as db:
+        rows = (await db.execute(select(Ephemeral).where(
+            Ephemeral.ns.in_((auth.CLI_LOGIN_NS, auth.CLI_OAUTH_NS)),
+        ))).scalars().all()
+        assert len(rows) == 1 and rows[0].expires_at > utcnow_naive()
 
 
 # ---- more invite / admin / health coverage ------------------------------------------------
